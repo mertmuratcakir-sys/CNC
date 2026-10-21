@@ -1,3 +1,6 @@
+import matplotlib
+matplotlib.use("Agg")  # Sunucuda ekran yok: GUI olmayan backend şart
+
 import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
@@ -5,8 +8,9 @@ import io
 import json
 import os
 import re
+import tempfile
 import pandas as pd
-from moviepy.editor import ImageSequenceClip
+from moviepy.video.VideoClip import VideoClip  # moviepy 1.x ve 2.x ile uyumlu
 
 CHANNEL_COLORS = ['#0072B2', '#D55E00', '#0072B2']
 
@@ -587,7 +591,7 @@ def run_all_gradio_analyses(x1, y1, tr1, fd1, code1,
 
             svg_container = f"""
             <div id="svg-wrapper-{i}" class="custom-fullscreen-container" style="width:100%; display:flex; flex-direction:column; align-items:center; padding:10px; background-color:white; border-radius:8px; border: 1px solid #ddd; position:relative;">
-                <button onclick=\"var elem = document.getElementById('svg-wrapper-{i}'); if (!document.fullscreenElement) { elem.requestFullscreen().catch(err => { alert('Error: ' + err.message); }); } else { document.exitFullscreen(); }\" style="margin-bottom:10px; padding:8px 16px; font-size:12px; font-weight:bold; cursor:pointer; background-color:#0072B2; color:white; border:none; border-radius:4px;">
+                <button onclick=\"var elem = document.getElementById('svg-wrapper-{i}'); if (!document.fullscreenElement) {{ elem.requestFullscreen().catch(err => {{ alert('Error: ' + err.message); }}); }} else {{ document.exitFullscreen(); }}\" style="margin-bottom:10px; padding:8px 16px; font-size:12px; font-weight:bold; cursor:pointer; background-color:#0072B2; color:white; border:none; border-radius:4px;">
                     🔍 Tam Ekran Yap / Çık
                 </button>
                 <div style="width:100%; display:flex; justify-content:center; align-items:center; background-color:white;">
@@ -617,6 +621,8 @@ def run_all_gradio_analyses(x1, y1, tr1, fd1, code1,
         df_dist = pd.DataFrame(distance_rows)
 
         timelines, total_time = synchronize(channels_segments)
+        if not ac_step or ac_step <= 0:
+            ac_step = 0.1
         ac_circles = [f"; Kanal Çember Kodları (Zaman: {ac_start}s - {ac_end}s, Adım: {ac_step}s)"]
         for t in np.arange(ac_start, ac_end + ac_step, ac_step):
             t_clamped = max(0.0, min(t, total_time))
@@ -638,7 +644,9 @@ def run_all_gradio_analyses(x1, y1, tr1, fd1, code1,
 
         fps = 20
         n_frames = max(int(total_time * fps), 2)
-        video_filename = "gradio_temp_simulation.mp4"
+        tmp_vid = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        video_filename = tmp_vid.name
+        tmp_vid.close()
 
         all_x, all_y = [p[0] for p in mold_points], [p[1] for p in mold_points]
         for segs, (sx, sy) in zip(channels_segments, start_points):
@@ -678,8 +686,8 @@ def run_all_gradio_analyses(x1, y1, tr1, fd1, code1,
         ax_v.legend(loc='upper left', bbox_to_anchor=(1.04, 1.0), borderaxespad=0, fontsize=8)
         time_text = ax_v.text(0.02, 0.98, '', transform=ax_v.transAxes, va='top', fontsize=9)
 
-        def render_mp4_frame(frame):
-            t_val = (frame / n_frames) * total_time
+        def make_frame(t):
+            t_val = min(max(float(t), 0.0), total_time)
             for k in range(3):
                 center_pos = get_position(timelines[k], t_val, 'points')
                 contact_pos = get_position(timelines[k], t_val, 'orig_points')
@@ -692,13 +700,11 @@ def run_all_gradio_analyses(x1, y1, tr1, fd1, code1,
                 spoke_lines[k].set_data([center_pos[0], contact_pos[0]], [center_pos[1], contact_pos[1]])
             time_text.set_text(f't = {t_val:.2f} / {total_time:.2f} s')
             fig_v.canvas.draw()
-            img_argb = np.frombuffer(fig_v.canvas.tostring_argb(), dtype=np.uint8)
-            img = img_argb.reshape(fig_v.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
-            return img
+            return np.asarray(fig_v.canvas.buffer_rgba())[:, :, :3].copy()
 
-        frames = [render_mp4_frame(f_idx) for f_idx in range(n_frames)]
-        clip = ImageSequenceClip(frames, fps=fps)
-        clip.write_videofile(video_filename, fps=fps, codec='libx264', logger=None)
+        # Kareler tek tek üretilir (hepsini RAM'de tutmaz -> Render'da bellek taşmaz)
+        clip = VideoClip(make_frame, duration=n_frames / fps)
+        clip.write_videofile(video_filename, fps=fps, codec='libx264', audio=False, logger=None)
         plt.close(fig_v)
 
         if not note:
@@ -720,9 +726,10 @@ def run_all_gradio_analyses(x1, y1, tr1, fd1, code1,
         return (dummy_fig, err_str, err_str, err_str, pd.DataFrame(), err_str, err_str, None, err_str)
 
 def load_gradio_json_config(file_obj):
-    if file_obj is None: return [gr.update()]*17
+    if file_obj is None: return [gr.update()] * 19
     try:
-        with open(file_obj.name, 'r', encoding='utf-8') as f:
+        file_path = file_obj if isinstance(file_obj, str) else getattr(file_obj, 'name', None)
+        with open(file_path, 'r', encoding='utf-8') as f:
             config_data = json.load(f)
         updates = []
         channels = config_data.get('channels', [])
@@ -844,4 +851,5 @@ with gr.Blocks(title="Tam Entegre CNC Simülatörü") as demo:
                  log_output]
     )
 
-demo.launch()
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
