@@ -1,0 +1,6 @@
+gradio
+matplotlib
+numpy
+pandas
+moviepy
+tqdm
