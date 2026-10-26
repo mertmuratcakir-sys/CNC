@@ -1,4 +1,11 @@
 import os
+
+# Şifre koruması: Render > Environment bölümünden APP_USER ve APP_PASSWORD tanımla
+APP_USER = os.environ.get("APP_USER")
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+if not APP_USER or not APP_PASSWORD:
+    raise RuntimeError("APP_USER ve APP_PASSWORD ortam değişkenleri tanımlı değil")
+
 import matplotlib
 matplotlib.use("Agg")   # sunucuda ekransız çizim
 
@@ -1759,4 +1766,4 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     # Python varsayılan kodu
     defaults_btn.click(make_defaults_code, inputs=cfg_comps, outputs=defaults_out)
 
-demo.queue().launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+demo.queue().launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)), auth=(APP_USER, APP_PASSWORD))
