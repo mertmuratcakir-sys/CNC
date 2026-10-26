@@ -1,6 +1,8 @@
-gradio
+gradio==6.30.0
+imageio
+imageio-ffmpeg
 matplotlib
+moviepy
 numpy
 pandas
-moviepy
-tqdm
+pillow

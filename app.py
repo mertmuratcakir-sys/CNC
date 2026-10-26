@@ -1,29 +1,23 @@
-import matplotlib
-matplotlib.use("Agg")  # Sunucuda ekran yok: GUI olmayan backend şart
-
-import gradio as gr
-import matplotlib.pyplot as plt
-import numpy as np
-import io
-import json
 import os
+import matplotlib
+matplotlib.use("Agg")   # sunucuda ekransız çizim
+
+# ===== Hücre 2 =====
+# [render] kaldırıldı: !pip install gradio moviepy -q
+
+
+# ===== Hücre 4 =====
+import numpy as np
 import re
-import tempfile
-import pandas as pd
-from moviepy.video.VideoClip import VideoClip  # moviepy 1.x ve 2.x ile uyumlu
+import io
 
-CHANNEL_COLORS = ['#0072B2', '#D55E00', '#0072B2']
 
-demo_gcode = [
-    "G1 X0 Y0 F800\nG1 X40 Y0\nG41\nG1 X40 Y30\nG2 X20 Y50 R20\nG1 X0 Y50\nG40\nWAIT\nG1 X0 Y0",
-    "G1 X60 Y60 F600\nWAIT\nG1 X10 Y10\nG3 X30 Y10 R-15\nG1 X10 Y10",
-    "G1 X-20 Y-20 F1000\nG4 P1\nWAIT\nG1 X-20 Y40",
-]
-
+# -------------------------------------------------------------
 def parse_gcode(text):
+    """G-kodu metnini satır satır ayrıştırır, komut sözlükleri üretir."""
     commands = []
     for raw_line in text.strip().split('\n'):
-        line = raw_line.split(';')[0].strip()
+        line = raw_line.split(';')[0].strip()  # yorumları at
         if not line:
             continue
         if line.upper().startswith('WAIT'):
@@ -38,35 +32,48 @@ def parse_gcode(text):
         commands.append(cmd)
     return commands
 
+
 def _unit(v):
     n = float(np.hypot(v[0], v[1]))
     return (v[0] / n, v[1] / n) if n > 1e-12 else (0.0, 0.0)
 
+
 def _rotate90(v, sign):
+    """sign=+1 -> yön vektörünü +90° (CCW), sign=-1 -> -90° (CW) döndürür."""
     return (-sign * v[1], sign * v[0])
+
 
 def _resample_arc(center, r, a0, a1, n_min=3):
     n_pts = max(int(abs(a1 - a0) / 0.04), n_min)
     angs = np.linspace(a0, a1, n_pts)
     return [(center[0] + r * np.cos(a), center[1] + r * np.sin(a)) for a in angs]
 
+
 def _tangent_for(seg, ang):
     if seg['clockwise']:
         return _unit((np.sin(ang), -np.cos(ang)))
     return _unit((-np.sin(ang), np.cos(ang)))
 
+
 def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.0, y_offset=0.0):
+    """
+    Bir kanalın G-kodu komutlarını işleyip hareket segmentleri listesi üretir.
+    y_offset: G-kodundaki tüm Y değerlerine eklenecek ofset miktarı.
+    """
     x, y = start_x, start_y
     motion_mode = 'G0'
     comp_mode = 'G40'
     feed = default_feed
     segments = []
+
+    # Renklendirme için hareket içeren komutları sayacağız
     move_counter = 0
 
     for cmd in commands:
         if cmd['type'] == 'WAIT':
             segments.append({'type': 'wait'})
             continue
+
         if 'G' in cmd:
             g = int(cmd['G'])
             if g in (0, 1, 2, 3):
@@ -75,26 +82,34 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
                 motion_mode = 'G4'
             elif g in (40, 41, 42):
                 comp_mode = f'G{g}'
+
         if 'F' in cmd:
             feed = cmd['F']
+
         if motion_mode == 'G4':
             dwell = cmd.get('P', 0.0)
             segments.append({'type': 'dwell', 'point': (x, y), 'duration': dwell})
             continue
 
         target_x = cmd.get('X', x)
+        # Hedef Y değerine kullanıcı tarafından girilen offset dinamik olarak ekleniyor
         target_y = cmd.get('Y', y - y_offset) + y_offset
+
         if np.isclose(x, target_x) and np.isclose(y, target_y):
             continue
 
         active_comp = comp_mode if comp_mode in ('G41', 'G42') else 'G40'
+
+        # Her geçerli geometrik harekete sırayla artan bir indeks veriyoruz
         seg_color_idx = move_counter
         move_counter += 1
 
+        # --- Doğrusal hareket (G0 / G1) ---
         if motion_mode in ('G0', 'G1'):
             p0 = (x, y)
             p1 = (target_x, target_y)
             direction = _unit((p1[0] - p0[0], p1[1] - p0[1]))
+
             if active_comp != 'G40':
                 sign = +1 if active_comp == 'G41' else -1
                 normal = _rotate90(direction, sign)
@@ -102,9 +117,11 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
                 p1c = (p1[0] + normal[0] * tool_radius, p1[1] + normal[1] * tool_radius)
             else:
                 p0c, p1c = p0, p1
+
             dist = float(np.hypot(p1c[0] - p0c[0], p1c[1] - p0c[1]))
             eff_feed = feed if motion_mode == 'G1' else max(feed * 3, 3000)
             dur = (dist / eff_feed) * 60 if eff_feed > 0 else 0.0
+
             segments.append({
                 'type': 'move', 'kind': 'line',
                 'points': [p0c, p1c], 'duration': dur, 'feed': eff_feed,
@@ -114,8 +131,11 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
                 'orig_points': [p0, p1],
                 'color_idx': seg_color_idx
             })
+
+        # --- Dairesel hareket (G2/G3) ---
         elif motion_mode in ('G2', 'G3'):
             clockwise = (motion_mode == 'G2')
+
             if 'R' in cmd:
                 r_signed = cmd['R']
                 r_abs = abs(r_signed)
@@ -131,20 +151,24 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
                 ux, uy = dx / d, dy / d
                 n_left = (-uy, ux)
                 n_right = (uy, -ux)
+
                 if clockwise:
                     normal = n_right if r_signed >= 0 else n_left
                 else:
                     normal = n_left if r_signed >= 0 else n_right
+
                 cx = mx + h * normal[0]
                 cy = my + h * normal[1]
             else:
                 i_off = cmd.get('I', 0.0)
+                # Dairesel yay merkez koordinatı da Y offsete göre dinamik kaydırılıyor
                 j_off = cmd.get('J', 0.0)
                 cx, cy = x + i_off, y + j_off
 
             r = float(np.hypot(x - cx, y - cy))
             start_ang = np.arctan2(y - cy, x - cx)
             end_ang = np.arctan2(target_y - cy, target_x - cx)
+
             if clockwise and end_ang > start_ang:
                 end_ang -= 2 * np.pi
             if (not clockwise) and end_ang < start_ang:
@@ -163,6 +187,7 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
             orig_pts = _resample_arc((cx, cy), r, start_ang, end_ang)
             arc_len = abs(end_ang - start_ang) * r_comp
             dur = (arc_len / feed) * 60 if feed > 0 else 0.0
+
             seg = {
                 'type': 'move', 'kind': 'arc',
                 'points': pts, 'duration': dur, 'feed': feed,
@@ -176,9 +201,13 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
             seg['tangent_start'] = _tangent_for(seg, start_ang)
             seg['tangent_end'] = _tangent_for(seg, end_ang)
             segments.append(seg)
+
         x, y = target_x, target_y
+
     return segments
 
+
+# ===== Hücre 6 =====
 def _line_line_intersection(p0, d0, p1, d1):
     cross_d = d0[0] * d1[1] - d0[1] * d1[0]
     if abs(cross_d) < 1e-9:
@@ -186,6 +215,7 @@ def _line_line_intersection(p0, d0, p1, d1):
     ex, ey = p1[0] - p0[0], p1[1] - p0[1]
     t = (ex * d1[1] - ey * d1[0]) / cross_d
     return (p0[0] + t * d0[0], p0[1] + t * d0[1])
+
 
 def _line_circle_intersection(p0, d, center, r, near_point):
     fx, fy = p0[0] - center[0], p0[1] - center[1]
@@ -202,6 +232,7 @@ def _line_circle_intersection(p0, d, center, r, near_point):
     d1_ = (cand1[0] - near_point[0]) ** 2 + (cand1[1] - near_point[1]) ** 2
     d2_ = (cand2[0] - near_point[0]) ** 2 + (cand2[1] - near_point[1]) ** 2
     return cand1 if d1_ <= d2_ else cand2
+
 
 def _circle_circle_intersection(c1, r1, c2, r2, near_point):
     dx, dy = c2[0] - c1[0], c2[1] - c1[1]
@@ -221,11 +252,14 @@ def _circle_circle_intersection(c1, r1, c2, r2, near_point):
     d2_ = (cand2[0] - near_point[0]) ** 2 + (cand2[1] - near_point[1]) ** 2
     return cand1 if d1_ <= d2_ else cand2
 
+
 def _trim_arc(seg, new_point, at_start):
     ang = np.arctan2(new_point[1] - seg['center'][1], new_point[0] - seg['center'][0])
     ref = seg['end_ang'] if at_start else seg['start_ang']
-    while ang - ref > np.pi: ang -= 2 * np.pi
-    while ang - ref < -np.pi: ang += 2 * np.pi
+    while ang - ref > np.pi:
+        ang -= 2 * np.pi
+    while ang - ref < -np.pi:
+        ang += 2 * np.pi
     if at_start:
         seg['start_ang'] = ang
         seg['tangent_start'] = _tangent_for(seg, ang)
@@ -237,10 +271,12 @@ def _trim_arc(seg, new_point, at_start):
     arc_len = abs(seg['end_ang'] - seg['start_ang']) * seg['radius']
     seg['duration'] = (arc_len / seg['feed']) * 60 if seg['feed'] > 0 else 0.0
 
+
 def _trim_line(seg, new_point, at_start, tool_radius):
     sign = +1 if seg['comp_mode'] == 'G41' else -1
     normal = _rotate90(seg['tangent_end'], sign)
     orig_new_point = (new_point[0] - normal[0] * tool_radius, new_point[1] - normal[1] * tool_radius)
+
     if at_start:
         seg['points'] = [new_point, seg['points'][-1]]
         seg['orig_points'] = [orig_new_point, seg['orig_points'][-1]]
@@ -250,6 +286,7 @@ def _trim_line(seg, new_point, at_start, tool_radius):
     p0, p1 = seg['points']
     dist = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
     seg['duration'] = (dist / seg['feed']) * 60 if seg['feed'] > 0 else 0.0
+
 
 def apply_corner_compensation(segments, tool_radius):
     result = []
@@ -261,13 +298,16 @@ def apply_corner_compensation(segments, tool_radius):
         if seg['type'] != 'move':
             i += 1
             continue
+
         j = i + 1
         while j < n and segments[j]['type'] != 'move':
             j += 1
         if j >= n:
             i += 1
             continue
+
         segA, segB = seg, segments[j]
+
         if segA['comp_mode'] == segB['comp_mode'] and segA['comp_mode'] != 'G40':
             tin, tout = segA['tangent_end'], segB['tangent_start']
             cross = tin[0] * tout[1] - tin[1] * tout[0]
@@ -275,12 +315,16 @@ def apply_corner_compensation(segments, tool_radius):
                 offset_sign = +1 if segA['comp_mode'] == 'G41' else -1
                 turn_sign = 1 if cross > 0 else -1
                 V = segA['orig_end']
+
                 if turn_sign != offset_sign:
+                    # --- DIŞBÜKEY: fillet yayı ekle ---
                     Ei, Sj = segA['points'][-1], segB['points'][0]
                     a0 = np.arctan2(Ei[1] - V[1], Ei[0] - V[0])
                     a1 = np.arctan2(Sj[1] - V[1], Sj[0] - V[0])
-                    if turn_sign > 0 and a1 < a0: a1 += 2 * np.pi
-                    if turn_sign < 0 and a1 > a0: a1 -= 2 * np.pi
+                    if turn_sign > 0 and a1 < a0:
+                        a1 += 2 * np.pi
+                    if turn_sign < 0 and a1 > a0:
+                        a1 -= 2 * np.pi
                     fillet_pts = _resample_arc(V, tool_radius, a0, a1, n_min=2)
                     arc_len = abs(a1 - a0) * tool_radius
                     feed_ref = segB.get('feed', segA.get('feed', 1000.0))
@@ -292,37 +336,61 @@ def apply_corner_compensation(segments, tool_radius):
                         'tangent_start': tin, 'tangent_end': tout,
                         'orig_start': V, 'orig_end': V,
                         'orig_points': [V, V],
-                        'color_idx': segA.get('color_idx', 0)
+                        'color_idx': segA.get('color_idx', 0) # Bir önceki hareketin rengini sürdür
                     })
                 else:
+                    # --- İÇBÜKEY ---
                     if segA['kind'] == 'line' and segB['kind'] == 'line':
-                        P = _line_line_intersection(segA['points'][0], segA['tangent_end'], segB['points'][0], segB['tangent_start'])
+                        P = _line_line_intersection(segA['points'][0], segA['tangent_end'],
+                                                     segB['points'][0], segB['tangent_start'])
                     elif segA['kind'] == 'line' and segB['kind'] == 'arc':
-                        P = _line_circle_intersection(segA['points'][0], segA['tangent_end'], segB['center'], segB['radius'], V)
+                        P = _line_circle_intersection(segA['points'][0], segA['tangent_end'],
+                                                       segB['center'], segB['radius'], V)
                     elif segA['kind'] == 'arc' and segB['kind'] == 'line':
-                        P = _line_circle_intersection(segB['points'][0], segB['tangent_start'], segA['center'], segA['radius'], V)
+                        P = _line_circle_intersection(segB['points'][0], segB['tangent_start'],
+                                                       segA['center'], segA['radius'], V)
                     else:
-                        P = _circle_circle_intersection(segA['center'], segA['radius'], segB['center'], segB['radius'], V)
+                        P = _circle_circle_intersection(segA['center'], segA['radius'],
+                                                          segB['center'], segB['radius'], V)
                     if P is not None:
-                        if segA['kind'] == 'arc': _trim_arc(segA, P, False)
-                        else: _trim_line(segA, P, False, tool_radius)
-                        if segB['kind'] == 'arc': _trim_arc(segB, P, True)
-                        else: _trim_line(segB, P, True, tool_radius)
+                        if segA['kind'] == 'arc':
+                            _trim_arc(segA, P, False)
+                        else:
+                            _trim_line(segA, P, False, tool_radius)
+                        if segB['kind'] == 'arc':
+                            _trim_arc(segB, P, True)
+                        else:
+                            _trim_line(segB, P, True, tool_radius)
         i += 1
+
     return result
 
+
+# ===== Hücre 8 =====
 def split_by_wait(segments):
+    """Segment listesini WAIT komutlarına göre aşamalara (stage) böler."""
     stages = [[]]
     for seg in segments:
-        if seg['type'] == 'wait': stages.append([])
-        else: stages[-1].append(seg)
+        if seg['type'] == 'wait':
+            stages.append([])
+        else:
+            stages[-1].append(seg)
     return stages
 
+
 def synchronize(channels_segments):
+    """
+    3 kanalın segment listelerini alır, WAIT noktalarında birbirini
+    bekleyecek şekilde mutlak zaman çizelgesi (timeline) üretir.
+    Döndürür: (timelines, toplam_sure)
+      timelines[i] = [(t_baslangic, t_bitis, segment), ...]
+    """
     stages_per_channel = [split_by_wait(segs) for segs in channels_segments]
     max_stage_count = max(len(s) for s in stages_per_channel)
+
     timelines = [[] for _ in channels_segments]
     current_time = [0.0] * len(channels_segments)
+
     for k in range(max_stage_count):
         stage_end_times = []
         for ci, stages in enumerate(stages_per_channel):
@@ -335,24 +403,36 @@ def synchronize(channels_segments):
                 current_time[ci] = t
                 stage_end_times.append(t)
         if stage_end_times:
-            sync_t = max(stage_end_times)
+            sync_t = max(stage_end_times)  # en yavaş kanalı bekle
             for ci, stages in enumerate(stages_per_channel):
-                if k < len(stages): current_time[ci] = sync_t
+                if k < len(stages):
+                    current_time[ci] = sync_t
+
     total_time = max(current_time) if current_time else 0.0
     return timelines, total_time
 
+
 def _dwell_point(seg, key):
-    if key == 'orig_points': return seg.get('orig_point', seg['point'])
+    """G4 (bekleme) segmentinde konum: takım merkezi için 'point',
+    temas noktası için (varsa) 'orig_point'."""
+    if key == 'orig_points':
+        return seg.get('orig_point', seg['point'])
     return seg['point']
 
+
 def get_position(timeline, t, key='points'):
-    if not timeline: return (0.0, 0.0)
+    """Verilen zamanda kanalın konumunu (x,y) döndürür (ara değerleme ile).
+    key='points' -> takım merkezi yolu, key='orig_points' -> takım kenarının
+    (kalıp konturuna değdiği) temas noktası yolu."""
+    if not timeline:
+        return (0.0, 0.0)
     if t <= timeline[0][0]:
         first = timeline[0][2]
         return _dwell_point(first, key) if first['type'] == 'dwell' else first[key][0]
     for (t0, t1, seg) in timeline:
         if t0 <= t <= t1:
-            if seg['type'] == 'dwell': return _dwell_point(seg, key)
+            if seg['type'] == 'dwell':
+                return _dwell_point(seg, key)
             pts = seg[key]
             frac = 1.0 if t1 == t0 else (t - t0) / (t1 - t0)
             idx = frac * (len(pts) - 1)
@@ -364,33 +444,48 @@ def get_position(timeline, t, key='points'):
     last = timeline[-1][2]
     return _dwell_point(last, key) if last['type'] == 'dwell' else last[key][-1]
 
+
 def _seg_points(seg, key, n=None):
+    """Segmentin noktalarını döndürür; temas noktası izinde (orig_points)
+    sıçrama (orig_breaks) varsa araya NaN koyar (çizimde çizgi kopuk görünür).
+    n verilirse sadece ilk n nokta alınır."""
     pts = seg[key]
     limit = len(pts) if n is None else n
     brk = seg.get('orig_breaks') if key == 'orig_points' else None
-    if not brk: return list(pts[:limit])
+    if not brk:
+        return list(pts[:limit])
     brk = set(brk)
     out = []
     for k in range(limit):
         out.append(pts[k])
-        if k in brk and k + 1 < limit: out.append((float('nan'), float('nan')))
+        if k in brk and k + 1 < limit:
+            out.append((float('nan'), float('nan')))
     return out
 
+
 def get_trail(timeline, t, key='points'):
+    """Verilen zamana kadar kat edilen tüm noktaları (iz) döndürür.
+    key='points' -> takım merkezi izi, key='orig_points' -> temas noktası izi."""
     trail = []
     for (t0, t1, seg) in timeline:
         if seg['type'] == 'dwell':
-            if t0 <= t: trail.append(_dwell_point(seg, key))
+            if t0 <= t:
+                trail.append(_dwell_point(seg, key))
             continue
         pts = seg[key]
-        if t >= t1: trail.extend(_seg_points(seg, key))
+        if t >= t1:
+            trail.extend(_seg_points(seg, key))
         elif t0 <= t < t1:
             frac = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
             idx = frac * (len(pts) - 1)
             i0 = int(np.floor(idx))
             local_frac = idx - i0
             trail.extend(_seg_points(seg, key, i0 + 1))
-            if (local_frac > 1e-9 and i0 + 1 < len(pts) and not (key == 'orig_points' and i0 in seg.get('orig_breaks', ()))):
+            # Segmentin ANLIK (henüz tamamlanmamış) noktasını da ekle; aksi
+            # halde 2 noktalı doğru segmentlerinde (i0 her zaman 0 kalır)
+            # segment bitene kadar çizgi ekranda hiç ilerlemez.
+            if (local_frac > 1e-9 and i0 + 1 < len(pts)
+                    and not (key == 'orig_points' and i0 in seg.get('orig_breaks', ()))):
                 p0 = np.array(pts[i0]); p1 = np.array(pts[i0 + 1])
                 trail.append(tuple(p0 + (p1 - p0) * local_frac))
             break
@@ -398,13 +493,21 @@ def get_trail(timeline, t, key='points'):
             break
     return trail
 
+
+# ===== Hücre 10 =====
+# -------------------------------------------------------------
+# 5b) GEOMETRİK TEMAS NOKTASI (kompanzasyondan bağımsız)
+# -------------------------------------------------------------
+
 def _densify(points, max_step):
     out = [tuple(points[0])]
     for a, b in zip(points[:-1], points[1:]):
         d = float(np.hypot(b[0] - a[0], b[1] - a[1]))
         n = max(int(np.ceil(d / max_step)), 1)
-        for k in range(1, n + 1): out.append((a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n))
+        for k in range(1, n + 1):
+            out.append((a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n))
     return out
+
 
 def _tool_contact_points(centers, mold, tool_radius, chunk=256):
     C = np.asarray(centers, float)
@@ -429,6 +532,7 @@ def _tool_contact_points(centers, mold, tool_radius, chunk=256):
         out[s:s + chunk][d <= 1e-9] = Pc[d <= 1e-9]
         dist[s:s + chunk] = d
     return out, dist
+
 
 def apply_geometric_contact(segments, mold_points, tool_radius, start_xy):
     mold = np.asarray(mold_points, float)
@@ -458,7 +562,9 @@ def apply_geometric_contact(segments, mold_points, tool_radius, start_xy):
         out.append(seg)
     return out
 
+
 def _contact_chunks(seg):
+    """Segment içindeki NaN kırılma noktalarına göre temas noktalarını gruplara ayırır."""
     pts = seg['orig_points']
     breaks = set(seg.get('orig_breaks', []))
     chunks = []
@@ -466,390 +572,862 @@ def _contact_chunks(seg):
     for k, p in enumerate(pts):
         current.append(p)
         if k in breaks:
-            if current: chunks.append(current)
+            if current:
+                chunks.append(current)
             current = []
-    if current: chunks.append(current)
+    if current:
+        chunks.append(current)
     return chunks
 
-def _run_simulation_data(x1, y1, tr1, fd1, code1,
-                         x2, y2, tr2, fd2, code2,
-                         x3, y3, tr3, fd3, code3,
-                         m_x0, m_y0, m_code, contact_mode):
-    mold_cmds = parse_gcode(m_code)
-    mold_segs = simulate_channel(mold_cmds, m_x0, m_y0, 0.0, 1000.0)
-    mold_points = [(m_x0, m_y0)]
+
+# ===== Hücre 12 =====
+import json, os, io, uuid, time, tempfile, threading, traceback, pprint
+import numpy as np
+import pandas as pd
+
+CHANNEL_COLORS = ['#0072B2', '#D55E00', '#0072B2']   # renk körü dostu 2 renk (sırayla)
+N_CH = 3
+
+# -------------------------------------------------------------
+# VARSAYILAN DEĞERLER  (JSON ile kaydettiğin değerleri istersen
+# arayüzdeki "Varsayılanları Python kodu olarak al" butonuyla buraya yapıştırabilirsin)
+# -------------------------------------------------------------
+DEMO_GCODE = [
+    "G1 X0 Y0 F800\nG1 X40 Y0\nG41\nG1 X40 Y30\nG2 X20 Y50 R20\nG1 X0 Y50\nG40\nWAIT\nG1 X0 Y0",
+    "G1 X60 Y60 F600\nWAIT\nG1 X10 Y10\nG3 X30 Y10 R-15\nG1 X10 Y10",
+    "G1 X-20 Y-20 F1000\nG4 P1\nWAIT\nG1 X-20 Y40",
+]
+
+DEFAULT_CHANNELS = [
+    {'x0': -275.0,   'y0': -100.0, 'tr': 15.0, 'fd': 800.0, 'y_offset': 0.0, 'code': DEMO_GCODE[0]},
+    {'x0': -286.075, 'y0': -99.5,  'tr': 15.0, 'fd': 800.0, 'y_offset': 0.0, 'code': DEMO_GCODE[1]},
+    {'x0': -275.0,   'y0': -100.0, 'tr': 15.0, 'fd': 800.0, 'y_offset': 0.0, 'code': DEMO_GCODE[2]},
+]
+DEFAULT_MOLD = {
+    'x0': -30.0, 'y0': -30.0,
+    'code': "G1 X30 Y-30 F1000\nG1 X30 Y30\nG2 X-30 Y30 I-30 J0\nG1 X-30 Y-30",
+}
+DEFAULT_CONTACT_MODE = 'geometric'
+CONTACT_MODE_CHOICES = [
+    ('Geometrik: takım dairesi ile kalıp arasındaki en dar nokta (G40/G41/G42 fark etmez)', 'geometric'),
+    ('Programlanan: G41/G42 konturu, G40 takım merkezi (eski davranış)', 'programmed'),
+]
+
+N_CFG = 22   # arayüzden gelen konfigürasyon değeri sayısı: 3 kanal x 6 + kalıp 3 + mod 1
+
+
+def _num(v, default=0.0):
+    """Boş bırakılan / bozuk sayı alanlarını güvenle float'a çevirir."""
+    try:
+        if v is None:
+            return default
+        f = float(v)
+        return default if np.isnan(f) else f
+    except Exception:
+        return default
+
+
+def cfg_from_values(v):
+    """Gradio bileşen değerleri listesi (22 eleman) -> konfigürasyon sözlüğü."""
+    channels = []
+    for k in range(N_CH):
+        b = k * 6
+        channels.append({
+            'x0': _num(v[b]), 'y0': _num(v[b + 1]), 'tr': _num(v[b + 2], 10.0),
+            'fd': _num(v[b + 3], 1000.0), 'y_offset': _num(v[b + 4]),
+            'code': v[b + 5] or '',
+        })
+    mold = {'x0': _num(v[18]), 'y0': _num(v[19]), 'code': v[20] or ''}
+    mode = v[21] if v[21] in ('geometric', 'programmed') else 'geometric'
+    return {'channels': channels, 'mold': mold, 'contact_mode': mode}
+
+
+# -------------------------------------------------------------
+# Widget'tan bağımsız build_channels (Colab'daki ile aynı mantık)
+# -------------------------------------------------------------
+def get_mold_points_cfg(mold):
+    mold_cmds = parse_gcode(mold['code'])
+    mold_segs = simulate_channel(mold_cmds, mold['x0'], mold['y0'], 0.0, 1000.0)
+    pts = [(mold['x0'], mold['y0'])]
     for seg in mold_segs:
         if seg['type'] == 'move':
-            mold_points.extend(seg['points'])
+            pts.extend(seg['points'])
+    return pts
 
-    use_geo = (contact_mode == 'geometric')
-    note = ""
+
+def build_channels_cfg(cfg):
+    mold_points = get_mold_points_cfg(cfg['mold'])
+    use_geo = (cfg['contact_mode'] == 'geometric')
+    note = ''
     if use_geo and len(mold_points) < 2:
         use_geo = False
-        note = "Uyarı: Kalıp G-kodu boş - programlanan yol kullanılıyor.\n"
-
-    inputs = [
-        {'x0': x1, 'y0': y1, 'tr': tr1, 'fd': fd1, 'code': code1},
-        {'x0': x2, 'y0': y2, 'tr': tr2, 'fd': fd2, 'code': code2},
-        {'x0': x3, 'y0': y3, 'tr': tr3, 'fd': fd3, 'code': code3}
-    ]
-
-    channels_segments = []
-    start_points = []
-    radii = []
-
-    for idx, inp in enumerate(inputs):
-        cmds = parse_gcode(inp['code'])
-        segs = simulate_channel(cmds, inp['x0'], inp['y0'], inp['tr'], inp['fd'], y_offset=0.0)
-        segs = apply_corner_compensation(segs, inp['tr'])
+        note = ("Uyarı: Kalıp G-kodu boş (tek nokta) - geometrik temas noktası "
+                "hesaplanamadı, programlanan yol kullanılıyor.")
+    channels_segments, start_points, radii = [], [], []
+    for ch in cfg['channels']:
+        cmds = parse_gcode(ch['code'])
+        segs = simulate_channel(cmds, ch['x0'], ch['y0'], ch['tr'], ch['fd'], y_offset=ch['y_offset'])
+        segs = apply_corner_compensation(segs, ch['tr'])
         if use_geo:
-            segs = apply_geometric_contact(segs, mold_points, inp['tr'], (inp['x0'], inp['y0']))
+            segs = apply_geometric_contact(segs, mold_points, ch['tr'], (ch['x0'], ch['y0']))
             gaps = [s['gap_min'] for s in segs if 'gap_min' in s]
             if gaps and min(gaps) < -0.05:
-                note += f"Uyarı: Kanal {idx + 1} takım dairesi kalıba giriyor (en küçük boşluk = {min(gaps):.2f}).\n"
+                note += (f"\nUyarı: Kanal {len(channels_segments) + 1} takım dairesi kalıba giriyor "
+                         f"(en küçük boşluk = {min(gaps):.2f}). Takım yarıçapını / yolu / G41-G42 yönünü kontrol et.")
         channels_segments.append(segs)
-        start_points.append((inp['x0'], inp['y0']))
-        radii.append(inp['tr'])
+        start_points.append((ch['x0'], ch['y0']))
+        radii.append(ch['tr'])
+    return channels_segments, start_points, radii, mold_points, note.strip()
 
-    return channels_segments, start_points, radii, mold_points, note
 
-def run_all_gradio_analyses(x1, y1, tr1, fd1, code1,
-                            x2, y2, tr2, fd2, code2,
-                            x3, y3, tr3, fd3, code3,
-                            m_x0, m_y0, m_code, contact_mode,
-                            ac_start, ac_end, ac_step):
+# ===== Hücre 14 =====
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.patches import Circle
+from PIL import Image
+
+
+def _is_g0(seg):
+    return seg.get('feed', 1000.0) >= 3000.0
+
+
+def _plot_limits(mold_points, start_points, radii, margin_mult):
+    all_x = [p[0] for p in mold_points] + [s[0] for s in start_points]
+    all_y = [p[1] for p in mold_points] + [s[1] for s in start_points]
+    margin = max(15.0, max(radii) * margin_mult)
+    return (min(all_x) - margin, max(all_x) + margin), (min(all_y) - margin, max(all_y) + margin)
+
+
+def _mold_closest_fn(mold_points):
+    """Verilen noktanın kalıp konturundaki en yakın noktasını ve mesafesini döndüren fonksiyon üretir."""
+    mold = np.asarray(mold_points, float)
+    A = mold[:-1]
+    AB = mold[1:] - A
+    L2 = np.maximum((AB ** 2).sum(1), 1e-18)
+
+    def closest(point):
+        p = np.array(point, float)
+        ap = p - A
+        t = np.clip((ap * AB).sum(1) / L2, 0.0, 1.0)
+        proj = A + t[:, None] * AB
+        dists = np.sqrt(((proj - p) ** 2).sum(1))
+        k = dists.argmin()
+        return tuple(proj[k]), float(dists[k])
+    return closest
+
+
+# -------------------------------------------------------------
+# 7b) Büyük karşılaştırma grafiği (G0 hariç)
+# -------------------------------------------------------------
+def plot_comparison_fig(channels_segments, start_points, radii, mold_points):
+    fig = Figure(figsize=(14, 10), dpi=100)
+    ax = fig.add_subplot(111)
+    fig.subplots_adjust(right=0.80)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.set_aspect('equal')
+    ax.set_title('Büyük Boyutlu Net Kontur Karşılaştırması (G0 Hareketi Hariç - Her Kod Satırı Farklı Renk)',
+                 fontsize=14, pad=15)
+    ax.set_xlabel('X Koordinatı (mm)', fontsize=11)
+    ax.set_ylabel('Y Koordinatı (mm)', fontsize=11)
+
+    if len(mold_points) > 1:
+        ax.plot([p[0] for p in mold_points], [p[1] for p in mold_points],
+                color='black', linewidth=1.2, linestyle='-', label='Kalıp Konturu (Sabit)')
+
+    for i in range(N_CH):
+        drawn = set()
+        for seg in channels_segments[i]:
+            if seg['type'] == 'move' and not _is_g0(seg) and seg['orig_points']:
+                c_idx = seg.get('color_idx', 0)
+                color = CHANNEL_COLORS[c_idx % 2]
+                for pts in _contact_chunks(seg):
+                    key = f"K{i+1}_S{c_idx % 2}"
+                    lbl = ''
+                    if key not in drawn:
+                        lbl = f'Kanal {i+1} - Satır Grubu {c_idx % 2 + 1}'
+                        drawn.add(key)
+                    ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, linewidth=3.0, label=lbl)
+        sx, sy = start_points[i]
+        ax.plot(sx, sy, 'o', color=CHANNEL_COLORS[0], markersize=8,
+                label=f'Kanal {i+1} Başlangıç ({sx:.1f}, {sy:.1f})')
+
+    xl, yl = _plot_limits(mold_points, start_points, radii, 3.0)
+    ax.set_xlim(*xl)
+    ax.set_ylim(*yl)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0), borderaxespad=0, fontsize=9, shadow=True)
+    return fig
+
+
+# -------------------------------------------------------------
+# 7c) Kanal bazlı detaylı grafik + kalıp mesafe ölçüleri
+# -------------------------------------------------------------
+def plot_channel_fig(i, channels_segments, start_points, radii, mold_points):
+    closest = _mold_closest_fn(mold_points)
+    xl, yl = _plot_limits(mold_points, start_points, radii, 3.0)
+
+    fig = Figure(figsize=(16, 11), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.set_aspect('equal')
+    ax.set_xlim(*xl)
+    ax.set_ylim(*yl)
+    ax.set_title(f'Kanal {i+1} Detaylı Kontur ve Kalıp Mesafesi Analizi', fontsize=16, pad=14)
+    ax.set_xlabel('X Koordinatı (mm)', fontsize=12)
+    ax.set_ylabel('Y Koordinatı (mm)', fontsize=12)
+
+    if len(mold_points) > 1:
+        ax.plot([p[0] for p in mold_points], [p[1] for p in mold_points],
+                color='black', linewidth=2.0, linestyle='-', label='Kalıp Konturu')
+
+    drawn = set()
+    for seg in channels_segments[i]:
+        if seg['type'] == 'move' and not _is_g0(seg) and seg['orig_points']:
+            c_idx = seg.get('color_idx', 0)
+            color = CHANNEL_COLORS[c_idx % 2]
+            for pts in _contact_chunks(seg):
+                key = f"S{c_idx % 2}"
+                lbl = ''
+                if key not in drawn:
+                    lbl = f'Satır Grubu {c_idx % 2 + 1} Yolu'
+                    drawn.add(key)
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, linewidth=3.5, label=lbl)
+
+            pts = seg['orig_points']
+            n = len(pts)
+            for kp in (pts[0], pts[n // 2], pts[-1]):
+                cp, d = closest(kp)
+                ax.plot([kp[0], cp[0]], [kp[1], cp[1]], color='red', linestyle=':', linewidth=1.4, alpha=0.85)
+                ax.plot(kp[0], kp[1], 'o', color='red', markersize=5)
+                dx, dy = kp[0] - cp[0], kp[1] - cp[1]
+                norm = float(np.hypot(dx, dy))
+                if norm > 1e-3:
+                    ox, oy = dx / norm * 2.5, dy / norm * 2.5     # etiketi kalıptan dışarı doğru ötele
+                else:
+                    ox, oy = 0.5, 1.5
+                ax.text(kp[0] + ox, kp[1] + oy, f"{d:.2f}mm", color='darkred', fontsize=9, fontweight='bold',
+                        va='center', ha='center',
+                        bbox=dict(facecolor='white', alpha=0.85, edgecolor='none', boxstyle='round,pad=0.25'))
+
+    sx, sy = start_points[i]
+    ax.plot(sx, sy, 'o', color=CHANNEL_COLORS[0], markersize=10, label='Başlangıç Noktası')
+    ax.legend(loc='upper right', fontsize=11, shadow=True)
+    return fig
+
+
+def fig_to_svg_card(fig):
+    """Vektörel SVG + 'Tam Ekran' düğmesi içeren HTML kartı üretir (gr.HTML içinde gösterilir)."""
+    buf = io.StringIO()
+    fig.savefig(buf, format='svg', bbox_inches='tight')
+    svg = buf.getvalue()
+    svg = svg[svg.find('<svg'):]
+    svg = svg.replace('<svg ', '<svg style="max-width:100%;height:auto;" ', 1)
+    uid = 'svgw' + uuid.uuid4().hex[:8]
+    css = (f"#{uid}:fullscreen{{padding:10px!important;background:#fff!important;width:100vw!important;"
+           f"height:100vh!important;box-sizing:border-box!important;display:flex!important;"
+           f"flex-direction:column!important;align-items:center!important;justify-content:center!important;}}"
+           f"#{uid}:fullscreen svg{{width:95vw!important;height:85vh!important;"
+           f"max-width:98vw!important;max-height:88vh!important;}}")
+    onclick = (f"var e=document.getElementById('{uid}');"
+               "if(!document.fullscreenElement){e.requestFullscreen().catch(function(err){"
+               "alert('Tam ekran moduna geçilemedi: '+err.message);});}"
+               "else{document.exitFullscreen();}")
+    return (f'<div id="{uid}" style="width:100%;display:flex;flex-direction:column;align-items:center;'
+            f'padding:10px;background:#fff;border-radius:8px;border:1px solid #ddd;box-sizing:border-box;">'
+            f'<style>{css}</style>'
+            f'<button onclick="{onclick}" style="margin-bottom:10px;padding:8px 16px;font-size:12px;'
+            f'font-weight:bold;cursor:pointer;background:#0072B2;color:#fff;border:none;border-radius:4px;">'
+            f'🔍 Tam Ekran Yap / Çık</button>'
+            f'<div style="width:100%;display:flex;justify-content:center;align-items:center;background:#fff;">'
+            f'{svg}</div></div>')
+
+
+# -------------------------------------------------------------
+# Mesafe tablosu (Colab 7c-analiz hücresi)
+# -------------------------------------------------------------
+def distance_table(channels_segments, mold_points):
+    if len(mold_points) < 2:
+        return pd.DataFrame(columns=['Kanal', 'Segment No', 'Başlangıç (mm)', 'Orta (mm)', 'Bitiş (mm)'])
+    closest = _mold_closest_fn(mold_points)
+    rows = []
+    for i in range(N_CH):
+        for s_idx, seg in enumerate(channels_segments[i]):
+            if seg['type'] == 'move' and not _is_g0(seg) and seg['orig_points']:
+                pts = seg['orig_points']
+                n = len(pts)
+                rows.append({
+                    'Kanal': f"Kanal {i+1}",
+                    'Segment No': f"Kod: {seg.get('color_idx', s_idx)}",
+                    'Başlangıç (mm)': round(closest(pts[0])[1], 4),
+                    'Orta (mm)': round(closest(pts[n // 2])[1], 4),
+                    'Bitiş (mm)': round(closest(pts[-1])[1], 4),
+                })
+    return pd.DataFrame(rows, columns=['Kanal', 'Segment No', 'Başlangıç (mm)', 'Orta (mm)', 'Bitiş (mm)'])
+
+
+# -------------------------------------------------------------
+# AutoCAD çember / path kodları (Colab bölüm 9 ve 10)
+# -------------------------------------------------------------
+def autocad_circles_text(timelines, total_time, radii, start_t, end_t, step_t):
+    if end_t <= start_t or step_t <= 0:
+        raise ValueError("Geçersiz zaman aralığı veya adım büyüklüğü (Bitiş > Başlangıç ve Adım > 0 olmalı).")
+    n = int(np.floor((end_t - start_t) / step_t + 1e-9)) + 1
+    if n > 100000:
+        raise ValueError(f"Çok fazla çember üretilecek ({n}). Zaman adımını büyüt.")
+    per_channel = [[] for _ in range(N_CH)]
+    for t in start_t + step_t * np.arange(n):
+        t_c = max(0.0, min(float(t), total_time))
+        for i in range(N_CH):
+            c = get_position(timelines[i], t_c, 'points')
+            per_channel[i].append(f"_CIRCLE {c[0]:.4f},{c[1]:.4f} {radii[i]:.4f}")
+    lines = []
+    for i in range(N_CH):
+        lines.append(f"; Kanal {i+1} Çember Kodları")
+        lines.extend(per_channel[i])
+        if i < N_CH - 1:
+            lines.append("")
+    return "\n".join(lines)
+
+
+def autocad_paths_text(channels_segments):
+    lines = []
+    for i in range(N_CH):
+        cmds = []
+        for seg in channels_segments[i]:
+            if seg['type'] == 'move' and seg['orig_points']:
+                for pts in _contact_chunks(seg):
+                    cmds.append("_PLINE " + " ".join(f"{q[0]:.4f},{q[1]:.4f}" for q in pts))
+        if cmds:
+            lines.append(f"; Kanal {i+1} İşlenmiş Kontur Kodları")
+            lines.extend(cmds)
+            if i < N_CH - 1:
+                lines.append("")
+    return "\n".join(lines)
+
+
+# ===== Hücre 16 =====
+# -------------------------------------------------------------
+# ANİMASYON SAHNESİ (canlı oynatıcı ve MP4 aynı kodu kullanır)
+# -------------------------------------------------------------
+def _scene_bounds(channels_segments, start_points, radii, mold_points):
+    all_x, all_y = [p[0] for p in mold_points], [p[1] for p in mold_points]
+    for segs, (sx, sy) in zip(channels_segments, start_points):
+        all_x.append(sx); all_y.append(sy)
+        for seg in segs:
+            if seg['type'] == 'move':
+                all_x.extend(p[0] for p in seg['orig_points'])
+                all_y.extend(p[1] for p in seg['orig_points'])
+    margin = max(10.0, max(radii) * 2)
+    return min(all_x) - margin, max(all_x) + margin, min(all_y) - margin, max(all_y) + margin
+
+
+def build_scene(channels_segments, start_points, radii, mold_points):
+    xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points)
+    fig = Figure(figsize=(8.5, 6.0), dpi=90)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    fig.subplots_adjust(right=0.73)          # sağda açıklama kutusu için boşluk
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_title("CNC Simülasyonu")
+    if len(mold_points) > 1:
+        ax.plot([p[0] for p in mold_points], [p[1] for p in mold_points],
+                color='black', linewidth=1.0, linestyle='-', label='Kalıp (sabit)')
+
+    sc = {'fig': fig, 'canvas': canvas, 'contact_lines': [], 'tool_circles': [],
+          'spoke_lines': [], 'contact_dots': [], 'tool_centers': []}
+    for i in range(N_CH):
+        (cline,) = ax.plot([], [], color=CHANNEL_COLORS[i], linewidth=2.2, label=f'Kanal {i+1} — kontur')
+        circ = Circle((0, 0), radii[i], facecolor=CHANNEL_COLORS[i], alpha=0.22,
+                      edgecolor=CHANNEL_COLORS[i], linewidth=1.8)
+        ax.add_patch(circ)
+        (spoke,) = ax.plot([], [], color=CHANNEL_COLORS[i], linewidth=1.2)
+        (dot,) = ax.plot([], [], 'o', color=CHANNEL_COLORS[i], markersize=5)
+        (center,) = ax.plot([], [], '+', color=CHANNEL_COLORS[i], markersize=7, markeredgewidth=1.5)
+        sc['contact_lines'].append(cline); sc['tool_circles'].append(circ)
+        sc['spoke_lines'].append(spoke); sc['contact_dots'].append(dot); sc['tool_centers'].append(center)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.04, 1.0), borderaxespad=0, fontsize=8)
+    sc['time_text'] = ax.text(0.02, 0.98, '', transform=ax.transAxes, va='top', fontsize=9)
+    return sc
+
+
+def render_scene(sc, timelines, total_time, t):
+    for i in range(N_CH):
+        center_pos = get_position(timelines[i], t, 'points')
+        contact_pos = get_position(timelines[i], t, 'orig_points')
+        trail = get_trail(timelines[i], t, 'orig_points')
+        if trail:
+            sc['contact_lines'][i].set_data([p[0] for p in trail], [p[1] for p in trail])
+        else:
+            sc['contact_lines'][i].set_data([], [])
+        sc['tool_circles'][i].center = center_pos
+        sc['tool_centers'][i].set_data([center_pos[0]], [center_pos[1]])
+        sc['contact_dots'][i].set_data([contact_pos[0]], [contact_pos[1]])
+        sc['spoke_lines'][i].set_data([center_pos[0], contact_pos[0]], [center_pos[1], contact_pos[1]])
+    sc['time_text'].set_text(f't = {t:.2f} / {total_time:.2f} s')
+
+
+def scene_rgb(sc):
+    sc['canvas'].draw()
+    return np.array(sc['canvas'].buffer_rgba())[:, :, :3]
+
+
+# -------------------------------------------------------------
+# Canlı oynatıcı için sunucu tarafı önbellek (oturum başına bir 'token')
+# -------------------------------------------------------------
+_ANIM = {}
+_ANIM_LOCK = threading.RLock()
+
+
+def register_anim(channels_segments, start_points, radii, mold_points, timelines, total_time, fps, speed):
+    sc = build_scene(channels_segments, start_points, radii, mold_points)
+    n_frames = max(int(total_time * fps / speed), 2)
+    token = uuid.uuid4().hex
+    with _ANIM_LOCK:
+        _ANIM[token] = {'scene': sc, 'timelines': timelines, 'total_time': total_time, 'n_frames': n_frames}
+        while len(_ANIM) > 8:                       # eski oturumları temizle
+            _ANIM.pop(next(iter(_ANIM)))
+    return token, n_frames
+
+
+def render_frame_image(token, frame):
+    with _ANIM_LOCK:
+        a = _ANIM.get(token)
+        if not a:
+            return None
+        frame = int(max(0, min(int(frame or 0), a['n_frames'])))
+        t = (frame / a['n_frames']) * a['total_time']
+        render_scene(a['scene'], a['timelines'], a['total_time'], t)
+        return Image.fromarray(scene_rgb(a['scene']))
+
+
+def playback_interval(fps, speed):
+    return max(1.0 / max(fps * speed, 1e-6), 0.08)   # Gradio sunucu turu nedeniyle alt sınır
+
+
+# -------------------------------------------------------------
+# MP4 (Colab bölüm 8) - kareleri belleğe biriktirmeden akış halinde yazar
+# -------------------------------------------------------------
+def _even_crop(img):
+    h, w = img.shape[:2]
+    return img[:h - (h % 2), :w - (w % 2)]
+
+
+def mp4_generator(channels_segments, start_points, radii, mold_points, timelines, total_time, fps, path):
+    """Her ~5 karede bir (kare_no, toplam) üretir; bittiğinde dosya yazılmış olur."""
+    sc = build_scene(channels_segments, start_points, radii, mold_points)
+    n_frames = max(int(total_time * fps), 2)
+    writer, frames = None, None
     try:
-        channels_segments, start_points, radii, mold_points, note = _run_simulation_data(
-            x1, y1, tr1, fd1, code1,
-            x2, y2, tr2, fd2, code2,
-            x3, y3, tr3, fd3, code3,
-            m_x0, m_y0, m_code, contact_mode
-        )
+        try:
+            import imageio.v2 as iio
+        except ImportError:
+            import imageio as iio
+        writer = iio.get_writer(path, fps=fps, codec='libx264', pixelformat='yuv420p', macro_block_size=1)
+    except Exception:
+        writer, frames = None, []            # imageio-ffmpeg yoksa moviepy'ye düş
 
-        fig_comp, ax_comp = plt.subplots(figsize=(10, 8), dpi=100)
-        ax_comp.grid(True, linestyle='--', alpha=0.5)
-        ax_comp.set_aspect('equal')
-        ax_comp.set_title('Genel Kontur Karşılaştırması', fontsize=12)
-        if len(mold_points) > 1:
-            ax_comp.plot([p[0] for p in mold_points], [p[1] for p in mold_points], color='black', linewidth=1.5, label='Kalıp Konturu')
-        for i in range(3):
-            for seg in channels_segments[i]:
-                is_g0 = seg.get('feed', 1000.0) >= 3000.0
-                if seg['type'] == 'move' and not is_g0 and seg['orig_points']:
-                    c_idx = seg.get('color_idx', 0)
-                    for pts in _contact_chunks(seg):
-                        ax_comp.plot([p[0] for p in pts], [p[1] for p in pts], color=CHANNEL_COLORS[c_idx % 2], linewidth=2.0)
-            ax_comp.plot(start_points[i][0], start_points[i][1], 'o', color=CHANNEL_COLORS[0], markersize=6)
-        ax_comp.legend(loc='upper right', fontsize=8)
-        plt.tight_layout()
+    for k in range(n_frames):
+        render_scene(sc, timelines, total_time, (k / n_frames) * total_time)
+        img = _even_crop(scene_rgb(sc))
+        if writer is not None:
+            writer.append_data(img)
+        else:
+            frames.append(img.copy())
+        if k % 5 == 0 or k == n_frames - 1:
+            yield k + 1, n_frames
+    if writer is not None:
+        writer.close()
+    else:
+        try:
+            from moviepy.editor import ImageSequenceClip
+        except Exception:
+            from moviepy import ImageSequenceClip
+        clip = ImageSequenceClip(frames, fps=fps)
+        clip.write_videofile(path, fps=fps, codec='libx264', logger=None,
+                             ffmpeg_params=['-pix_fmt', 'yuv420p'])
 
-        svg_outputs = []
-        mold = np.asarray(mold_points, float)
-        A = mold[:-1]
-        AB = mold[1:] - A
-        L2 = np.maximum((AB ** 2).sum(1), 1e-18)
 
-        def get_closest_mold_point_and_dist(point):
-            p = np.array(point, float)
-            ap = p - A
-            t = np.clip((ap * AB).sum(1) / L2, 0.0, 1.0)
-            proj = A + t[:, None] * AB
-            dists = np.sqrt(((proj - p) ** 2).sum(1))
-            min_idx = dists.argmin()
-            return tuple(proj[min_idx]), float(dists[min_idx])
+# -------------------------------------------------------------
+# JSON kaydet / yükle (Colab bölüm 11 ile uyumlu + y_offset ve AutoCAD ayarları eklendi)
+# -------------------------------------------------------------
+def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step):
+    data = {'channels': [], 'mold': dict(cfg['mold']),
+            'settings': {'contact_mode': cfg['contact_mode'], 'fps': fps, 'speed': speed},
+            'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step}}
+    for idx, ch in enumerate(cfg['channels']):
+        data['channels'].append({'channel_id': idx + 1, 'x0': ch['x0'], 'y0': ch['y0'], 'tr': ch['tr'],
+                                 'fd': ch['fd'], 'y_offset': ch['y_offset'], 'code': ch['code']})
+    return data
 
-        for i in range(3):
-            fig_ind, ax_ind = plt.subplots(figsize=(8, 6), dpi=100)
-            ax_ind.grid(True, linestyle='--', alpha=0.5)
-            ax_ind.set_aspect('equal')
-            ax_ind.set_title(f'Kanal {i+1} Detaylı Kontur ve Kalıp Mesafesi', fontsize=12)
-            if len(mold_points) > 1:
-                ax_ind.plot([p[0] for p in mold_points], [p[1] for p in mold_points], color='black', linewidth=1.5, label='Kalıp Konturu')
 
-            for seg in channels_segments[i]:
-                is_g0 = seg.get('feed', 1000.0) >= 3000.0
-                if seg['type'] == 'move' and not is_g0 and seg['orig_points']:
-                    c_idx = seg.get('color_idx', 0)
-                    for pts in _contact_chunks(seg):
-                        ax_ind.plot([p[0] for p in pts], [p[1] for p in pts], color=CHANNEL_COLORS[c_idx % 2], linewidth=2.5)
-                    pts = seg['orig_points']
-                    n = len(pts)
-                    key_points = [pts[0], pts[n // 2], pts[-1]]
-                    for kp in key_points:
-                        closest_p, d = get_closest_mold_point_and_dist(kp)
-                        ax_ind.plot([kp[0], closest_p[0]], [kp[1], closest_p[1]], color='red', linestyle=':', linewidth=1.0)
-                        ax_ind.plot(kp[0], kp[1], 'o', color='red', markersize=5)
-                        ax_ind.text(kp[0] + 1.0, kp[1] + 1.0, f"{d:.2f}mm", color='darkred', fontsize=7)
-            ax_ind.plot(start_points[i][0], start_points[i][1], 'o', color=CHANNEL_COLORS[0], markersize=6, label='Başlangıç')
-            ax_ind.legend(loc='upper right', fontsize=8)
-            plt.tight_layout()
+def json_dict_to_updates(data, gr_update):
+    """JSON sözlüğünü bileşen güncellemelerine çevirir (27 eleman: 22 cfg + fps + speed + 3 AutoCAD).
+    JSON'da olmayan alanlar mevcut değerini korur (gr_update() boş güncelleme)."""
+    def pick(d, key):
+        return gr_update(value=d[key]) if key in d else gr_update()
+    ups = []
+    chans = data.get('channels', []) or []
+    for k in range(N_CH):
+        ch = chans[k] if k < len(chans) else {}
+        for key in ('x0', 'y0', 'tr', 'fd', 'y_offset', 'code'):
+            ups.append(pick(ch, key))
+    mold = data.get('mold', {}) or {}
+    for key in ('x0', 'y0', 'code'):
+        ups.append(pick(mold, key))
+    st = data.get('settings', {}) or {}
+    ups.append(pick(st, 'contact_mode'))
+    ups.append(pick(st, 'fps'))
+    ups.append(pick(st, 'speed'))
+    ac = data.get('autocad', {}) or {}
+    for key in ('start', 'end', 'step'):
+        ups.append(pick(ac, key))
+    return ups
 
-            svg_io = io.StringIO()
-            fig_ind.savefig(svg_io, format='svg', bbox_inches='tight')
-            plt.close(fig_ind)
-            svg_data = svg_io.getvalue()
 
-            svg_container = f"""
-            <div id="svg-wrapper-{i}" class="custom-fullscreen-container" style="width:100%; display:flex; flex-direction:column; align-items:center; padding:10px; background-color:white; border-radius:8px; border: 1px solid #ddd; position:relative;">
-                <button onclick=\"var elem = document.getElementById('svg-wrapper-{i}'); if (!document.fullscreenElement) {{ elem.requestFullscreen().catch(err => {{ alert('Error: ' + err.message); }}); }} else {{ document.exitFullscreen(); }}\" style="margin-bottom:10px; padding:8px 16px; font-size:12px; font-weight:bold; cursor:pointer; background-color:#0072B2; color:white; border:none; border-radius:4px;">
-                    🔍 Tam Ekran Yap / Çık
-                </button>
-                <div style="width:100%; display:flex; justify-content:center; align-items:center; background-color:white;">
-                    {svg_data}
-                </div>
-            </div>
-            """
-            svg_outputs.append(svg_container)
+# ===== Hücre 18 =====
+import gradio as gr
 
-        distance_rows = []
-        for i in range(3):
-            for s_idx, seg in enumerate(channels_segments[i]):
-                is_g0 = seg.get('feed', 1000.0) >= 3000.0
-                if seg['type'] == 'move' and not is_g0 and seg['orig_points']:
-                    pts = seg['orig_points']
-                    n = len(pts)
-                    d_start = get_closest_mold_point_and_dist(pts[0])[1]
-                    d_mid = get_closest_mold_point_and_dist(pts[n // 2])[1]
-                    d_end = get_closest_mold_point_and_dist(pts[-1])[1]
-                    distance_rows.append({
-                        'Kanal': f"Kanal {i+1}",
-                        'Segment No': f"Kod: {seg.get('color_idx', s_idx)}",
-                        'Başlangıç (mm)': round(d_start, 4),
-                        'Orta (mm)': round(d_mid, 4),
-                        'Bitiş (mm)': round(d_end, 4)
-                    })
-        df_dist = pd.DataFrame(distance_rows)
+N_ANIM_OUT = 12   # run_all çıktı sayısı
 
-        timelines, total_time = synchronize(channels_segments)
-        if not ac_step or ac_step <= 0:
-            ac_step = 0.1
-        ac_circles = [f"; Kanal Çember Kodları (Zaman: {ac_start}s - {ac_end}s, Adım: {ac_step}s)"]
-        for t in np.arange(ac_start, ac_end + ac_step, ac_step):
-            t_clamped = max(0.0, min(t, total_time))
-            for i in range(3):
-                center_pos = get_position(timelines[i], t_clamped, 'points')
-                ac_circles.append(f"_CIRCLE {center_pos[0]:.4f},{center_pos[1]:.4f} {radii[i]:.4f}")
-        ac_circles_txt = "\n".join(ac_circles)
 
-        ac_paths = []
-        for i in range(3):
-            ac_paths.append(f"; Kanal {i+1} İşlenmiş Kontur Kodları")
-            for seg in channels_segments[i]:
-                if seg['type'] == 'move' and seg['orig_points']:
-                    for pts in _contact_chunks(seg):
-                        points_str = " ".join([f"{q[0]:.4f},{q[1]:.4f}" for q in pts])
-                        ac_paths.append(f"_PLINE {points_str}")
-            ac_paths.append("")
-        ac_paths_txt = "\n".join(ac_paths)
+def _split_vals(vals):
+    """vals = 22 cfg + fps + speed + ac_start + ac_end + ac_step"""
+    cfg = cfg_from_values(vals[:N_CFG])
+    fps = int(_num(vals[N_CFG], 20))
+    speed = _num(vals[N_CFG + 1], 1.0) or 1.0
+    ac_s, ac_e, ac_st = (_num(vals[N_CFG + 2], 0.0), _num(vals[N_CFG + 3], 0.0), _num(vals[N_CFG + 4], 0.1))
+    return cfg, fps, speed, ac_s, ac_e, ac_st
 
-        fps = 20
-        n_frames = max(int(total_time * fps), 2)
-        tmp_vid = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        video_filename = tmp_vid.name
-        tmp_vid.close()
 
-        all_x, all_y = [p[0] for p in mold_points], [p[1] for p in mold_points]
-        for segs, (sx, sy) in zip(channels_segments, start_points):
-            all_x.append(sx); all_y.append(sy)
-            for seg in segs:
-                if seg['type'] == 'move':
-                    all_x.extend(p[0] for p in seg['orig_points'])
-                    all_y.extend(p[1] for p in seg['orig_points'])
-        margin = max(10.0, max(radii) * 2)
-        xmin, xmax = min(all_x) - margin, max(all_x) + margin
-        ymin, ymax = min(all_y) - margin, max(all_y) + margin
-
-        fig_v, ax_v = plt.subplots(figsize=(8.0, 6.0), dpi=90)
-        fig_v.subplots_adjust(right=0.75)
-        ax_v.set_xlim(xmin, xmax)
-        ax_v.set_ylim(ymin, ymax)
-        ax_v.set_aspect('equal')
-        ax_v.grid(True, alpha=0.3)
-
-        if len(mold_points) > 1:
-            ax_v.plot([p[0] for p in mold_points], [p[1] for p in mold_points], color='black', linewidth=1.0, linestyle='-')
-
-        contact_lines, tool_circles, spoke_lines, contact_dots, tool_centers = [], [], [], [], []
-        for k in range(3):
-            (cline,) = ax_v.plot([], [], color=CHANNEL_COLORS[k], linewidth=2.2, label=f'Kanal {k+1}')
-            contact_lines.append(cline)
-            circ = plt.Circle((0, 0), radii[k], facecolor=CHANNEL_COLORS[k], alpha=0.22, edgecolor=CHANNEL_COLORS[k], linewidth=1.8)
-            ax_v.add_patch(circ)
-            tool_circles.append(circ)
-            (spoke,) = ax_v.plot([], [], color=CHANNEL_COLORS[k], linewidth=1.2)
-            spoke_lines.append(spoke)
-            (dot,) = ax_v.plot([], [], 'o', color=CHANNEL_COLORS[k], markersize=5)
-            contact_dots.append(dot)
-            (center,) = ax_v.plot([], [], '+', color=CHANNEL_COLORS[k], markersize=7, markeredgewidth=1.5)
-            tool_centers.append(center)
-
-        ax_v.legend(loc='upper left', bbox_to_anchor=(1.04, 1.0), borderaxespad=0, fontsize=8)
-        time_text = ax_v.text(0.02, 0.98, '', transform=ax_v.transAxes, va='top', fontsize=9)
-
-        def make_frame(t):
-            t_val = min(max(float(t), 0.0), total_time)
-            for k in range(3):
-                center_pos = get_position(timelines[k], t_val, 'points')
-                contact_pos = get_position(timelines[k], t_val, 'orig_points')
-                contact_trail = get_trail(timelines[k], t_val, 'orig_points')
-                if contact_trail:
-                    contact_lines[k].set_data([p[0] for p in contact_trail], [p[1] for p in contact_trail])
-                tool_circles[k].center = center_pos
-                tool_centers[k].set_data([center_pos[0]], [center_pos[1]])
-                contact_dots[k].set_data([contact_pos[0]], [contact_pos[1]])
-                spoke_lines[k].set_data([center_pos[0], contact_pos[0]], [center_pos[1], contact_pos[1]])
-            time_text.set_text(f't = {t_val:.2f} / {total_time:.2f} s')
-            fig_v.canvas.draw()
-            return np.asarray(fig_v.canvas.buffer_rgba())[:, :, :3].copy()
-
-        # Kareler tek tek üretilir (hepsini RAM'de tutmaz -> Render'da bellek taşmaz)
-        clip = VideoClip(make_frame, duration=n_frames / fps)
-        clip.write_videofile(video_filename, fps=fps, codec='libx264', audio=False, logger=None)
-        plt.close(fig_v)
-
-        if not note:
-            note = "Simülasyon başarıyla tamamlandı! Herhangi bir kritik çakışma tespit edilmedi."
-
-        return (
-            fig_comp,
-            svg_outputs[0], svg_outputs[1], svg_outputs[2],
-            df_dist,
-            ac_circles_txt, ac_paths_txt,
-            video_filename,
-            note
-        )
-    except Exception as e:
-        import traceback
-        err_str = f"Hata Detayı:\n{traceback.format_exc()}"
-        dummy_fig, ax = plt.subplots()
-        ax.text(0.5, 0.5, "Hata Oluştu", ha='center', va='center')
-        return (dummy_fig, err_str, err_str, err_str, pd.DataFrame(), err_str, err_str, None, err_str)
-
-def load_gradio_json_config(file_obj):
-    if file_obj is None: return [gr.update()] * 19
+# -------------------------------------------------------------
+# 1) Ana çalıştırma: animasyon + analizler + AutoCAD kodları
+# -------------------------------------------------------------
+def run_all(*vals):
     try:
-        file_path = file_obj if isinstance(file_obj, str) else getattr(file_obj, 'name', None)
-        with open(file_path, 'r', encoding='utf-8') as f:
-            config_data = json.load(f)
-        updates = []
-        channels = config_data.get('channels', [])
-        ch1 = channels[0] if len(channels) > 0 else {}
-        ch2 = channels[1] if len(channels) > 1 else {}
-        ch3 = channels[2] if len(channels) > 2 else {}
-        updates.extend([
-            gr.update(value=ch1.get('x0', -275.0)), gr.update(value=ch1.get('y0', -100.0)),
-            gr.update(value=ch1.get('tr', 15.0)), gr.update(value=ch1.get('fd', 800.0)), gr.update(value=ch1.get('code', ''))
-        ])
-        updates.extend([
-            gr.update(value=ch2.get('x0', -286.075)), gr.update(value=ch2.get('y0', -99.5)),
-            gr.update(value=ch2.get('tr', 15.0)), gr.update(value=ch2.get('fd', 800.0)), gr.update(value=ch2.get('code', ''))
-        ])
-        updates.extend([
-            gr.update(value=ch3.get('x0', -275.0)), gr.update(value=ch3.get('y0', -100.0)),
-            gr.update(value=ch3.get('tr', 15.0)), gr.update(value=ch3.get('fd', 800.0)), gr.update(value=ch3.get('code', ''))
-        ])
-        mold = config_data.get('mold', {})
-        updates.extend([
-            gr.update(value=mold.get('x0', -30.0)), gr.update(value=mold.get('y0', -30.0)), gr.update(value=mold.get('code', ''))
-        ])
-        settings = config_data.get('settings', {})
-        updates.append(gr.update(value=settings.get('contact_mode', 'geometric')))
-        return updates
-    except Exception as e:
-         raise gr.Error(f"JSON yüklenirken hata oluştu: {str(e)}")
+        cfg, fps, speed, ac_s, ac_e, ac_st = _split_vals(vals)
+        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+        timelines, total_time = synchronize(segs)
+        if total_time <= 0:
+            total_time = 1.0
 
-with gr.Blocks(title="Tam Entegre CNC Simülatörü") as demo:
-    gr.Markdown("# 🚀 CNC Simülatör Web Kontrol ve Analiz Merkezi")
-    gr.Markdown("Notebook'ta bulunan tüm bağımsız grafik, analiz ve video üretici hücrelerini tek bir panelde birleştirir.\n\n*(Doğrudan gömülü SVG render mimarisi aktiftir.)*\n\nGrafikleri **🔍 Tam Ekran Yap / Çık** butonu ile tarayıcı sınırlarında maksimum büyüklükte inceleyebilirsiniz.")
+        token, n_frames = register_anim(segs, starts, radii, mold_pts, timelines, total_time, fps, speed)
+        frame0 = render_frame_image(token, 0)
+
+        comp_html = fig_to_svg_card(plot_comparison_fig(segs, starts, radii, mold_pts))
+        if len(mold_pts) > 1:
+            ind_html = [fig_to_svg_card(plot_channel_fig(i, segs, starts, radii, mold_pts)) for i in range(N_CH)]
+        else:
+            msg = "<p>Kalıp noktası yetersiz.</p>"
+            ind_html = [msg] * N_CH
+        table = distance_table(segs, mold_pts)
+
+        end_used = ac_e if ac_e > ac_s else total_time
+        try:
+            circ_txt = autocad_circles_text(timelines, total_time, radii, ac_s, end_used, ac_st)
+        except ValueError as ve:
+            circ_txt = f"Hata: {ve}"
+        path_txt = autocad_paths_text(segs)
+
+        status = (note + "\n" if note else "") + \
+                 (f"Simülasyon hazır. Toplam süre: {total_time:.2f} sn — animasyon kare sayısı: {n_frames} — "
+                  f"AutoCAD çember aralığı: {ac_s:g}–{end_used:.2f} sn")
+        return (frame0,
+                gr.update(minimum=0, maximum=n_frames, value=0),
+                gr.update(value=playback_interval(fps, speed), active=False),
+                token,
+                comp_html, ind_html[0], ind_html[1], ind_html[2],
+                table, circ_txt, path_txt, status)
+    except Exception:
+        err = "Simülasyon hazırlanırken hata oluştu:\n" + traceback.format_exc()
+        return tuple([gr.update()] * (N_ANIM_OUT - 1) + [err])
+
+
+# -------------------------------------------------------------
+# 2) Oynatıcı kontrolleri (Oynat / Duraklat / Kare kaydırıcısı)
+# -------------------------------------------------------------
+def anim_render(frame, token):
+    try:
+        return render_frame_image(token, frame)
+    except Exception:
+        print("Kare güncellenirken hata:", traceback.format_exc())
+        return gr.update()
+
+
+def anim_play(cur, token):
+    a = _ANIM.get(token)
+    if not a:
+        return gr.update(), gr.update(active=False)
+    cur = int(cur or 0)
+    if cur >= a['n_frames']:
+        cur = 0
+    return gr.update(value=cur), gr.update(active=True)
+
+
+def anim_tick(cur, token):
+    a = _ANIM.get(token)
+    if not a:
+        return gr.update(), gr.update(active=False)
+    nxt = int(cur or 0) + 1
+    if nxt >= a['n_frames']:
+        return gr.update(value=a['n_frames']), gr.update(active=False)
+    return gr.update(value=nxt), gr.update()
+
+
+def anim_pause():
+    return gr.update(active=False)
+
+
+def anim_retune(fps, speed, token):
+    """FPS / Hız çarpanı değişince kare sayısını ve oynatma aralığını yeniden ayarlar."""
+    a = _ANIM.get(token)
+    if not a:
+        return gr.update(), gr.update()
+    fps, speed = int(_num(fps, 20)), (_num(speed, 1.0) or 1.0)
+    n_frames = max(int(a['total_time'] * fps / speed), 2)
+    a['n_frames'] = n_frames
+    return gr.update(minimum=0, maximum=n_frames, value=0), gr.update(value=playback_interval(fps, speed), active=False)
+
+
+# -------------------------------------------------------------
+# 3) MP4 kaydet (üreteç: ilerlemeyi durum kutusunda gösterir)
+# -------------------------------------------------------------
+def make_mp4(*vals):
+    try:
+        mp4_fps = int(_num(vals[N_CFG], 20)) or 20
+        cfg = cfg_from_values(vals[:N_CFG])
+        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+        timelines, total_time = synchronize(segs)
+        if total_time <= 0:
+            total_time = 1.0
+        out_dir = tempfile.mkdtemp(prefix='cnc_mp4_')
+        path = os.path.join(out_dir, 'cnc_simulation.mp4')
+        yield gr.update(), gr.update(), (note + "\n" if note else "") + "MP4 hazırlanıyor..."
+        for done, total in mp4_generator(segs, starts, radii, mold_pts, timelines, total_time, mp4_fps, path):
+            yield gr.update(), gr.update(), f"MP4 kareleri oluşturuluyor: {done}/{total}"
+        yield path, path, f"Tamamlandı: cnc_simulation.mp4 ({total_time:.2f} sn, {mp4_fps} FPS). Aşağıdan indirebilirsin."
+    except Exception:
+        yield gr.update(), gr.update(), "MP4 oluşturulurken hata oluştu:\n" + traceback.format_exc()
+
+
+# -------------------------------------------------------------
+# 4) AutoCAD kodlarını tek başına yeniden üret
+# -------------------------------------------------------------
+def gen_circles_only(*vals):
+    try:
+        cfg, fps, speed, ac_s, ac_e, ac_st = _split_vals(vals)
+        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+        timelines, total_time = synchronize(segs)
+        if total_time <= 0:
+            total_time = 1.0
+        end_used = ac_e if ac_e > ac_s else total_time
+        txt = autocad_circles_text(timelines, total_time, radii, ac_s, end_used, ac_st)
+        return txt, (note + "\n" if note else "") + f"AutoCAD çember kodları oluşturuldu ({ac_s:g}–{end_used:.2f} sn, adım {ac_st:g} sn)."
+    except ValueError as ve:
+        return gr.update(), f"Hata: {ve}"
+    except Exception:
+        return gr.update(), "AutoCAD kodları oluşturulurken hata oluştu:\n" + traceback.format_exc()
+
+
+def gen_paths_only(*vals):
+    try:
+        cfg = cfg_from_values(vals[:N_CFG])
+        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+        return autocad_paths_text(segs), (note + "\n" if note else "") + "AutoCAD çizim yolları oluşturuldu."
+    except Exception:
+        return gr.update(), "AutoCAD çizim yolları oluşturulurken hata oluştu:\n" + traceback.format_exc()
+
+
+# -------------------------------------------------------------
+# 5) JSON kaydet / yükle + Python varsayılan kodu
+# -------------------------------------------------------------
+def export_json(*vals):
+    try:
+        cfg, fps, speed, ac_s, ac_e, ac_st = _split_vals(vals)
+        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st)
+        out_dir = tempfile.mkdtemp(prefix='cnc_cfg_')
+        path = os.path.join(out_dir, 'gcode_simulator_config.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        return path, "Konfigürasyon 'gcode_simulator_config.json' olarak hazırlandı — yukarıdaki dosya kutusundan indirebilirsin."
+    except Exception:
+        return None, "JSON dışa aktarılırken hata oluştu:\n" + traceback.format_exc()
+
+
+def import_json(file_obj):
+    n_out = N_CFG + 2 + 3 + 1
+    if file_obj is None:
+        return tuple([gr.update()] * (n_out - 1) + ["JSON dosyası seçilmedi."])
+    try:
+        path = file_obj if isinstance(file_obj, str) else getattr(file_obj, 'name', None) or file_obj['name']
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        ups = json_dict_to_updates(data, gr.update)
+        return tuple(ups) + ("JSON yüklendi ve arayüz güncellendi. Simülasyonu güncellemek için 'Çalıştır' butonuna bas.",)
+    except Exception as e:
+        return tuple([gr.update()] * (n_out - 1) + [f"JSON yüklenirken hata oluştu. Dosya formatını kontrol et: {e}"])
+
+
+def make_defaults_code(*vals):
+    cfg = cfg_from_values(vals[:N_CFG])
+    chans = pprint.pformat(cfg['channels'], sort_dicts=False, width=110)
+    mold = pprint.pformat(cfg['mold'], sort_dicts=False, width=110)
+    return (f"DEFAULT_CHANNELS = {chans}\n\nDEFAULT_MOLD = {mold}\n\n"
+            f"DEFAULT_CONTACT_MODE = {cfg['contact_mode']!r}")
+
+
+def _textbox(**kw):
+    try:
+        return gr.Textbox(show_copy_button=True, **kw)
+    except TypeError:
+        return gr.Textbox(**kw)
+
+
+# -------------------------------------------------------------
+# ARAYÜZ
+# -------------------------------------------------------------
+try:
+    demo.close()          # hücre yeniden çalıştırılırsa eski sunucuyu kapat
+except Exception:
+    pass
+
+with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
+    gr.Markdown("# 3 Kanallı CNC Simülatörü\n"
+                "Desteklenen komutlar: **G0, G1, G2/G3** (I/J veya R), **G4**, **G40/G41/G42**, **WAIT**. "
+                "Girdileri soldan ayarla, **Çalıştır** butonuna bas; sağdaki sekmelerden animasyonu, grafikleri, "
+                "mesafe tablosunu, AutoCAD kodlarını ve MP4'ü kullan.")
 
     with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("### 🛠️ Girdi ve Yapılandırma Paneli")
+        # ---------------- SOL: girdiler ----------------
+        with gr.Column(scale=4, min_width=380):
+            cfg_comps = []
             with gr.Tabs():
-                with gr.TabItem("Kanal 1"):
-                    x1 = gr.Number(value=-275.0, label="Başlangıç X")
-                    y1 = gr.Number(value=-100.0, label="Başlangıç Y")
-                    tr1 = gr.Number(value=15.0, label="Takım Yarıçapı")
-                    fd1 = gr.Number(value=800.0, label="Varsayılan F")
-                    code1 = gr.Textbox(value=demo_gcode[0], lines=5, label="G-Kodu")
-                with gr.TabItem("Kanal 2"):
-                    x2 = gr.Number(value=-286.075, label="Başlangıç X")
-                    y2 = gr.Number(value=-99.5, label="Başlangıç Y")
-                    tr2 = gr.Number(value=15.0, label="Takım Yarıçapı")
-                    fd2 = gr.Number(value=800.0, label="Varsayılan F")
-                    code2 = gr.Textbox(value=demo_gcode[1], lines=5, label="G-Kodu")
-                with gr.TabItem("Kanal 3"):
-                    x3 = gr.Number(value=-275.0, label="Başlangıç X")
-                    y3 = gr.Number(value=-100.0, label="Başlangıç Y")
-                    tr3 = gr.Number(value=15.0, label="Takım Yarıçapı")
-                    fd3 = gr.Number(value=800.0, label="Varsayılan F")
-                    code3 = gr.Textbox(value=demo_gcode[2], lines=5, label="G-Kodu")
-            with gr.Group():
-                gr.Markdown("**Kalıp (Sabit Path) Ayarları**")
-                m_x0 = gr.Number(value=-30.0, label="Kalıp Başlangıç X")
-                m_y0 = gr.Number(value=-30.0, label="Kalıp Başlangıç Y")
-                m_code = gr.Textbox(value="G1 X30 Y-30 F1000\nG1 X30 Y30\nG2 X-30 Y30 I-30 J0\nG1 X-30 Y-30", lines=3, label="Kalıp G-Kodu")
-                contact_mode = gr.Dropdown(choices=["geometric", "programmed"], value="geometric", label="Çizilen Yol Modu")
-            with gr.Group():
-                gr.Markdown("**AutoCAD Ayarları**")
-                ac_start = gr.Number(value=0.0, label="AutoCAD Başlangıç Zamanı (sn)")
-                ac_end = gr.Number(value=10.0, label="AutoCAD Bitiş Zamanı (sn)")
-                ac_step = gr.Number(value=0.1, label="AutoCAD Zaman Adımı (sn)")
-            with gr.Group():
-                gr.Markdown("**Konfigürasyon Yükle (JSON)**")
-                json_upload = gr.File(file_count="single", file_types=[".json"], label="JSON Ayar Dosyasını Sürükleyin")
-            run_btn = gr.Button("Simülasyon ve Analizleri Çalıştır", variant="primary")
-        with gr.Column(scale=2):
-            gr.Markdown("### 📊 Tüm Analizler ve Çıktı Sekmeleri")
-            with gr.Tabs() as out_tabs:
-                with gr.TabItem("🎥 Simülasyon Video Oynatıcı & MP4"):
-                    gr.Markdown("Simülasyonun hareketli oynatıcısı. Sağ alt köşedeki üç noktadan videoyu MP4 formatında indirebilirsiniz.")
-                    video_out = gr.Video(label="Simülasyon Oynatıcı (MP4)", format="mp4")
-                with gr.TabItem("🔍 Genel Karşılaştırma"):
-                    plot_comp_out = gr.Plot(label="Genel Karşılaştırma Grafiği")
-                with gr.TabItem("📐 Bireysel Kanal Analizi"):
-                    gr.Markdown("Kanalların detaylandırılmış hassas ölçüm grafikleri (Doğrudan entegre vektörel SVG formatında anında yüklenir).")
-                    with gr.Tabs():
-                        with gr.TabItem("Kanal 1"):
-                            plot_ind_1 = gr.HTML()
-                        with gr.TabItem("Kanal 2"):
-                            plot_ind_2 = gr.HTML()
-                        with gr.TabItem("Kanal 3"):
-                            plot_ind_3 = gr.HTML()
-                with gr.TabItem("📏 Mesafe Tablosu"):
-                    gr.Markdown("Segmentlerin Kalıp Konturuna Olan Başlangıç, Orta ve Bitiş Mesafeleri")
-                    table_out = gr.DataFrame()
-                with gr.TabItem("💻 AutoCAD Çember Kodları"):
-                    gr.Markdown("Aşağıdaki AutoCAD çember komutlarını kopyalayarak AutoCAD komut satırına doğrudan yapıştırabilirsiniz.")
-                    ac_circles_out = gr.TextArea(label="Çember Kodları (Kanal Bazlı)", lines=12)
-                with gr.TabItem("🔀 AutoCAD Path Kodları"):
-                    gr.Markdown("Aşağıdaki Çoklu Çizgi (_PLINE) kodlarını kopyalayarak AutoCAD'e aktarabilirsiniz.")
-                    ac_paths_out = gr.TextArea(label="Çizgi Yolu Kodları (PLINE)", lines=12)
-            log_output = gr.Textbox(label="Sistem Durum Raporu / Uyarılar", lines=5)
+                for k in range(N_CH):
+                    d = DEFAULT_CHANNELS[k]
+                    with gr.Tab(f"Kanal {k+1}"):
+                        x0 = gr.Number(value=d['x0'], label="Başlangıç X")
+                        y0 = gr.Number(value=d['y0'], label="Başlangıç Y")
+                        tr = gr.Number(value=d['tr'], label="Takım Yarıçapı")
+                        fd = gr.Number(value=d['fd'], label="Varsayılan F")
+                        yo = gr.Number(value=d['y_offset'], label="Y Offset (mm)")
+                        code = gr.Textbox(value=d['code'], lines=8, label="G-Kodu")
+                        cfg_comps += [x0, y0, tr, fd, yo, code]
 
-    json_upload.change(
-        fn=load_gradio_json_config,
-        inputs=[json_upload],
-        outputs=[x1, y1, tr1, fd1, code1,
-                 x2, y2, tr2, fd2, code2,
-                 x3, y3, tr3, fd3, code3,
-                 m_x0, m_y0, m_code, contact_mode]
-    )
+            with gr.Accordion("Kalıp (Sabit Path)", open=True):
+                m_x0 = gr.Number(value=DEFAULT_MOLD['x0'], label="Kalıp Başlangıç X")
+                m_y0 = gr.Number(value=DEFAULT_MOLD['y0'], label="Kalıp Başlangıç Y")
+                m_code = gr.Textbox(value=DEFAULT_MOLD['code'], lines=5, label="Kalıp G-Kodu")
+                contact_mode = gr.Dropdown(choices=CONTACT_MODE_CHOICES, value=DEFAULT_CONTACT_MODE,
+                                           label="Çizilen yol")
+                cfg_comps += [m_x0, m_y0, m_code, contact_mode]
+
+            with gr.Row():
+                fps_sl = gr.Slider(5, 40, value=20, step=1, label="FPS")
+                speed_sl = gr.Slider(0.2, 5.0, value=1.0, step=0.2, label="Hız Çarpanı")
+
+            run_btn = gr.Button("▶ Simülasyonu ve Analizleri Çalıştır", variant="primary")
+
+            with gr.Accordion("Konfigürasyon Yönetimi (JSON)", open=True):
+                gr.Markdown("3 kanalın ve kalıbın tüm ayarlarını (başlangıç, yarıçap, F, Y offset, G-kodları, "
+                            "çizilen yol modu, FPS/hız, AutoCAD zaman ayarları) tek JSON dosyası olarak kaydet / yükle.")
+                json_btn = gr.Button("💾 Ayarları JSON Olarak Kaydet", variant="secondary")
+                json_file_out = gr.File(label="İndirilecek JSON", interactive=False)
+                json_upload = gr.File(label="JSON Ayar Dosyası Yükle", file_types=[".json"], file_count="single")
+
+            with gr.Accordion("Varsayılanları Python kodu olarak al", open=False):
+                gr.Markdown("Güncel arayüz değerlerini, ilgili hücredeki `DEFAULT_CHANNELS` / `DEFAULT_MOLD` "
+                            "yerine yapıştırabileceğin kod olarak verir.")
+                defaults_btn = gr.Button("Kodu Üret")
+                defaults_out = _textbox(label="Python kodu", lines=10)
+
+        # ---------------- SAĞ: çıktılar ----------------
+        with gr.Column(scale=7):
+            status = gr.Textbox(label="Durum / Uyarılar", lines=4, interactive=False)
+            anim_token = gr.State("")
+
+            with gr.Tabs():
+                with gr.Tab("🎬 Animasyon"):
+                    gr.Markdown("**Çalıştır**'dan sonra ▶ ile oynat, ⏸ ile durdur; kare kaydırıcısı ile istediğin "
+                                "ana atla (ileri/geri). Oynatma her kareyi sunucudan çizdiği için yüksek hızda "
+                                "MP4 sekmesindeki video daha akıcıdır. FPS / Hız çarpanını değiştirince kare sayısı "
+                                "yeniden ayarlanır.")
+                    anim_img = gr.Image(label="Simülasyon", type="pil", interactive=False)
+                    with gr.Row():
+                        play_btn = gr.Button("▶ Oynat", variant="primary")
+                        pause_btn = gr.Button("⏸ Duraklat")
+                    frame_sl = gr.Slider(0, 1, value=0, step=1, label="Kare", interactive=True)
+                    play_timer = gr.Timer(0.1, active=False)
+
+                with gr.Tab("🎥 MP4"):
+                    gr.Markdown("Simülasyonu MP4 video olarak üretir ve indirmeni sağlar.")
+                    mp4_fps = gr.Slider(5, 40, value=20, step=1, label="MP4 FPS")
+                    mp4_btn = gr.Button("🎥 Simülasyonu MP4 Olarak Kaydet", variant="primary")
+                    video_out = gr.Video(label="Simülasyon (MP4)", interactive=False)
+                    mp4_file = gr.File(label="MP4 indir", interactive=False)
+
+                with gr.Tab("🔍 Genel Karşılaştırma"):
+                    comp_html = gr.HTML()
+
+                with gr.Tab("📐 Bireysel Kanal Analizi"):
+                    with gr.Tabs():
+                        with gr.Tab("Kanal 1"):
+                            ind1 = gr.HTML()
+                        with gr.Tab("Kanal 2"):
+                            ind2 = gr.HTML()
+                        with gr.Tab("Kanal 3"):
+                            ind3 = gr.HTML()
+
+                with gr.Tab("📏 Mesafe Tablosu"):
+                    gr.Markdown("Her hareket segmentinin başlangıç / orta / bitiş noktasının kalıp konturuna olan "
+                                "en kısa mesafesi (G0 hariç).")
+                    table_out = gr.DataFrame()
+
+                with gr.Tab("💻 AutoCAD Çember"):
+                    gr.Markdown("Seçilen zaman aralığında her kanalın takım merkezine `_CIRCLE` komutu üretir. "
+                                "Bitiş zamanı 0 (veya Başlangıç'tan küçük) ise toplam süre kullanılır.")
+                    with gr.Row():
+                        ac_start = gr.Number(value=0.0, label="Başlangıç Zamanı (s)")
+                        ac_end = gr.Number(value=0.0, label="Bitiş Zamanı (s)  [0 = otomatik]")
+                        ac_step = gr.Number(value=0.1, label="Zaman Adımı (s)")
+                    ac_circ_btn = gr.Button("AutoCAD Kodlarını Oluştur", variant="primary")
+                    ac_circ_txt = _textbox(label="Çember Kodları (Kanal Bazlı)", lines=14)
+
+                with gr.Tab("🔀 AutoCAD Path"):
+                    gr.Markdown("Her kanalın işlenmiş kontur (temas noktası) izini `_PLINE` komutlarıyla üretir.")
+                    ac_path_btn = gr.Button("AutoCAD Path Kodlarını Oluştur", variant="primary")
+                    ac_path_txt = _textbox(label="Çizgi Yolu Kodları (PLINE)", lines=14)
+
+    # ---------------- OLAYLAR ----------------
+    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step]
 
     run_btn.click(
-        fn=run_all_gradio_analyses,
-        inputs=[x1, y1, tr1, fd1, code1,
-                x2, y2, tr2, fd2, code2,
-                x3, y3, tr3, fd3, code3,
-                m_x0, m_y0, m_code, contact_mode,
-                ac_start, ac_end, ac_step],
-        outputs=[plot_comp_out,
-                 plot_ind_1, plot_ind_2, plot_ind_3,
-                 table_out,
-                 ac_circles_out, ac_paths_out,
-                 video_out,
-                 log_output]
-    )
+        run_all, inputs=all_inputs,
+        outputs=[anim_img, frame_sl, play_timer, anim_token, comp_html, ind1, ind2, ind3,
+                 table_out, ac_circ_txt, ac_path_txt, status])
 
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+    # oynatıcı
+    frame_sl.change(anim_render, inputs=[frame_sl, anim_token], outputs=anim_img,
+                    trigger_mode="always_last", show_progress="hidden")
+    play_btn.click(anim_play, inputs=[frame_sl, anim_token], outputs=[frame_sl, play_timer])
+    pause_btn.click(anim_pause, outputs=play_timer)
+    play_timer.tick(anim_tick, inputs=[frame_sl, anim_token], outputs=[frame_sl, play_timer],
+                    show_progress="hidden")
+    fps_sl.release(anim_retune, inputs=[fps_sl, speed_sl, anim_token], outputs=[frame_sl, play_timer])
+    speed_sl.release(anim_retune, inputs=[fps_sl, speed_sl, anim_token], outputs=[frame_sl, play_timer])
+
+    # MP4
+    mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps], outputs=[video_out, mp4_file, status])
+
+    # AutoCAD
+    ac_circ_btn.click(gen_circles_only, inputs=all_inputs, outputs=[ac_circ_txt, status])
+    ac_path_btn.click(gen_paths_only, inputs=cfg_comps, outputs=[ac_path_txt, status])
+
+    # JSON
+    json_btn.click(export_json, inputs=all_inputs, outputs=[json_file_out, status])
+    json_upload.upload(import_json, inputs=json_upload, outputs=all_inputs + [status])
+
+    # Python varsayılan kodu
+    defaults_btn.click(make_defaults_code, inputs=cfg_comps, outputs=defaults_out)
+
+demo.queue().launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
