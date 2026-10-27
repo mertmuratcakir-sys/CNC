@@ -62,7 +62,7 @@ def _tangent_for(seg, ang):
     return _unit((-np.sin(ang), np.cos(ang)))
 
 
-def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.0, y_offset=0.0):
+def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.0, y_offset=0.0, g0_feed=15000.0):
     """
     Bir kanalın G-kodu komutlarını işleyip hareket segmentleri listesi üretir.
     y_offset: G-kodundaki tüm Y değerlerine eklenecek ofset miktarı.
@@ -126,12 +126,15 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
                 p0c, p1c = p0, p1
 
             dist = float(np.hypot(p1c[0] - p0c[0], p1c[1] - p0c[1]))
-            eff_feed = feed if motion_mode == 'G1' else max(feed * 3, 3000)
+            if motion_mode == 'G1':
+                eff_feed = feed
+            else:   # G0: satırda F yoksa varsayılan hızlı hareket hızı (g0_feed, varsayılan 15000)
+                eff_feed = feed if 'F' in cmd else g0_feed
             dur = (dist / eff_feed) * 60 if eff_feed > 0 else 0.0
 
             segments.append({
                 'type': 'move', 'kind': 'line',
-                'points': [p0c, p1c], 'duration': dur, 'feed': eff_feed,
+                'points': [p0c, p1c], 'duration': dur, 'feed': eff_feed, 'g0': motion_mode == 'G0',
                 'comp_mode': active_comp,
                 'tangent_start': direction, 'tangent_end': direction,
                 'orig_start': p0, 'orig_end': p1,
@@ -619,6 +622,10 @@ DEFAULT_MOLD = {
     'dia_mode': 'radius', 'dia_axis': 'X',
 }
 DEFAULT_CONTACT_MODE = 'geometric'
+DEFAULT_G0_FEED = 15000.0        # G0 (hızlı hareket) varsayılan hızı, mm/dk (satırda F yazılmamışsa)
+DEFAULT_LABEL_FONT = 7           # bireysel kanal analizi mesafe yazı boyutu
+DEFAULT_LABEL_SHIFT = 0.0        # tüm mesafe yazılarını yukarı(+)/aşağı(-) kaydırma (mm)
+DEFAULT_XNAME, DEFAULT_YNAME = 'X', 'Y'    # grafiklerde yatay / dikey eksen adı
 CONTACT_MODE_CHOICES = [
     ('Geometrik: takım dairesi ile kalıp arasındaki en dar nokta (G40/G41/G42 fark etmez)', 'geometric'),
     ('Programlanan: G41/G42 konturu, G40 takım merkezi (eski davranış)', 'programmed'),
@@ -629,7 +636,8 @@ DIA_AXIS_CHOICES = [('X ekseni', 'X'), ('Y ekseni', 'Y'), ('X ve Y', 'XY')]
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1          # 30 (+ çizilen yol modu)
+N_CFG = MOLD_START + 5 + 1 + 1      # 31: kalıp(5) + çizilen yol modu + G0 hızı
+N_OPT = 4                           # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad
 
 
 def _num(v, default=0.0):
@@ -663,7 +671,16 @@ def cfg_from_values(v):
     dm, da = _dia(v[m + 3], v[m + 4])
     mold = {'x0': _num(v[m]), 'y0': _num(v[m + 1]), 'code': v[m + 2] or '', 'dia_mode': dm, 'dia_axis': da}
     mode = v[m + 5] if v[m + 5] in ('geometric', 'programmed') else 'geometric'
-    return {'channels': channels, 'mold': mold, 'contact_mode': mode}
+    g0 = _num(v[m + 6], DEFAULT_G0_FEED)
+    return {'channels': channels, 'mold': mold, 'contact_mode': mode, 'g0_feed': g0}
+
+
+def opts_from_values(v):
+    """[yazı boyutu, kaydırma, yatay eksen adı, dikey eksen adı] -> grafik seçenekleri sözlüğü."""
+    font = min(max(_num(v[0], DEFAULT_LABEL_FONT), 3.0), 40.0)
+    return {'label_font': font, 'label_shift': _num(v[1], DEFAULT_LABEL_SHIFT),
+            'xname': (str(v[2]).strip() if v[2] is not None else '') or DEFAULT_XNAME,
+            'yname': (str(v[3]).strip() if v[3] is not None else '') or DEFAULT_YNAME}
 
 
 # -------------------------------------------------------------
@@ -706,11 +723,11 @@ def _dia_note(label, d):
 # -------------------------------------------------------------
 # Widget'tan bağımsız build_channels (Colab'daki ile aynı mantık)
 # -------------------------------------------------------------
-def get_mold_points_cfg(mold):
+def get_mold_points_cfg(mold, g0_feed=DEFAULT_G0_FEED):
     code, x0, y0 = apply_diameter(mold['code'], mold['x0'], mold['y0'],
                                   mold.get('dia_mode'), mold.get('dia_axis'))
     mold_cmds = parse_gcode(code)
-    mold_segs = simulate_channel(mold_cmds, x0, y0, 0.0, 1000.0)
+    mold_segs = simulate_channel(mold_cmds, x0, y0, 0.0, 1000.0, g0_feed=g0_feed)
     pts = [(x0, y0)]
     for seg in mold_segs:
         if seg['type'] == 'move':
@@ -719,7 +736,8 @@ def get_mold_points_cfg(mold):
 
 
 def build_channels_cfg(cfg):
-    mold_points = get_mold_points_cfg(cfg['mold'])
+    g0_feed = cfg.get('g0_feed', DEFAULT_G0_FEED)
+    mold_points = get_mold_points_cfg(cfg['mold'], g0_feed)
     use_geo = (cfg['contact_mode'] == 'geometric')
     notes = []
     n = _dia_note('Kalıp', cfg['mold'])
@@ -736,7 +754,7 @@ def build_channels_cfg(cfg):
         if n:
             notes.append(n)
         cmds = parse_gcode(code)
-        segs = simulate_channel(cmds, x0, y0, ch['tr'], ch['fd'], y_offset=ch['y_offset'])
+        segs = simulate_channel(cmds, x0, y0, ch['tr'], ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
         segs = apply_corner_compensation(segs, ch['tr'])
         if use_geo:
             segs = apply_geometric_contact(segs, mold_points, ch['tr'], (x0, y0))
@@ -758,7 +776,7 @@ from PIL import Image
 
 
 def _is_g0(seg):
-    return seg.get('feed', 1000.0) >= 3000.0
+    return bool(seg.get('g0', False)) or seg.get('feed', 1000.0) >= 3000.0
 
 
 def _plot_limits(mold_points, start_points, radii, margin_mult):
@@ -789,7 +807,7 @@ def _mold_closest_fn(mold_points):
 # -------------------------------------------------------------
 # 7b) Büyük karşılaştırma grafiği (G0 hariç)
 # -------------------------------------------------------------
-def plot_comparison_fig(channels_segments, start_points, radii, mold_points):
+def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xname='X', yname='Y'):
     fig = Figure(figsize=(14, 10), dpi=100)
     ax = fig.add_subplot(111)
     fig.subplots_adjust(right=0.80)
@@ -797,8 +815,8 @@ def plot_comparison_fig(channels_segments, start_points, radii, mold_points):
     ax.set_aspect('equal')
     ax.set_title('Büyük Boyutlu Net Kontur Karşılaştırması (G0 Hareketi Hariç - Her Kod Satırı Farklı Renk)',
                  fontsize=14, pad=15)
-    ax.set_xlabel('X Koordinatı (mm)', fontsize=11)
-    ax.set_ylabel('Y Koordinatı (mm)', fontsize=11)
+    ax.set_xlabel(xname, fontsize=11)
+    ax.set_ylabel(yname, fontsize=11)
 
     if len(mold_points) > 1:
         ax.plot([p[0] for p in mold_points], [p[1] for p in mold_points],
@@ -844,9 +862,10 @@ def _densify_px(P, step=4.0):
     return np.vstack(out)
 
 
-def _place_distance_labels(fig, ax, labels, polylines, fontsize=7):
+def _place_distance_labels(fig, ax, labels, polylines, fontsize=7, shift=0.0):
     """Mesafe etiketlerini birbirine ve çizilen yollara/çizgilere değmeyecek şekilde yerleştirir.
-    labels: [(nokta, metin, (dx, dy) tercih edilen yön)], polylines: kaçınılacak çizgiler (veri koordinatı)."""
+    labels: [(nokta, metin, (dx, dy) tercih edilen yön)], polylines: kaçınılacak çizgiler (veri koordinatı).
+    Yazılar dikey (90°) çizilir; shift (mm) tüm yazıları birlikte yukarı(+)/aşağı(-) kaydırır."""
     if not labels:
         return
     canvas = FigureCanvasAgg(fig)
@@ -865,7 +884,7 @@ def _place_distance_labels(fig, ax, labels, polylines, fontsize=7):
     radii_px = [12, 22, 34, 48, 66, 88, 115]
     pad = 2.5
     for kp, text, (dx, dy) in labels:
-        probe = ax.text(0, 0, text, fontsize=fontsize, fontweight='bold')
+        probe = ax.text(0, 0, text, fontsize=fontsize, fontweight='bold', rotation=90)
         bb = probe.get_window_extent(renderer)
         probe.remove()
         w, h = bb.width + 2 * pad, bb.height + 2 * pad
@@ -900,13 +919,17 @@ def _place_distance_labels(fig, ax, labels, polylines, fontsize=7):
         _, box, (cx, cy), r = best
         placed.append(box)
         lx, ly = inv.transform((cx, cy))
-        arrow = dict(arrowstyle='-', color='darkred', lw=0.5, alpha=0.8, shrinkA=0, shrinkB=1) if r > 20 else None
-        ax.annotate(text, xy=kp, xytext=(lx, ly), textcoords='data', ha='center', va='center',
+        ly += shift                                              # toplu yukarı/aşağı kaydırma (mm)
+        end_d = tr.transform((lx, ly))
+        far = float(np.hypot(end_d[0] - k_d[0], end_d[1] - k_d[1])) > max(w, h) / 2 + 14
+        arrow = dict(arrowstyle='-', color='darkred', lw=0.5, alpha=0.8, shrinkA=0, shrinkB=1) if far else None
+        ax.annotate(text, xy=kp, xytext=(lx, ly), textcoords='data', ha='center', va='center', rotation=90,
                     fontsize=fontsize, fontweight='bold', color='darkred', arrowprops=arrow,
                     bbox=dict(facecolor='white', alpha=0.9, edgecolor='none', boxstyle='round,pad=0.15'))
 
 
-def plot_channel_fig(i, channels_segments, start_points, radii, mold_points):
+def plot_channel_fig(i, channels_segments, start_points, radii, mold_points,
+                     xname='X', yname='Y', label_font=7.0, label_shift=0.0):
     closest = _mold_closest_fn(mold_points)
     xl, yl = _plot_limits(mold_points, start_points, radii, 3.0)
 
@@ -918,8 +941,8 @@ def plot_channel_fig(i, channels_segments, start_points, radii, mold_points):
     ax.set_xlim(*xl)
     ax.set_ylim(*yl)
     ax.set_title(f'Kanal {i+1} Detaylı Kontur ve Kalıp Mesafesi Analizi', fontsize=16, pad=14)
-    ax.set_xlabel('X Koordinatı (mm)', fontsize=12)
-    ax.set_ylabel('Y Koordinatı (mm)', fontsize=12)
+    ax.set_xlabel(xname, fontsize=12)
+    ax.set_ylabel(yname, fontsize=12)
 
     polylines = []
     if len(mold_points) > 1:
@@ -958,7 +981,7 @@ def plot_channel_fig(i, channels_segments, start_points, radii, mold_points):
     sx, sy = start_points[i]
     ax.plot(sx, sy, 'o', color=CHANNEL_COLORS[0], markersize=10, label='Başlangıç Noktası')
     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), borderaxespad=0, fontsize=10, shadow=True)
-    _place_distance_labels(fig, ax, labels, polylines, fontsize=7)
+    _place_distance_labels(fig, ax, labels, polylines, fontsize=label_font, shift=label_shift)
     return fig
 
 
@@ -1068,7 +1091,7 @@ def _scene_bounds(channels_segments, start_points, radii, mold_points):
     return min(all_x) - margin, max(all_x) + margin, min(all_y) - margin, max(all_y) + margin
 
 
-def build_scene(channels_segments, start_points, radii, mold_points):
+def build_scene(channels_segments, start_points, radii, mold_points, xname='X', yname='Y'):
     xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points)
     fig = Figure(figsize=(8.5, 6.0), dpi=90)
     canvas = FigureCanvasAgg(fig)
@@ -1079,6 +1102,8 @@ def build_scene(channels_segments, start_points, radii, mold_points):
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
     ax.set_title("CNC Simülasyonu")
+    ax.set_xlabel(xname)
+    ax.set_ylabel(yname)
     if len(mold_points) > 1:
         ax.plot([p[0] for p in mold_points], [p[1] for p in mold_points],
                 color='black', linewidth=1.0, linestyle='-', label='Kalıp (sabit)')
@@ -1128,8 +1153,9 @@ _ANIM = {}
 _ANIM_LOCK = threading.RLock()
 
 
-def register_anim(channels_segments, start_points, radii, mold_points, timelines, total_time, fps, speed):
-    sc = build_scene(channels_segments, start_points, radii, mold_points)
+def register_anim(channels_segments, start_points, radii, mold_points, timelines, total_time, fps, speed,
+                  xname='X', yname='Y'):
+    sc = build_scene(channels_segments, start_points, radii, mold_points, xname, yname)
     n_frames = max(int(total_time * fps / speed), 2)
     token = uuid.uuid4().hex
     with _ANIM_LOCK:
@@ -1162,9 +1188,10 @@ def _even_crop(img):
     return img[:h - (h % 2), :w - (w % 2)]
 
 
-def mp4_generator(channels_segments, start_points, radii, mold_points, timelines, total_time, fps, path):
+def mp4_generator(channels_segments, start_points, radii, mold_points, timelines, total_time, fps, path,
+                  xname='X', yname='Y'):
     """Her ~5 karede bir (kare_no, toplam) üretir; bittiğinde dosya yazılmış olur."""
-    sc = build_scene(channels_segments, start_points, radii, mold_points)
+    sc = build_scene(channels_segments, start_points, radii, mold_points, xname, yname)
     n_frames = max(int(total_time * fps), 2)
     writer, frames = None, None
     try:
@@ -1200,10 +1227,12 @@ def mp4_generator(channels_segments, start_points, radii, mold_points, timelines
 # -------------------------------------------------------------
 # JSON kaydet / yükle (Colab bölüm 11 ile uyumlu + y_offset ve AutoCAD ayarları eklendi)
 # -------------------------------------------------------------
-def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step):
+def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts):
     data = {'channels': [], 'mold': dict(cfg['mold']),
-            'settings': {'contact_mode': cfg['contact_mode'], 'fps': fps, 'speed': speed},
-            'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step}}
+            'settings': {'contact_mode': cfg['contact_mode'], 'g0_feed': cfg['g0_feed'], 'fps': fps, 'speed': speed},
+            'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step},
+            'plot': {'label_font': opts['label_font'], 'label_shift': opts['label_shift'],
+                     'xname': opts['xname'], 'yname': opts['yname']}}
     for idx, ch in enumerate(cfg['channels']):
         data['channels'].append({'channel_id': idx + 1, 'x0': ch['x0'], 'y0': ch['y0'], 'tr': ch['tr'],
                                  'fd': ch['fd'], 'y_offset': ch['y_offset'], 'code': ch['code'],
@@ -1212,8 +1241,8 @@ def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step):
 
 
 def json_dict_to_updates(data, gr_update):
-    """JSON sözlüğünü bileşen güncellemelerine çevirir (N_CFG cfg + fps + speed + 3 AutoCAD).
-    JSON'da olmayan alanlar mevcut değerini korur (gr_update() boş güncelleme)."""
+    """JSON sözlüğünü bileşen güncellemelerine çevirir. Sıra, arayüzdeki all_inputs ile aynıdır:
+    N_CFG cfg + fps + speed + 3 AutoCAD + 4 grafik seçeneği. JSON'da olmayan alanlar mevcut değerini korur."""
     def pick(d, key):
         return gr_update(value=d[key]) if key in d else gr_update()
     ups = []
@@ -1227,11 +1256,15 @@ def json_dict_to_updates(data, gr_update):
         ups.append(pick(mold, key))
     st = data.get('settings', {}) or {}
     ups.append(pick(st, 'contact_mode'))
+    ups.append(pick(st, 'g0_feed'))
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
     ac = data.get('autocad', {}) or {}
     for key in ('start', 'end', 'step'):
         ups.append(pick(ac, key))
+    pl = data.get('plot', {}) or {}
+    for key in ('label_font', 'label_shift', 'xname', 'yname'):
+        ups.append(pick(pl, key))
     return ups
 
 
@@ -1247,10 +1280,25 @@ body{display:flex;flex-direction:column}
 button{padding:6px 12px;font-size:13px;font-weight:bold;cursor:pointer;border:1px solid #bbb;border-radius:5px;background:#fff}
 button.main{background:#0072B2;color:#fff;border-color:#0072B2}
 button.on{background:#222;color:#fff}
+button.rec{background:#c0392b;color:#fff;border-color:#c0392b}
 input[type=range]{vertical-align:middle}
-#cwrap{flex:1 1 auto;min-height:0;position:relative}
+#main{flex:1 1 auto;min-height:0;display:flex}
+#cwrap{flex:1 1 auto;min-width:0;position:relative}
 #cv{position:absolute;left:0;top:0;width:100%;height:100%}
+#side{width:290px;flex:0 0 290px;overflow:auto;border-left:1px solid #ddd;padding:10px;box-sizing:border-box;font-size:12px;background:#fafafa}
+#side .ttl{font-weight:bold;font-size:14px;margin-bottom:2px}
+#side .sub{color:#666;font-size:11px;margin-bottom:8px}
+#dt{width:100%;border-collapse:collapse;margin-bottom:10px}
+#dt th{font-size:11px;color:#555;text-align:right;padding:2px 3px;border-bottom:1px solid #ccc}
+#dt th:first-child,#dt td:first-child{text-align:left}
+#dt td{padding:5px 3px;text-align:right;border-bottom:1px solid #eee;font-variant-numeric:tabular-nums;vertical-align:top}
+#dt .cur{font-size:16px;font-weight:bold}
+#dt .tt{display:block;color:#888;font-size:10px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+#measb{width:100%;margin-bottom:6px}
+#mstat{font-size:12px;line-height:1.4}
 #tm{flex:1;min-width:140px}
+@media (max-width:760px){#main{flex-direction:column}#side{width:auto;flex:0 0 auto;max-height:46%;border-left:0;border-top:1px solid #ddd}}
 </style></head><body>
 <div class="bar">
  <button id="play" class="main">▶ Oynat</button><button id="rst">⟲ Başa</button>
@@ -1261,19 +1309,84 @@ input[type=range]{vertical-align:middle}
  <button id="fs">⛶ Tam Ekran</button>
 </div>
 <div class="bar"><input id="tm" type="range" min="0" max="10000" value="0"><b id="tv"></b></div>
-<div id="cwrap"><canvas id="cv"></canvas></div>
+<div id="main">
+ <div id="cwrap"><canvas id="cv"></canvas></div>
+ <div id="side">
+  <div class="ttl">Takım – Kalıp Mesafesi</div>
+  <div class="sub">Temas noktası → kalıp konturu (mm), canlı</div>
+  <table id="dt"><thead><tr><th>Kanal</th><th>Anlık</th><th>Min</th><th>Maks</th></tr></thead><tbody id="dtb"></tbody></table>
+  <button id="measb" class="main">📏 Ölçümü Başlat</button>
+  <div id="mstat">Ölçüm yapılmadı. “Ölçümü Başlat” ile başlat, “Ölçümü Bitir” ile sabitle.</div>
+ </div>
+</div>
 <script>
 (function(){
 var D=__DATA__;
 var cv=document.getElementById('cv'), ctx=cv.getContext('2d');
 var playB=document.getElementById('play'), rstB=document.getElementById('rst'), spd=document.getElementById('spd'),
     spdv=document.getElementById('spdv'), loopC=document.getElementById('loop'), fsB=document.getElementById('fs'),
-    tm=document.getElementById('tm'), tv=document.getElementById('tv'), pre=document.getElementById('presets');
+    tm=document.getElementById('tm'), tv=document.getElementById('tv'), pre=document.getElementById('presets'),
+    measB=document.getElementById('measb'), mstat=document.getElementById('mstat'), dtb=document.getElementById('dtb');
 var t=0, playing=false, last=0, speed=Math.min(Math.max(D.speed||1,0.1),30), W=0, H=0;
-var xmin=D.b[0], xmax=D.b[1], ymin=D.b[2], ymax=D.b[3];
+var xmin=D.b[0], xmax=D.b[1], ymin=D.b[2], ymax=D.b[3], NC=D.ch.length;
 function hex2rgba(h,a){var n=parseInt(h.slice(1),16);return 'rgba('+(n>>16&255)+','+(n>>8&255)+','+(n&255)+','+a+')';}
 function nice(r){var e=Math.pow(10,Math.floor(Math.log10(r))), f=r/e; return (f<1.5?1:f<3.5?2:f<7.5?5:10)*e;}
 function lerp(a,k,f){return a[k]+(a[k+1]-a[k])*f;}
+function fmt(v){return (typeof v==='number' && isFinite(v))?v.toFixed(3):'—';}
+function fmtT(v){return v.toFixed(2);}
+
+// ---- kalıp mesafesi ----
+function dpt(x,y){
+  var M=D.mold; if(M.length<2) return NaN; var best=1e18;
+  for(var i=0;i<M.length-1;i++){
+    var ax=M[i][0], ay=M[i][1], bx=M[i+1][0]-ax, by=M[i+1][1]-ay, l2=bx*bx+by*by;
+    var q=l2>0?((x-ax)*bx+(y-ay)*by)/l2:0; q=q<0?0:(q>1?1:q);
+    var dx=ax+q*bx-x, dy=ay+q*by-y, dd=dx*dx+dy*dy; if(dd<best) best=dd;}
+  return Math.sqrt(best);
+}
+function pos(i,key,k,f){var c=D.ch[i]; return [lerp(c[key[0]],k,f), lerp(c[key[1]],k,f)];}
+function kf(){var u=t/D.dt, k=Math.min(Math.floor(u),D.n-1), f=u-k; if(k<0){k=0;f=0;} return [k,f];}
+function curDist(i){var q=kf(), p=pos(i,['px','py'],q[0],q[1]); return dpt(p[0],p[1]);}
+
+var meas={on:false,has:false,last:0,tlo:0,thi:0,mn:[],mx:[],tmn:[],tmx:[]};
+function measReset(){meas.mn=[];meas.mx=[];meas.tmn=[];meas.tmx=[]; for(var i=0;i<NC;i++){meas.mn.push(Infinity);meas.mx.push(-Infinity);meas.tmn.push(0);meas.tmx.push(0);}}
+function measPush(i,v,tt){ if(!isFinite(v)) return; if(v<meas.mn[i]){meas.mn[i]=v;meas.tmn[i]=tt;} if(v>meas.mx[i]){meas.mx[i]=v;meas.tmx[i]=tt;} }
+function measStep(){
+  if(!meas.on) return;
+  var lo=Math.min(meas.last,t), hi=Math.max(meas.last,t);
+  var k0=Math.max(0,Math.floor(lo/D.dt)), k1=Math.min(D.n-1,Math.floor(hi/D.dt));
+  for(var k=k0;k<=k1;k++){                       // aralıktaki tüm örnekler + aralarında 3 ara adım (hız farketmez)
+    for(var s=0;s<4;s++){ var tt=(k+s/4)*D.dt; if(tt<lo-1e-9||tt>hi+1e-9) continue;
+      for(var i=0;i<NC;i++){ var c=D.ch[i]; measPush(i,dpt(lerp(c.px,k,s/4),lerp(c.py,k,s/4)),tt); } } }
+  for(var i=0;i<NC;i++) measPush(i,curDist(i),t);
+  meas.last=t; meas.tlo=Math.min(meas.tlo,t); meas.thi=Math.max(meas.thi,t);
+}
+function startMeas(){ measReset(); meas.on=true; meas.has=false; meas.last=t; meas.tlo=t; meas.thi=t;
+  for(var i=0;i<NC;i++) measPush(i,curDist(i),t);
+  measB.textContent='⏹ Ölçümü Bitir'; measB.className='rec'; ui(); }
+function stopMeas(why){ if(!meas.on) return; measStep(); meas.on=false; meas.has=true;
+  measB.textContent='📏 Ölçümü Başlat'; measB.className='main'; meas.why=why||''; ui(); }
+measB.onclick=function(){ if(meas.on) stopMeas(''); else startMeas(); };
+
+// tablo satırları
+for(var qi=0;qi<NC;qi++){
+  var tr=document.createElement('tr');
+  tr.innerHTML='<td><span class="sw" style="background:'+D.col[qi]+'"></span>K'+(qi+1)+'</td>'+
+    '<td class="cur" id="cd'+qi+'">—</td><td id="mn'+qi+'">—</td><td id="mx'+qi+'">—</td>';
+  dtb.appendChild(tr);
+}
+measReset();
+function cellHtml(v,tt){ return isFinite(v)?(fmt(v)+'<span class="tt">@'+fmtT(tt)+' s</span>'):'—'; }
+function updatePanel(){
+  for(var i=0;i<NC;i++){
+    document.getElementById('cd'+i).textContent=fmt(curDist(i));
+    document.getElementById('mn'+i).innerHTML=cellHtml(meas.mn[i],meas.tmn[i]);
+    document.getElementById('mx'+i).innerHTML=cellHtml(meas.mx[i],meas.tmx[i]);
+  }
+  if(meas.on){ mstat.innerHTML='<span style="color:#c0392b;font-weight:bold">● Ölçüm sürüyor</span><br>Aralık: '+fmtT(meas.tlo)+' – '+fmtT(meas.thi)+' s'; }
+  else if(meas.has){ mstat.innerHTML='<span style="color:#1e8449;font-weight:bold">✔ Ölçüm tamamlandı (sabitlendi)</span><br>Aralık: '+fmtT(meas.tlo)+' – '+fmtT(meas.thi)+' s'+(meas.why?'<br><i>'+meas.why+'</i>':''); }
+}
+
 function setSpeed(v){speed=v; spd.value=v; spdv.textContent=v.toFixed(1)+'×';
   var bs=pre.getElementsByTagName('button'); for(var i=0;i<bs.length;i++){bs[i].className=(Math.abs(parseFloat(bs[i].getAttribute('data-v'))-v)<1e-9)?'on':'';}}
 [0.5,1,2,5,10,20].forEach(function(v){var b=document.createElement('button'); b.textContent=v+'×'; b.setAttribute('data-v',v);
@@ -1282,28 +1395,25 @@ function resize(){var dpr=window.devicePixelRatio||1, r=cv.getBoundingClientRect
   cv.width=Math.max(10,Math.round(W*dpr)); cv.height=Math.max(10,Math.round(H*dpr)); ctx.setTransform(dpr,0,0,dpr,0,0); draw();}
 function draw(){
   ctx.clearRect(0,0,W,H);
-  var L=58,B=40,T=34,R=Math.min(175,W*0.26);
+  var L=62,B=46,T=34,R=Math.min(165,W*0.26);
   var pw=W-L-R, ph=H-T-B; if(pw<20||ph<20) return;
   var sc=Math.min(pw/(xmax-xmin), ph/(ymax-ymin));
   var ox=L+(pw-sc*(xmax-xmin))/2, oy=T+(ph-sc*(ymax-ymin))/2;
   function X(x){return ox+(x-xmin)*sc;} function Y(y){return oy+(ymax-y)*sc;}
   ctx.font='bold 15px Arial'; ctx.fillStyle='#222'; ctx.textAlign='center'; ctx.fillText('CNC Simülasyonu',ox+sc*(xmax-xmin)/2,20);
-  // ızgara
   var st=nice(Math.max(xmax-xmin,ymax-ymin)/8);
   ctx.save(); ctx.beginPath(); ctx.rect(ox,oy,sc*(xmax-xmin),sc*(ymax-ymin)); ctx.clip();
   ctx.strokeStyle='rgba(0,0,0,0.12)'; ctx.lineWidth=1; ctx.beginPath();
   for(var gx=Math.ceil(xmin/st)*st; gx<=xmax; gx+=st){ctx.moveTo(X(gx),oy); ctx.lineTo(X(gx),oy+sc*(ymax-ymin));}
   for(var gy=Math.ceil(ymin/st)*st; gy<=ymax; gy+=st){ctx.moveTo(ox,Y(gy)); ctx.lineTo(ox+sc*(xmax-xmin),Y(gy));}
   ctx.stroke();
-  // kalıp
   ctx.strokeStyle='#000'; ctx.lineWidth=1.4; ctx.beginPath();
   D.mold.forEach(function(p,i){ if(i===0) ctx.moveTo(X(p[0]),Y(p[1])); else ctx.lineTo(X(p[0]),Y(p[1])); }); ctx.stroke();
-  // kanallar
-  var u=t/D.dt, k=Math.min(Math.floor(u),D.n-1), f=u-k; if(k<0){k=0;f=0;}
+  var q=kf(), k=q[0], f=q[1];
   D.ch.forEach(function(c,i){
     var col=D.col[i];
     ctx.strokeStyle=col; ctx.lineWidth=2.3; ctx.beginPath();
-    var pen=false, m=c.m[k], lx=0, ly=0;
+    var pen=false, m=c.m[k];
     for(var j=0;j<m;j++){var p=c.F[j]; if(p===null){pen=false; continue;}
       if(!pen){ctx.moveTo(X(p[0]),Y(p[1])); pen=true;} else ctx.lineTo(X(p[0]),Y(p[1]));}
     var hx=c.hx[k], hy=c.hy[k];
@@ -1319,28 +1429,33 @@ function draw(){
   });
   ctx.restore();
   ctx.strokeStyle='#444'; ctx.lineWidth=1; ctx.strokeRect(ox,oy,sc*(xmax-xmin),sc*(ymax-ymin));
-  // eksen yazıları
   ctx.fillStyle='#333'; ctx.font='11px Arial'; ctx.textAlign='center';
   for(var tx=Math.ceil(xmin/st)*st; tx<=xmax; tx+=st){ctx.fillText(+tx.toFixed(6),X(tx),oy+sc*(ymax-ymin)+14);}
   ctx.textAlign='right';
   for(var ty=Math.ceil(ymin/st)*st; ty<=ymax; ty+=st){ctx.fillText(+ty.toFixed(6),ox-5,Y(ty)+4);}
+  // eksen adları
+  ctx.fillStyle='#111'; ctx.font='bold 13px Arial'; ctx.textAlign='center';
+  ctx.fillText(D.xn||'X', ox+sc*(xmax-xmin)/2, oy+sc*(ymax-ymin)+34);
+  ctx.save(); ctx.translate(14, oy+sc*(ymax-ymin)/2); ctx.rotate(-Math.PI/2); ctx.fillText(D.yn||'Y',0,0); ctx.restore();
   ctx.textAlign='left'; ctx.font='bold 12px Arial'; ctx.fillStyle='#111';
   ctx.fillText('t = '+t.toFixed(2)+' / '+D.T.toFixed(2)+' s',ox+6,oy+16);
-  // açıklama
   var lgx=W-R+14, lgy=T+4; ctx.font='11px Arial';
   function leg(col,txt,y){ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(lgx,y); ctx.lineTo(lgx+22,y); ctx.stroke(); ctx.fillStyle='#222'; ctx.fillText(txt,lgx+28,y+4);}
   leg('#000','Kalıp (sabit)',lgy+8);
-  for(var q=0;q<D.col.length;q++) leg(D.col[q],'Kanal '+(q+1)+' — kontur',lgy+28+q*20);
+  for(var qq=0;qq<D.col.length;qq++) leg(D.col[qq],'Kanal '+(qq+1)+' — kontur',lgy+28+qq*20);
 }
-function ui(){tm.value=Math.round(t/D.T*10000); tv.textContent=t.toFixed(2)+' / '+D.T.toFixed(2)+' s';}
-function setPlaying(p){playing=p; playB.textContent=p?'⏸ Duraklat':'▶ Oynat'; if(p){ if(t>=D.T) t=0; last=performance.now(); requestAnimationFrame(frame);} }
-function frame(now){ if(!playing) return; var dt=(now-last)/1000; last=now; t+=dt*speed;
-  if(t>=D.T){ if(loopC.checked){t=t%D.T;} else {t=D.T; setPlaying(false);} }
+function ui(){tm.value=Math.round(t/D.T*10000); tv.textContent=t.toFixed(2)+' / '+D.T.toFixed(2)+' s'; updatePanel();}
+function setT(nt){t=nt; measStep(); draw(); ui();}
+function setPlaying(p){playing=p; playB.textContent=p?'⏸ Duraklat':'▶ Oynat'; if(p){ if(t>=D.T) setT(0); last=performance.now(); requestAnimationFrame(frame);} }
+function frame(now){ if(!playing) return; var dtt=(now-last)/1000; last=now; var nt=t+dtt*speed;
+  if(nt>=D.T){ t=D.T; measStep(); if(meas.on) stopMeas('Süre sonuna ulaşıldı.');
+    if(loopC.checked){t=0;} else {setPlaying(false);} }
+  else { t=nt; measStep(); }
   draw(); ui(); if(playing) requestAnimationFrame(frame);}
 playB.onclick=function(){setPlaying(!playing);};
-rstB.onclick=function(){t=0; draw(); ui();};
+rstB.onclick=function(){ if(meas.on) stopMeas('Başa dönüldü.'); setT(0); };
 spd.oninput=function(){setSpeed(parseFloat(spd.value));};
-tm.oninput=function(){t=tm.value/10000*D.T; draw(); ui();};
+tm.oninput=function(){setT(tm.value/10000*D.T);};
 fsB.onclick=function(){ if(!document.fullscreenElement){ document.documentElement.requestFullscreen().catch(function(e){alert('Tam ekran açılamadı: '+e.message);}); } else { document.exitFullscreen(); } };
 document.addEventListener('fullscreenchange',function(){setTimeout(resize,100);});
 if(window.ResizeObserver){new ResizeObserver(resize).observe(document.getElementById('cwrap'));} else {window.addEventListener('resize',resize);}
@@ -1356,7 +1471,7 @@ def _same_pt(a, b):
 
 
 def build_player_data(channels_segments, start_points, radii, mold_points, timelines, total_time,
-                      speed0=1.0, rate=30):
+                      speed0=1.0, rate=30, xname='X', yname='Y'):
     xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points)
     n = int(min(max(np.ceil(total_time * rate), 2), 6000))
     dt = total_time / n
@@ -1384,7 +1499,7 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
         chans.append(c)
     return {'T': r3(total_time), 'n': n, 'dt': dt, 'b': [r3(xmin), r3(xmax), r3(ymin), r3(ymax)],
             'mold': [[r3(p[0]), r3(p[1])] for p in mold_points], 'r': [r3(r) for r in radii],
-            'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'ch': chans}
+            'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans}
 
 
 def build_player_html(data, height=720):
@@ -1400,12 +1515,28 @@ N_ANIM_OUT = 13   # run_all çıktı sayısı
 
 
 def _split_vals(vals):
-    """vals = 22 cfg + fps + speed + ac_start + ac_end + ac_step"""
+    """vals = N_CFG cfg + fps + speed + ac_start + ac_end + ac_step + 4 grafik seçeneği"""
     cfg = cfg_from_values(vals[:N_CFG])
     fps = int(_num(vals[N_CFG], 20))
     speed = _num(vals[N_CFG + 1], 1.0) or 1.0
     ac_s, ac_e, ac_st = (_num(vals[N_CFG + 2], 0.0), _num(vals[N_CFG + 3], 0.0), _num(vals[N_CFG + 4], 0.1))
-    return cfg, fps, speed, ac_s, ac_e, ac_st
+    opts = opts_from_values(vals[N_CFG + 5:N_CFG + 5 + N_OPT])
+    return cfg, fps, speed, ac_s, ac_e, ac_st, opts
+
+
+def _plot_kw(opts):
+    return dict(xname=opts['xname'], yname=opts['yname'],
+                label_font=opts['label_font'], label_shift=opts['label_shift'])
+
+
+def _static_plots(segs, starts, radii, mold_pts, opts):
+    comp = fig_to_svg_card(plot_comparison_fig(segs, starts, radii, mold_pts, opts['xname'], opts['yname']))
+    if len(mold_pts) > 1:
+        ind = [fig_to_svg_card(plot_channel_fig(i, segs, starts, radii, mold_pts, **_plot_kw(opts)))
+               for i in range(N_CH)]
+    else:
+        ind = ["<p>Kalıp noktası yetersiz.</p>"] * N_CH
+    return comp, ind
 
 
 # -------------------------------------------------------------
@@ -1413,21 +1544,17 @@ def _split_vals(vals):
 # -------------------------------------------------------------
 def run_all(*vals):
     try:
-        cfg, fps, speed, ac_s, ac_e, ac_st = _split_vals(vals)
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
             total_time = 1.0
 
-        token, n_frames = register_anim(segs, starts, radii, mold_pts, timelines, total_time, fps, speed)
+        token, n_frames = register_anim(segs, starts, radii, mold_pts, timelines, total_time, fps, speed,
+                                        opts['xname'], opts['yname'])
         frame0 = render_frame_image(token, 0)
 
-        comp_html = fig_to_svg_card(plot_comparison_fig(segs, starts, radii, mold_pts))
-        if len(mold_pts) > 1:
-            ind_html = [fig_to_svg_card(plot_channel_fig(i, segs, starts, radii, mold_pts)) for i in range(N_CH)]
-        else:
-            msg = "<p>Kalıp noktası yetersiz.</p>"
-            ind_html = [msg] * N_CH
+        comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts)
         table = distance_table(segs, mold_pts)
 
         end_used = ac_e if ac_e > ac_s else total_time
@@ -1439,7 +1566,8 @@ def run_all(*vals):
 
         try:
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
-                                                              total_time, speed0=speed))
+                                                              total_time, speed0=speed,
+                                                              xname=opts['xname'], yname=opts['yname']))
         except Exception:
             player_html = "<p>Hızlı oynatıcı hazırlanamadı:</p><pre>" + html.escape(traceback.format_exc()) + "</pre>"
 
@@ -1455,6 +1583,17 @@ def run_all(*vals):
     except Exception:
         err = "Simülasyon hazırlanırken hata oluştu:\n" + traceback.format_exc()
         return tuple([gr.update()] * (N_ANIM_OUT - 1) + [err])
+
+
+def redraw_plots(*vals):
+    """Yazı boyutu / kaydırma / eksen adı değişince yalnızca statik grafikleri yeniden çizer."""
+    try:
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
+        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+        comp, ind = _static_plots(segs, starts, radii, mold_pts, opts)
+        return comp, ind[0], ind[1], ind[2], "Grafikler güncellendi."
+    except Exception:
+        return (gr.update(),) * 4 + ("Grafikler yeniden çizilirken hata oluştu:\n" + traceback.format_exc(),)
 
 
 # -------------------------------------------------------------
@@ -1510,6 +1649,7 @@ def make_mp4(*vals):
     try:
         mp4_fps = int(_num(vals[N_CFG], 20)) or 20
         cfg = cfg_from_values(vals[:N_CFG])
+        opts = opts_from_values(vals[N_CFG + 1:N_CFG + 1 + N_OPT])
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
@@ -1517,7 +1657,8 @@ def make_mp4(*vals):
         out_dir = tempfile.mkdtemp(prefix='cnc_mp4_')
         path = os.path.join(out_dir, 'cnc_simulation.mp4')
         yield gr.update(), gr.update(), (note + "\n" if note else "") + "MP4 hazırlanıyor..."
-        for done, total in mp4_generator(segs, starts, radii, mold_pts, timelines, total_time, mp4_fps, path):
+        for done, total in mp4_generator(segs, starts, radii, mold_pts, timelines, total_time, mp4_fps, path,
+                                         opts['xname'], opts['yname']):
             yield gr.update(), gr.update(), f"MP4 kareleri oluşturuluyor: {done}/{total}"
         yield path, path, f"Tamamlandı: cnc_simulation.mp4 ({total_time:.2f} sn, {mp4_fps} FPS). Aşağıdan indirebilirsin."
     except Exception:
@@ -1529,7 +1670,7 @@ def make_mp4(*vals):
 # -------------------------------------------------------------
 def gen_circles_only(*vals):
     try:
-        cfg, fps, speed, ac_s, ac_e, ac_st = _split_vals(vals)
+        cfg, fps, speed, ac_s, ac_e, ac_st, _opts = _split_vals(vals)
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
@@ -1557,8 +1698,8 @@ def gen_paths_only(*vals):
 # -------------------------------------------------------------
 def export_json(*vals):
     try:
-        cfg, fps, speed, ac_s, ac_e, ac_st = _split_vals(vals)
-        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st)
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
+        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st, opts)
         out_dir = tempfile.mkdtemp(prefix='cnc_cfg_')
         path = os.path.join(out_dir, 'gcode_simulator_config.json')
         with open(path, 'w', encoding='utf-8') as f:
@@ -1569,7 +1710,7 @@ def export_json(*vals):
 
 
 def import_json(file_obj):
-    n_out = N_CFG + 2 + 3 + 1
+    n_out = N_CFG + 2 + 3 + N_OPT + 1
     if file_obj is None:
         return tuple([gr.update()] * (n_out - 1) + ["JSON dosyası seçilmedi."])
     try:
@@ -1587,7 +1728,7 @@ def make_defaults_code(*vals):
     chans = pprint.pformat(cfg['channels'], sort_dicts=False, width=110)
     mold = pprint.pformat(cfg['mold'], sort_dicts=False, width=110)
     return (f"DEFAULT_CHANNELS = {chans}\n\nDEFAULT_MOLD = {mold}\n\n"
-            f"DEFAULT_CONTACT_MODE = {cfg['contact_mode']!r}")
+            f"DEFAULT_CONTACT_MODE = {cfg['contact_mode']!r}\n\nDEFAULT_G0_FEED = {cfg['g0_feed']!r}")
 
 
 def _textbox(**kw):
@@ -1647,6 +1788,17 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                            label="Çizilen yol")
                 cfg_comps += [m_x0, m_y0, m_code, m_dmode, m_daxis, contact_mode]
 
+            g0_feed = gr.Number(value=DEFAULT_G0_FEED, label="G0 (hızlı hareket) hızı (mm/dk)",
+                                info="G0 satırında F yazılmamışsa bu hız kullanılır.")
+            cfg_comps.append(g0_feed)
+
+            with gr.Accordion("Grafik eksen adları", open=False):
+                with gr.Row():
+                    x_name = gr.Textbox(value=DEFAULT_XNAME, label="Yatay eksen adı", max_lines=1)
+                    y_name = gr.Textbox(value=DEFAULT_YNAME, label="Dikey eksen adı", max_lines=1)
+                gr.Markdown("Varsayılan X ve Y. Grafiklerde görünen adı değiştirir (G-kodundaki X/Y harfleri aynı kalır). "
+                            "Enter'a basınca grafikler güncellenir; animasyon / oynatıcı / MP4'e bir sonraki çalıştırmada yansır.")
+
             with gr.Row():
                 fps_sl = gr.Slider(5, 40, value=20, step=1, label="FPS")
                 speed_sl = gr.Slider(0.2, 5.0, value=1.0, step=0.2, label="Hız Çarpanı")
@@ -1688,7 +1840,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     gr.Markdown("**Çalıştır**'dan sonra animasyon tarayıcıda akıcı olarak oynar. Hızı (0.1×–30×) "
                                 "oynatıcının içindeki kaydırıcı / hazır düğmelerle istediğin an değiştirebilir, "
                                 "zaman çubuğundan ileri-geri gidebilir, tam ekrana geçebilirsin. "
-                                "1× = gerçek zamanlı simülasyon süresi.")
+                                "1× = gerçek zamanlı simülasyon süresi. Sağdaki panelde takım–kalıp mesafesi canlı görünür; "
+                                "**Ölçümü Başlat / Bitir** ile iki an arasındaki en küçük ve en büyük mesafe sabitlenir.")
                     player_out = gr.HTML()
 
                 with gr.Tab("🎥 MP4"):
@@ -1702,6 +1855,11 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     comp_html = gr.HTML()
 
                 with gr.Tab("📐 Bireysel Kanal Analizi"):
+                    with gr.Row():
+                        lbl_font = gr.Slider(4, 20, value=DEFAULT_LABEL_FONT, step=1, label="Mesafe yazı boyutu")
+                        lbl_shift = gr.Slider(-60, 60, value=DEFAULT_LABEL_SHIFT, step=0.5,
+                                              label="Tüm yazıları kaydır (mm): + yukarı / − aşağı")
+                    redraw_btn = gr.Button("Grafikleri yeniden çiz")
                     with gr.Tabs():
                         with gr.Tab("Kanal 1"):
                             ind1 = gr.HTML()
@@ -1731,12 +1889,20 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     ac_path_txt = _textbox(label="Çizgi Yolu Kodları (PLINE)", lines=14)
 
     # ---------------- OLAYLAR ----------------
-    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step]
+    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step, lbl_font, lbl_shift, x_name, y_name]
 
     run_btn.click(
         run_all, inputs=all_inputs,
         outputs=[anim_img, frame_sl, play_timer, anim_token, comp_html, ind1, ind2, ind3,
                  table_out, ac_circ_txt, ac_path_txt, player_out, status])
+
+    # statik grafikleri yeniden çiz (yazı boyutu / kaydırma / eksen adı)
+    redraw_outputs = [comp_html, ind1, ind2, ind3, status]
+    for _c in (lbl_font, lbl_shift):
+        _c.release(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
+    for _c in (x_name, y_name):
+        _c.submit(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
+    redraw_btn.click(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
 
     # oynatıcı
     frame_sl.change(anim_render, inputs=[frame_sl, anim_token], outputs=anim_img,
@@ -1749,7 +1915,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     speed_sl.release(anim_retune, inputs=[fps_sl, speed_sl, anim_token], outputs=[frame_sl, play_timer])
 
     # MP4
-    mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps], outputs=[video_out, mp4_file, status])
+    mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps, lbl_font, lbl_shift, x_name, y_name],
+                  outputs=[video_out, mp4_file, status])
 
     # AutoCAD
     ac_circ_btn.click(gen_circles_only, inputs=all_inputs, outputs=[ac_circ_txt, status])
