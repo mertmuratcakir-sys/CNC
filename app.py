@@ -23,17 +23,17 @@ import io
 def parse_gcode(text):
     """G-kodu metnini satır satır ayrıştırır, komut sözlükleri üretir."""
     commands = []
-    for raw_line in text.strip().split('\n'):
+    for _ln, raw_line in enumerate(text.strip().split('\n')):
         line = raw_line.split(';')[0].strip()  # yorumları at
         if not line:
             continue
         if line.upper().startswith('WAIT'):
-            commands.append({'type': 'WAIT'})
+            commands.append({'type': 'WAIT', '_line': _ln})
             continue
         tokens = re.findall(r'([A-Za-z])\s*(-?\d+\.?\d*)', line)
         if not tokens:
             continue
-        cmd = {'type': 'CMD'}
+        cmd = {'type': 'CMD', '_line': _ln}
         for letter, value in tokens:
             cmd[letter.upper()] = float(value)
         commands.append(cmd)
@@ -73,12 +73,26 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
     feed = default_feed
     segments = []
 
+    def _app(d):
+        """Segmenti ekler; CNC ekranı için kaynak satırı ve programlanan (kompanzasyonsuz) geometriyi saklar."""
+        d = dict(d)
+        d['line'] = cmd.get('_line')
+        if d.get('type') == 'move':
+            d['prog_start'] = (float(x), float(y))
+            d['prog_end'] = (float(target_x), float(target_y))
+            if d.get('kind') == 'arc':
+                d['prog_arc'] = (float(d['center'][0]), float(d['center'][1]), float(d['orig_radius']),
+                                 float(d['start_ang']), float(d['end_ang']))
+        elif d.get('type') == 'dwell':
+            d['prog_start'] = d['prog_end'] = (float(x), float(y))
+        segments.append(d)
+
     # Renklendirme için hareket içeren komutları sayacağız
     move_counter = 0
 
     for cmd in commands:
         if cmd['type'] == 'WAIT':
-            segments.append({'type': 'wait'})
+            _app({'type': 'wait'})
             continue
 
         if 'G' in cmd:
@@ -95,7 +109,7 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
 
         if motion_mode == 'G4':
             dwell = cmd.get('P', 0.0)
-            segments.append({'type': 'dwell', 'point': (x, y), 'duration': dwell})
+            _app({'type': 'dwell', 'point': (x, y), 'duration': dwell})
             continue
 
         target_x = cmd.get('X', x)
@@ -132,7 +146,7 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
                 eff_feed = feed if 'F' in cmd else g0_feed
             dur = (dist / eff_feed) * 60 if eff_feed > 0 else 0.0
 
-            segments.append({
+            _app({
                 'type': 'move', 'kind': 'line',
                 'points': [p0c, p1c], 'duration': dur, 'feed': eff_feed, 'g0': motion_mode == 'G0',
                 'comp_mode': active_comp,
@@ -210,7 +224,7 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
             }
             seg['tangent_start'] = _tangent_for(seg, start_ang)
             seg['tangent_end'] = _tangent_for(seg, end_ang)
-            segments.append(seg)
+            _app(seg)
 
         x, y = target_x, target_y
 
@@ -346,7 +360,10 @@ def apply_corner_compensation(segments, tool_radius):
                         'tangent_start': tin, 'tangent_end': tout,
                         'orig_start': V, 'orig_end': V,
                         'orig_points': [V, V],
-                        'color_idx': segA.get('color_idx', 0) # Bir önceki hareketin rengini sürdür
+                        'color_idx': segA.get('color_idx', 0), # Bir önceki hareketin rengini sürdür
+                        # CNC ekranı: köşe geçişi bir önceki bloğa ait, programlanan konum köşede sabit
+                        'line': segA.get('line'), 'g0': segA.get('g0', False),
+                        'prog_start': segA.get('prog_end', V), 'prog_end': segA.get('prog_end', V),
                     })
                 else:
                     # --- İÇBÜKEY ---
@@ -596,6 +613,7 @@ import numpy as np
 import pandas as pd
 
 CHANNEL_COLORS = ['#0072B2', '#D55E00', '#0072B2']   # renk körü dostu 2 renk (sırayla)
+CHANNEL_ENV_COLORS = ['#009E73', '#CC79A7', '#E69F00']   # radüs izi (form yüzeyi) renkleri, kanal bazlı
 N_CH = 3
 
 # -------------------------------------------------------------
@@ -626,6 +644,8 @@ DEFAULT_G0_FEED = 15000.0        # G0 (hızlı hareket) varsayılan hızı, mm/d
 DEFAULT_LABEL_FONT = 7           # bireysel kanal analizi mesafe yazı boyutu
 DEFAULT_LABEL_SHIFT = 0.0        # tüm mesafe yazılarını yukarı(+)/aşağı(-) kaydırma (mm)
 DEFAULT_XNAME, DEFAULT_YNAME = 'X', 'Y'    # grafiklerde yatay / dikey eksen adı
+DEFAULT_SHOW_ENV = True          # radüs izini (form yüzeyi) göster
+DEFAULT_ENV_LIMIT = 0.0          # radüs izi sınırı = ham malzeme kalınlığı (mm); 0 = takım yarıçapı
 CONTACT_MODE_CHOICES = [
     ('Geometrik: takım dairesi ile kalıp arasındaki en dar nokta (G40/G41/G42 fark etmez)', 'geometric'),
     ('Programlanan: G41/G42 konturu, G40 takım merkezi (eski davranış)', 'programmed'),
@@ -637,7 +657,7 @@ DIA_AXIS_CHOICES = [('X ekseni', 'X'), ('Y ekseni', 'Y'), ('X ve Y', 'XY')]
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
 N_CFG = MOLD_START + 5 + 1 + 1      # 31: kalıp(5) + çizilen yol modu + G0 hızı
-N_OPT = 4                           # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad
+N_OPT = 6                           # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı
 
 
 def _num(v, default=0.0):
@@ -676,11 +696,14 @@ def cfg_from_values(v):
 
 
 def opts_from_values(v):
-    """[yazı boyutu, kaydırma, yatay eksen adı, dikey eksen adı] -> grafik seçenekleri sözlüğü."""
+    """[yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi göster, iz sınırı] -> grafik seçenekleri."""
+    v = list(v) + [None] * (N_OPT - len(v))
     font = min(max(_num(v[0], DEFAULT_LABEL_FONT), 3.0), 40.0)
     return {'label_font': font, 'label_shift': _num(v[1], DEFAULT_LABEL_SHIFT),
             'xname': (str(v[2]).strip() if v[2] is not None else '') or DEFAULT_XNAME,
-            'yname': (str(v[3]).strip() if v[3] is not None else '') or DEFAULT_YNAME}
+            'yname': (str(v[3]).strip() if v[3] is not None else '') or DEFAULT_YNAME,
+            'show_env': DEFAULT_SHOW_ENV if v[4] is None else bool(v[4]),
+            'env_limit': max(_num(v[5], DEFAULT_ENV_LIMIT), 0.0)}
 
 
 # -------------------------------------------------------------
@@ -776,7 +799,9 @@ from PIL import Image
 
 
 def _is_g0(seg):
-    return bool(seg.get('g0', False)) or seg.get('feed', 1000.0) >= 3000.0
+    if 'g0' in seg:                                   # komuttan gelen kesin bilgi
+        return bool(seg['g0'])
+    return seg.get('feed', 1000.0) >= 3000.0          # eski segmentler için yedek kural
 
 
 def _plot_limits(mold_points, start_points, radii, margin_mult):
@@ -805,9 +830,158 @@ def _mold_closest_fn(mold_points):
 
 
 # -------------------------------------------------------------
+# RADÜS İZİ (FORM YÜZEYİ): takım dairelerinin kalıba bakan zarfı.
+# Kalıbın her noktasından normal yönünde (iki yöne) ışın atılır; ışının ilk
+# kestiği takım dairesi o noktadaki form yüzeyini verir. Takım ilerlemese,
+# sadece yanaşsa bile radüs şekli böylece izde görünür.
+# Kalıp ile bu iz arasında kalan bölge = inceltilmiş malzeme.
+# -------------------------------------------------------------
+def mold_rays(mold_points, max_pts=3000, fan_deg=8.0):
+    """Kalıp konturunu sıklaştırır ve her noktaya birim normal verir.
+    Köşelerde normali yelpaze gibi döndüren ek ışınlar ekler (köşe çevresinde iz kopmasın).
+    Döndürür: (M (N,2), Nrm (N,2), brk (N,) bool: bu noktadan önce iz kopsun mu)"""
+    P = np.asarray(mold_points, float)
+    if len(P) < 2:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0, bool)
+    keep = np.r_[True, np.hypot(*(P[1:] - P[:-1]).T) > 1e-9]
+    P = P[keep]
+    if len(P) < 2:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0, bool)
+    seg_len = np.hypot(*(P[1:] - P[:-1]).T)
+    step = max(0.25, float(seg_len.sum()) / max_pts)
+    dirs = (P[1:] - P[:-1]) / seg_len[:, None]
+    nrm = np.c_[-dirs[:, 1], dirs[:, 0]]                       # sol normal
+    M, N, B = [], [], []
+    for k in range(len(P) - 1):
+        if k > 0:                                              # köşe yelpazesi
+            a0 = np.arctan2(nrm[k - 1, 1], nrm[k - 1, 0])
+            a1 = np.arctan2(nrm[k, 1], nrm[k, 0])
+            da = (a1 - a0 + np.pi) % (2 * np.pi) - np.pi
+            nf = int(abs(np.degrees(da)) // fan_deg)
+            for f in range(1, nf + 1):
+                a = a0 + da * f / (nf + 1)
+                M.append(P[k]); N.append((np.cos(a), np.sin(a))); B.append(False)
+        n = max(int(np.ceil(seg_len[k] / step)), 1)
+        for j in range(n):
+            M.append(P[k] + dirs[k] * seg_len[k] * j / n); N.append(nrm[k]); B.append(False)
+    M.append(P[-1]); N.append(nrm[-1]); B.append(False)
+    return np.asarray(M), np.asarray(N), np.asarray(B)
+
+
+def tool_samples(timeline, tool_r):
+    """Kanalın takım merkezi yolunu (G0 hariç, hareket + bekleme) zamanıyla birlikte sık örnekler.
+    Döndürür: (C (K,2) merkezler, T (K,) zamanlar) - zamana göre sıralı."""
+    step = max(0.15, tool_r / 30.0)
+    C, T = [], []
+    for (t0, t1, seg) in timeline:
+        if seg['type'] == 'dwell':
+            C.append(seg['point']); T.append(t0)
+            continue
+        if seg['type'] != 'move' or _is_g0(seg):
+            continue
+        pts = np.asarray(seg['points'], float)
+        if len(pts) == 1:
+            C.append(pts[0]); T.append(t0)
+            continue
+        n_seg = len(pts) - 1
+        for i in range(n_seg):
+            a, b = pts[i], pts[i + 1]
+            L = float(np.hypot(*(b - a)))
+            m = max(int(np.ceil(L / step)), 1)
+            for j in range(m + (1 if i == n_seg - 1 else 0)):
+                u = j / m
+                C.append(a + (b - a) * u)
+                T.append(t0 + (t1 - t0) * (i + u) / n_seg)
+    if not C:
+        return np.zeros((0, 2)), np.zeros(0)
+    return np.asarray(C, float), np.asarray(T, float)
+
+
+def radius_envelope(M, Nrm, C, tool_r, chunk=384):
+    """Her kalıp noktası için en yakın takım dairesi kesişimini bulur.
+    Döndürür: s (N,) işaretli mesafe (+ normal yönü, - ters yönü; inf = hiç kesmedi).
+    Takım dairesi kalıp noktasını içine alıyorsa s = 0."""
+    N_m = len(M)
+    best = np.full(N_m, np.inf)
+    if N_m == 0 or len(C) == 0:
+        return best
+    r2 = float(tool_r) ** 2
+    for a in range(0, len(C), chunk):
+        Cc = C[a:a + chunk]
+        dx = M[:, None, 0] - Cc[None, :, 0]                   # (N_m, k)
+        dy = M[:, None, 1] - Cc[None, :, 1]
+        b = Nrm[:, None, 0] * dx + Nrm[:, None, 1] * dy
+        cterm = dx * dx + dy * dy - r2
+        disc = b * b - cterm
+        with np.errstate(invalid='ignore'):
+            sq = np.sqrt(np.maximum(disc, 0.0))
+        s = np.where(cterm <= 0, 0.0, -b + np.sign(b) * sq)    # ışının daireye GİRDİĞİ (yakın) kök
+        s = np.where((cterm > 0) & (disc < 0), np.inf, s)
+        k = np.argmin(np.abs(s), axis=1)
+        cand = s[np.arange(N_m), k]
+        better = np.abs(cand) < np.abs(best)
+        best[better] = cand[better]
+    return best
+
+
+def envelope_chunks(M, Nrm, s, limit, brk_jump=None):
+    """İşaretli mesafelerden çizilecek iz parçalarını üretir.
+    limit'ten uzak (form olmamış) noktalar ve yön değişimleri izi böler.
+    Döndürür: [(iz_noktaları (k,2), kalıp_noktaları (k,2)), ...]"""
+    if len(M) == 0:
+        return []
+    ok = np.isfinite(s) & (np.abs(s) <= limit)
+    E = M + Nrm * np.where(ok, s, 0.0)[:, None]
+    side = np.sign(s)
+    if brk_jump is None:
+        brk_jump = max(2.0, 0.5 * limit)
+    chunks, cur = [], []
+    for i in range(len(M)):
+        if not ok[i]:
+            if len(cur) > 1:
+                chunks.append(cur)
+            cur = []
+            continue
+        if cur:
+            j = cur[-1]
+            jump = float(np.hypot(*(E[i] - E[j])))
+            if (side[i] != side[j] and side[i] != 0 and side[j] != 0) or jump > brk_jump:
+                if len(cur) > 1:
+                    chunks.append(cur)
+                cur = []
+        cur.append(i)
+    if len(cur) > 1:
+        chunks.append(cur)
+    return [(E[idx], M[idx]) for idx in chunks]
+
+
+def compute_envelopes(timelines, radii, mold_points, limits):
+    """Tüm kanallar için radüs izini hesaplar. limits[i] <= 0 ise takım yarıçapı kullanılır."""
+    M, Nrm, _ = mold_rays(mold_points)
+    out = []
+    for i in range(N_CH):
+        lim = limits[i] if limits[i] > 0 else radii[i]
+        C, _T = tool_samples(timelines[i], radii[i])
+        s = radius_envelope(M, Nrm, C, radii[i])
+        out.append({'chunks': envelope_chunks(M, Nrm, s, lim), 'limit': lim})
+    return out
+
+
+def _draw_envelope(ax, env, color, label):
+    first = True
+    for E, Mk in env['chunks']:
+        poly = np.vstack([E, Mk[::-1]])
+        ax.fill(poly[:, 0], poly[:, 1], color=color, alpha=0.13, linewidth=0, zorder=1)
+        ax.plot(E[:, 0], E[:, 1], color=color, linewidth=1.6, linestyle=(0, (5, 2)),
+                label=(label if first else ''), zorder=3)
+        first = False
+
+
+# -------------------------------------------------------------
 # 7b) Büyük karşılaştırma grafiği (G0 hariç)
 # -------------------------------------------------------------
-def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xname='X', yname='Y'):
+def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xname='X', yname='Y',
+                        envelopes=None):
     fig = Figure(figsize=(14, 10), dpi=100)
     ax = fig.add_subplot(111)
     fig.subplots_adjust(right=0.80)
@@ -835,6 +1009,8 @@ def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xna
                         lbl = f'Kanal {i+1} - Satır Grubu {c_idx % 2 + 1}'
                         drawn.add(key)
                     ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, linewidth=3.0, label=lbl)
+        if envelopes:
+            _draw_envelope(ax, envelopes[i], CHANNEL_ENV_COLORS[i], f'Kanal {i+1} - Radüs İzi (Form Yüzeyi)')
         sx, sy = start_points[i]
         ax.plot(sx, sy, 'o', color=CHANNEL_COLORS[0], markersize=8,
                 label=f'Kanal {i+1} Başlangıç ({sx:.1f}, {sy:.1f})')
@@ -929,7 +1105,7 @@ def _place_distance_labels(fig, ax, labels, polylines, fontsize=7, shift=0.0):
 
 
 def plot_channel_fig(i, channels_segments, start_points, radii, mold_points,
-                     xname='X', yname='Y', label_font=7.0, label_shift=0.0):
+                     xname='X', yname='Y', label_font=7.0, label_shift=0.0, envelope=None):
     closest = _mold_closest_fn(mold_points)
     xl, yl = _plot_limits(mold_points, start_points, radii, 3.0)
 
@@ -978,6 +1154,10 @@ def plot_channel_fig(i, channels_segments, start_points, radii, mold_points,
                 polylines.append([kp, cp])
                 labels.append((kp, f"{d:.2f}mm", (kp[0] - cp[0], kp[1] - cp[1])))
 
+    if envelope:
+        _draw_envelope(ax, envelope, CHANNEL_ENV_COLORS[i], 'Radüs İzi (Form Yüzeyi)')
+        for E, _Mk in envelope['chunks']:
+            polylines.append(E)
     sx, sy = start_points[i]
     ax.plot(sx, sy, 'o', color=CHANNEL_COLORS[0], markersize=10, label='Başlangıç Noktası')
     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), borderaxespad=0, fontsize=10, shadow=True)
@@ -1036,43 +1216,142 @@ def distance_table(channels_segments, mold_points):
 
 
 # -------------------------------------------------------------
-# AutoCAD çember / path kodları (Colab bölüm 9 ve 10)
+# DXF ÇIKTISI (AutoCAD R12 / AC1009 - ek kütüphane gerektirmez)
 # -------------------------------------------------------------
-def autocad_circles_text(timelines, total_time, radii, start_t, end_t, step_t):
-    if end_t <= start_t or step_t <= 0:
-        raise ValueError("Geçersiz zaman aralığı veya adım büyüklüğü (Bitiş > Başlangıç ve Adım > 0 olmalı).")
-    n = int(np.floor((end_t - start_t) / step_t + 1e-9)) + 1
-    if n > 100000:
-        raise ValueError(f"Çok fazla çember üretilecek ({n}). Zaman adımını büyüt.")
-    per_channel = [[] for _ in range(N_CH)]
-    for t in start_t + step_t * np.arange(n):
-        t_c = max(0.0, min(float(t), total_time))
-        for i in range(N_CH):
-            c = get_position(timelines[i], t_c, 'points')
-            per_channel[i].append(f"_CIRCLE {c[0]:.4f},{c[1]:.4f} {radii[i]:.4f}")
-    lines = []
-    for i in range(N_CH):
-        lines.append(f"; Kanal {i+1} Çember Kodları")
-        lines.extend(per_channel[i])
-        if i < N_CH - 1:
-            lines.append("")
-    return "\n".join(lines)
+DXF_LAYER_CHOICES = [
+    ('Kalıp konturu', 'mold'),
+    ('Kontur (temas yolu)', 'contour'),
+    ('Radüs izi (form yüzeyi)', 'envelope'),
+    ('Takım merkezi yolu', 'center'),
+    ('Zaman adımlı takım çemberleri', 'circles'),
+    ('G0 hareketleri (temas yolu)', 'g0'),
+]
+DXF_DEFAULT_LAYERS = ['mold', 'contour', 'envelope', 'circles']
+_DXF_ACI = {'contour': [5, 30, 4], 'envelope': [3, 6, 1], 'center': [8, 8, 8], 'circles': [8, 8, 8], 'g0': [9, 9, 9]}
+_DXF_NAME = {'contour': 'KONTUR', 'envelope': 'RADUS_IZI', 'center': 'TAKIM_MERKEZI', 'circles': 'CEMBER', 'g0': 'G0'}
 
 
-def autocad_paths_text(channels_segments):
-    lines = []
+class _DxfWriter:
+    def __init__(self):
+        self.layers = {}          # ad -> renk (ACI)
+        self.ent = []
+        self.ext = [np.inf, np.inf, -np.inf, -np.inf]
+
+    def _grow(self, x, y, r=0.0):
+        e = self.ext
+        e[0] = min(e[0], x - r); e[1] = min(e[1], y - r); e[2] = max(e[2], x + r); e[3] = max(e[3], y + r)
+
+    def layer(self, name, color):
+        self.layers.setdefault(name, int(color))
+
+    def polyline(self, layer, pts, closed=False):
+        P = [(float(p[0]), float(p[1])) for p in pts if np.isfinite(p[0]) and np.isfinite(p[1])]
+        if len(P) < 2:
+            return
+        out = ['0', 'POLYLINE', '8', layer, '66', '1', '70', '1' if closed else '0',
+               '10', '0.0', '20', '0.0', '30', '0.0']
+        for x, y in P:
+            out += ['0', 'VERTEX', '8', layer, '10', f'{x:.6f}', '20', f'{y:.6f}', '30', '0.0']
+            self._grow(x, y)
+        out += ['0', 'SEQEND', '8', layer]
+        self.ent.append(out)
+
+    def circle(self, layer, c, r):
+        x, y = float(c[0]), float(c[1])
+        if not (np.isfinite(x) and np.isfinite(y)) or r <= 0:
+            return
+        self.ent.append(['0', 'CIRCLE', '8', layer, '10', f'{x:.6f}', '20', f'{y:.6f}', '30', '0.0',
+                         '40', f'{float(r):.6f}'])
+        self._grow(x, y, r)
+
+    def text(self):
+        e = self.ext if np.isfinite(self.ext[0]) else [0, 0, 1, 1]
+        L = ['0', 'SECTION', '2', 'HEADER',
+             '9', '$ACADVER', '1', 'AC1009',
+             '9', '$INSUNITS', '70', '4',
+             '9', '$EXTMIN', '10', f'{e[0]:.6f}', '20', f'{e[1]:.6f}', '30', '0.0',
+             '9', '$EXTMAX', '10', f'{e[2]:.6f}', '20', f'{e[3]:.6f}', '30', '0.0',
+             '0', 'ENDSEC',
+             '0', 'SECTION', '2', 'TABLES',
+             '0', 'TABLE', '2', 'LTYPE', '70', '1',
+             '0', 'LTYPE', '2', 'CONTINUOUS', '70', '0', '3', 'Solid line', '72', '65', '73', '0', '40', '0.0',
+             '0', 'ENDTAB',
+             '0', 'TABLE', '2', 'LAYER', '70', str(len(self.layers) + 1),
+             '0', 'LAYER', '2', '0', '70', '0', '62', '7', '6', 'CONTINUOUS']
+        for name, col in self.layers.items():
+            L += ['0', 'LAYER', '2', name, '70', '0', '62', str(col), '6', 'CONTINUOUS']
+        L += ['0', 'ENDTAB', '0', 'ENDSEC', '0', 'SECTION', '2', 'ENTITIES']
+        for e_ in self.ent:
+            L += e_
+        L += ['0', 'ENDSEC', '0', 'EOF']
+        return "\n".join(L) + "\n"
+
+
+def _split_nan(pts):
+    """NaN ile işaretlenmiş kopuklukları ayrı parçalara böler."""
+    out, cur = [], []
+    for p in pts:
+        if not (np.isfinite(p[0]) and np.isfinite(p[1])):
+            if len(cur) > 1:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(p)
+    if len(cur) > 1:
+        out.append(cur)
+    return out
+
+
+def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, total_time,
+                   circ_start, circ_end, circ_step, envelopes=None):
+    """Seçilen katmanlarla DXF metnini üretir. Döndürür: (dxf_metni, özet_satırları)"""
+    layers = set(layers or [])
+    w = _DxfWriter()
+    summary = []
+    if 'mold' in layers and len(mold_points) > 1:
+        w.layer('KALIP', 7)
+        w.polyline('KALIP', mold_points)
+        summary.append('KALIP: kalıp konturu')
+    if 'circles' in layers:
+        if circ_end <= circ_start or circ_step <= 0:
+            raise ValueError("Çemberler için geçersiz zaman aralığı (Bitiş > Başlangıç ve Adım > 0 olmalı).")
+        n = int(np.floor((circ_end - circ_start) / circ_step + 1e-9)) + 1
+        if n > 20000:
+            raise ValueError(f"Çok fazla çember ({n}). Zaman adımını büyüt.")
     for i in range(N_CH):
-        cmds = []
-        for seg in channels_segments[i]:
-            if seg['type'] == 'move' and seg['orig_points']:
+        segs = channels_segments[i]
+        if 'contour' in layers or 'g0' in layers:
+            for seg in segs:
+                if seg['type'] != 'move' or not seg['orig_points']:
+                    continue
+                key = 'g0' if _is_g0(seg) else 'contour'
+                if key not in layers:
+                    continue
+                name = f"K{i+1}_{_DXF_NAME[key]}"
+                w.layer(name, _DXF_ACI[key][i])
                 for pts in _contact_chunks(seg):
-                    cmds.append("_PLINE " + " ".join(f"{q[0]:.4f},{q[1]:.4f}" for q in pts))
-        if cmds:
-            lines.append(f"; Kanal {i+1} İşlenmiş Kontur Kodları")
-            lines.extend(cmds)
-            if i < N_CH - 1:
-                lines.append("")
-    return "\n".join(lines)
+                    w.polyline(name, pts)
+        if 'center' in layers:
+            name = f"K{i+1}_{_DXF_NAME['center']}"
+            w.layer(name, _DXF_ACI['center'][i])
+            for pts in _split_nan(get_trail(timelines[i], total_time + 1.0, 'points')):
+                w.polyline(name, pts)
+        if 'envelope' in layers and envelopes:
+            name = f"K{i+1}_{_DXF_NAME['envelope']}"
+            w.layer(name, _DXF_ACI['envelope'][i])
+            for E, _Mk in envelopes[i]['chunks']:
+                w.polyline(name, E)
+        if 'circles' in layers:
+            name = f"K{i+1}_{_DXF_NAME['circles']}"
+            w.layer(name, _DXF_ACI['circles'][i])
+            for t in circ_start + circ_step * np.arange(n):
+                t_c = max(0.0, min(float(t), total_time))
+                w.circle(name, get_position(timelines[i], t_c, 'points'), radii[i])
+    for name in w.layers:
+        if name != 'KALIP':
+            cnt = sum(1 for e_ in w.ent if e_[3] == name)
+            summary.append(f"{name}: {cnt} nesne")
+    return w.text(), summary
 
 
 # ===== Hücre 16 =====
@@ -1232,7 +1511,8 @@ def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts):
             'settings': {'contact_mode': cfg['contact_mode'], 'g0_feed': cfg['g0_feed'], 'fps': fps, 'speed': speed},
             'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step},
             'plot': {'label_font': opts['label_font'], 'label_shift': opts['label_shift'],
-                     'xname': opts['xname'], 'yname': opts['yname']}}
+                     'xname': opts['xname'], 'yname': opts['yname'],
+                     'show_env': opts['show_env'], 'env_limit': opts['env_limit']}}
     for idx, ch in enumerate(cfg['channels']):
         data['channels'].append({'channel_id': idx + 1, 'x0': ch['x0'], 'y0': ch['y0'], 'tr': ch['tr'],
                                  'fd': ch['fd'], 'y_offset': ch['y_offset'], 'code': ch['code'],
@@ -1242,7 +1522,7 @@ def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts):
 
 def json_dict_to_updates(data, gr_update):
     """JSON sözlüğünü bileşen güncellemelerine çevirir. Sıra, arayüzdeki all_inputs ile aynıdır:
-    N_CFG cfg + fps + speed + 3 AutoCAD + 4 grafik seçeneği. JSON'da olmayan alanlar mevcut değerini korur."""
+    N_CFG cfg + fps + speed + 3 DXF çember zamanı + N_OPT grafik seçeneği. JSON'da olmayan alanlar mevcut değerini korur."""
     def pick(d, key):
         return gr_update(value=d[key]) if key in d else gr_update()
     ups = []
@@ -1263,7 +1543,7 @@ def json_dict_to_updates(data, gr_update):
     for key in ('start', 'end', 'step'):
         ups.append(pick(ac, key))
     pl = data.get('plot', {}) or {}
-    for key in ('label_font', 'label_shift', 'xname', 'yname'):
+    for key in ('label_font', 'label_shift', 'xname', 'yname', 'show_env', 'env_limit'):
         ups.append(pick(pl, key))
     return ups
 
@@ -1298,6 +1578,21 @@ input[type=range]{vertical-align:middle}
 #measb{width:100%;margin-bottom:6px}
 #mstat{font-size:12px;line-height:1.4}
 #tm{flex:1;min-width:140px}
+#cncrow{flex:0 0 auto;display:flex;gap:8px;padding:8px;background:#1b1f24;border-top:1px solid #ddd;overflow-x:auto}
+.cnc{flex:1 1 0;min-width:290px;background:#0d1117;color:#d8dee9;border-radius:6px;padding:6px 8px;font-family:Consolas,'Courier New',monospace;font-size:12px}
+.cnc .hdr{display:flex;justify-content:space-between;gap:8px;font-weight:bold;border-bottom:1px solid #2d333b;padding-bottom:3px;margin-bottom:4px}
+.cnc .hdr .st{color:#f2b600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cnc .body{display:flex;gap:10px}
+.cnc .prog{flex:1 1 auto;min-width:0}
+.cnc .ln{white-space:pre;overflow:hidden;text-overflow:ellipsis;padding:1px 3px;border-radius:2px;color:#8b949e;min-height:15px}
+.cnc .ln.cur{background:#f2b600;color:#000;font-weight:bold}
+.cnc .pos{flex:0 0 auto}
+.cnc table{border-collapse:collapse}
+.cnc th{font-size:10px;color:#8b949e;font-weight:normal;text-align:right;padding:0 5px}
+.cnc td{padding:1px 5px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.cnc td.k{text-align:left;color:#8b949e}
+.cnc td.big{font-size:15px;font-weight:bold;color:#e6edf3}
+@media (max-width:760px){#cncrow{flex-direction:column}.cnc{min-width:0}}
 @media (max-width:760px){#main{flex-direction:column}#side{width:auto;flex:0 0 auto;max-height:46%;border-left:0;border-top:1px solid #ddd}}
 </style></head><body>
 <div class="bar">
@@ -1306,6 +1601,7 @@ input[type=range]{vertical-align:middle}
  <b id="spdv" style="min-width:46px">1.0×</b>
  <span id="presets"></span>
  <label><input type="checkbox" id="loop" checked> Döngü</label>
+ <label><input type="checkbox" id="envc"> Radüs izi</label>
  <button id="fs">⛶ Tam Ekran</button>
 </div>
 <div class="bar"><input id="tm" type="range" min="0" max="10000" value="0"><b id="tv"></b></div>
@@ -1319,6 +1615,7 @@ input[type=range]{vertical-align:middle}
   <div id="mstat">Ölçüm yapılmadı. “Ölçümü Başlat” ile başlat, “Ölçümü Bitir” ile sabitle.</div>
  </div>
 </div>
+<div id="cncrow"></div>
 <script>
 (function(){
 var D=__DATA__;
@@ -1387,6 +1684,98 @@ function updatePanel(){
   else if(meas.has){ mstat.innerHTML='<span style="color:#1e8449;font-weight:bold">✔ Ölçüm tamamlandı (sabitlendi)</span><br>Aralık: '+fmtT(meas.tlo)+' – '+fmtT(meas.thi)+' s'+(meas.why?'<br><i>'+meas.why+'</i>':''); }
 }
 
+// ---- RADÜS İZİ (form yüzeyi): kalıp noktalarından normal yönünde ışın, takım dairesine ilk giriş ----
+var EV=D.env||null, envC=document.getElementById('envc'), NM=0, CP=256, Mx,My,Nx,Ny, envCk=[], envCache=[];
+if(EV){
+  envC.checked=!!EV.show; NM=EV.M.length/2;
+  Mx=new Float64Array(NM); My=new Float64Array(NM); Nx=new Float64Array(NM); Ny=new Float64Array(NM);
+  for(var q0=0;q0<NM;q0++){Mx[q0]=EV.M[2*q0];My[q0]=EV.M[2*q0+1];Nx[q0]=EV.N[2*q0];Ny[q0]=EV.N[2*q0+1];}
+} else { envC.checked=false; envC.parentNode.style.display='none'; }
+envC.onchange=function(){draw();};
+function applySamples(arr,ch,a,b){
+  var C=EV.S[ch].c, r2=D.r[ch]*D.r[ch], RR=(D.r[ch]+EV.lim[ch])*(D.r[ch]+EV.lim[ch]);
+  for(var k=a;k<b;k++){ var cx=C[2*k], cy=C[2*k+1];
+    for(var i=0;i<NM;i++){ var dx=Mx[i]-cx, dy=My[i]-cy, d2=dx*dx+dy*dy; if(d2>RR) continue;
+      var ct=d2-r2, s; if(ct<=0){s=0;} else { var bb=Nx[i]*dx+Ny[i]*dy, disc=bb*bb-ct; if(disc<0) continue;
+        var sq=Math.sqrt(disc); s=bb>0?(-bb+sq):(-bb-sq); }
+      if(Math.abs(s)<Math.abs(arr[i])) arr[i]=s; } }
+}
+if(EV){ for(var ch0=0;ch0<NC;ch0++){ var K=EV.S[ch0].t.length, arr0=new Float64Array(NM).fill(Infinity), cps=[arr0.slice()];
+  for(var k0=0;k0<K;k0+=CP){ applySamples(arr0,ch0,k0,Math.min(K,k0+CP)); cps.push(arr0.slice()); }
+  envCk.push(cps); envCache.push({j:-1,a:null}); } }
+function upperBound(A,x){var lo=0,hi=A.length; while(lo<hi){var m=(lo+hi)>>1; if(A[m]<=x) lo=m+1; else hi=m;} return lo;}
+function envAt(ch){ var j=upperBound(EV.S[ch].t,t+1e-9), c=Math.floor(j/CP), ca=envCache[ch];
+  if(ca.j===j) return ca.a; var a=envCk[ch][c].slice(); applySamples(a,ch,c*CP,j); ca.j=j; ca.a=a; return a; }
+function drawEnv(X,Y){
+  if(!EV||!envC.checked) return;
+  for(var ch=0;ch<NC;ch++){ var s=envAt(ch), L=EV.lim[ch], brk=Math.max(2,0.5*L), col=EV.col[ch], run=[];
+    var flush=function(){ if(run.length>1){
+        ctx.beginPath(); for(var q=0;q<run.length;q++){var i=run[q], ex=X(Mx[i]+Nx[i]*s[i]), ey=Y(My[i]+Ny[i]*s[i]); if(q) ctx.lineTo(ex,ey); else ctx.moveTo(ex,ey);}
+        for(var q2=run.length-1;q2>=0;q2--){ctx.lineTo(X(Mx[run[q2]]),Y(My[run[q2]]));}
+        ctx.closePath(); ctx.fillStyle=hex2rgba(col,0.16); ctx.fill();
+        ctx.beginPath(); for(var q3=0;q3<run.length;q3++){var i3=run[q3], ex3=X(Mx[i3]+Nx[i3]*s[i3]), ey3=Y(My[i3]+Ny[i3]*s[i3]); if(q3) ctx.lineTo(ex3,ey3); else ctx.moveTo(ex3,ey3);}
+        ctx.setLineDash([6,3]); ctx.strokeStyle=col; ctx.lineWidth=1.8; ctx.stroke(); ctx.setLineDash([]); }
+      run=[]; };
+    for(var i=0;i<NM;i++){ var v=s[i];
+      if(!(isFinite(v)&&Math.abs(v)<=L)){flush();continue;}
+      if(run.length){ var j=run[run.length-1], sj=s[j];
+        var side=(v!==0&&sj!==0&&((v>0)!==(sj>0)));
+        var jump=Math.hypot((Mx[i]+Nx[i]*v)-(Mx[j]+Nx[j]*sj),(My[i]+Ny[i]*v)-(My[j]+Ny[j]*sj));
+        if(side||jump>brk) flush(); }
+      run.push(i); }
+    flush(); }
+}
+
+// ---- CNC EKRANI: program satırları, eksen konumu, kalan mesafe ----
+var CN=D.cnc||null, cncRow=document.getElementById('cncrow'), cards=[];
+var MODE=['G0','G1','G2','G3','G4','WAIT','G1'];
+function el(tag,cls,txt){var e=document.createElement(tag); if(cls) e.className=cls; if(txt!==undefined) e.textContent=txt; return e;}
+if(!CN){ cncRow.style.display='none'; } else {
+  CN.forEach(function(c,i){
+    var card=el('div','cnc'), hdr=el('div','hdr'), body=el('div','body'), prog=el('div','prog'), pos=el('div','pos');
+    var ttl=el('span','', 'KANAL '+(i+1)); ttl.style.color=D.col[i]==='#0072B2'?'#58a6ff':'#ff9b6b';
+    var st=el('span','st',''); hdr.appendChild(ttl); hdr.appendChild(st);
+    var lines=[]; for(var q=0;q<6;q++){var d=el('div','ln',''); prog.appendChild(d); lines.push(d);}
+    var tb=el('table'), th=el('tr'); ['', 'Konum', 'Kalan'].forEach(function(h){th.appendChild(el('th','',h));}); tb.appendChild(th);
+    function row(lbl){var r=el('tr'); var k=el('td','k',lbl), a=el('td','big',''), b=el('td','',''); r.appendChild(k); r.appendChild(a); r.appendChild(b); tb.appendChild(r); return [a,b];}
+    var rx=row('X'+(c.fx===2?' Ø':'')), ry=row('Y'+(c.fy===2?' Ø':''));
+    var rl=el('tr'), lk=el('td','k','Yol'), lv=el('td','',''), lv2=el('td','','');
+    rl.appendChild(lk); rl.appendChild(lv); rl.appendChild(lv2); tb.appendChild(rl);
+    pos.appendChild(tb); body.appendChild(prog); body.appendChild(pos); card.appendChild(hdr); card.appendChild(body); cncRow.appendChild(card);
+    cards.push({st:st, lines:lines, rx:rx, ry:ry, lk:lk, lv:lv, lv2:lv2});
+  });
+}
+function f3(v){return (Math.abs(v)<5e-4?0:v).toFixed(3);}
+function blockAt(B,tt){var lo=0,hi=B.length-1,ans=-1; while(lo<=hi){var m=(lo+hi)>>1; if(B[m][0]<=tt+1e-9){ans=m;lo=m+1;} else hi=m-1;} return ans;}
+function updateCNC(){
+  if(!CN) return;
+  CN.forEach(function(c,i){
+    var cd=cards[i], B=c.B, k=blockAt(B,t), L=c.L;
+    var b=(k>=0)?B[k]:null, done=(!b)||(k===B.length-1&&t>b[1]+1e-6);
+    var cur=-1, px=0, py=0, rx=0, ry=0, rem=0, status='', remLbl='Yol', remTxt='';
+    if(!b){ status='—'; }
+    else {
+      cur=(b[2]===null)?-1:b[2];
+      var code=b[3], f=(b[1]>b[0])?Math.min(Math.max((t-b[0])/(b[1]-b[0]),0),1):1; if(done) f=1;
+      if(code===2||code===3){ var a=b[11]+(b[12]-b[11])*f; px=b[8]+b[10]*Math.cos(a); py=b[9]+b[10]*Math.sin(a); rem=Math.abs(b[12]-b[11])*b[10]*(1-f); }
+      else { px=b[4]+(b[6]-b[4])*f; py=b[5]+(b[7]-b[5])*f; rem=Math.hypot(b[6]-px,b[7]-py); }
+      rx=(b[6]-px)*c.fx; ry=(b[7]-py)*c.fy;
+      if(done){ status='PROGRAM SONU'; rem=0; rx=0; ry=0; }
+      else if(code===5){ status='WAIT – diğer kanallar bekleniyor'; remLbl='Bekleme'; remTxt=(b[1]-t).toFixed(2)+' s'; }
+      else if(code===4){ status='G4 bekleme'; remLbl='Bekleme'; remTxt=(b[1]-t).toFixed(2)+' s'; }
+      else { status=MODE[code]+(code===6?' (köşe geçişi)':'')+(b[13]>0?'   F'+(+b[13].toFixed(1)):''); }
+    }
+    cd.st.textContent=status;
+    var start=Math.max(0,Math.min(cur-2,L.length-6));
+    for(var q=0;q<6;q++){ var idx=start+q, d=cd.lines[q];
+      if(idx<L.length){ var n='N'+(idx+1); while(n.length<5) n+=' '; d.textContent=n+L[idx]; } else d.textContent='';
+      d.className=(idx===cur&&!done)?'ln cur':'ln'; }
+    cd.rx[0].textContent=f3(px*c.fx); cd.ry[0].textContent=f3((py-c.yo)*c.fy);
+    cd.rx[1].textContent=f3(rx); cd.ry[1].textContent=f3(ry);
+    cd.lk.textContent=remLbl; cd.lv.textContent=''; cd.lv2.textContent=remTxt||f3(rem);
+  });
+}
+
 function setSpeed(v){speed=v; spd.value=v; spdv.textContent=v.toFixed(1)+'×';
   var bs=pre.getElementsByTagName('button'); for(var i=0;i<bs.length;i++){bs[i].className=(Math.abs(parseFloat(bs[i].getAttribute('data-v'))-v)<1e-9)?'on':'';}}
 [0.5,1,2,5,10,20].forEach(function(v){var b=document.createElement('button'); b.textContent=v+'×'; b.setAttribute('data-v',v);
@@ -1409,6 +1798,7 @@ function draw(){
   ctx.stroke();
   ctx.strokeStyle='#000'; ctx.lineWidth=1.4; ctx.beginPath();
   D.mold.forEach(function(p,i){ if(i===0) ctx.moveTo(X(p[0]),Y(p[1])); else ctx.lineTo(X(p[0]),Y(p[1])); }); ctx.stroke();
+  drawEnv(X,Y);
   var q=kf(), k=q[0], f=q[1];
   D.ch.forEach(function(c,i){
     var col=D.col[i];
@@ -1443,8 +1833,9 @@ function draw(){
   function leg(col,txt,y){ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(lgx,y); ctx.lineTo(lgx+22,y); ctx.stroke(); ctx.fillStyle='#222'; ctx.fillText(txt,lgx+28,y+4);}
   leg('#000','Kalıp (sabit)',lgy+8);
   for(var qq=0;qq<D.col.length;qq++) leg(D.col[qq],'Kanal '+(qq+1)+' — kontur',lgy+28+qq*20);
+  if(EV&&envC.checked){ for(var qe=0;qe<NC;qe++){ ctx.setLineDash([6,3]); leg(EV.col[qe],'Kanal '+(qe+1)+' — radüs izi',lgy+28+(D.col.length+qe)*20); ctx.setLineDash([]); } }
 }
-function ui(){tm.value=Math.round(t/D.T*10000); tv.textContent=t.toFixed(2)+' / '+D.T.toFixed(2)+' s'; updatePanel();}
+function ui(){tm.value=Math.round(t/D.T*10000); tv.textContent=t.toFixed(2)+' / '+D.T.toFixed(2)+' s'; updatePanel(); updateCNC();}
 function setT(nt){t=nt; measStep(); draw(); ui();}
 function setPlaying(p){playing=p; playB.textContent=p?'⏸ Duraklat':'▶ Oynat'; if(p){ if(t>=D.T) setT(0); last=performance.now(); requestAnimationFrame(frame);} }
 function frame(now){ if(!playing) return; var dtt=(now-last)/1000; last=now; var nt=t+dtt*speed;
@@ -1470,8 +1861,82 @@ def _same_pt(a, b):
     return abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9
 
 
+_CODE_G = {'line': 1, 'fillet': 6}
+
+
+def build_block_table(segs, timeline, total_time):
+    """CNC ekranı için blok tablosu. Her satır:
+    [t0, t1, satır, kod, sx, sy, ex, ey, cx, cy, r, a0, a1, F]
+    kod: 0=G0 1=G1 2=G2 3=G3 4=G4 5=WAIT 6=köşe geçişi. Koordinatlar programlanan (kompanzasyonsuz)."""
+    r4 = lambda v: round(float(v), 4)
+    entries = list(timeline)
+    blocks, ei, t_prev, last = [], 0, 0.0, None
+    for seg in segs:
+        if seg['type'] == 'wait':
+            t0 = t_prev
+            t1 = max(entries[ei][0] if ei < len(entries) else total_time, t0)
+            p = last or (0.0, 0.0)
+            blocks.append([r4(t0), r4(t1), seg.get('line'), 5, r4(p[0]), r4(p[1]), r4(p[0]), r4(p[1]),
+                           0, 0, 0, 0, 0, 0])
+            t_prev = t1
+            continue
+        if ei >= len(entries):
+            break
+        t0, t1, s_ = entries[ei]
+        ei += 1
+        ps = s_.get('prog_start') or (last or (0.0, 0.0))
+        pe = s_.get('prog_end') or ps
+        arc = [0, 0, 0, 0, 0]
+        if s_['type'] == 'dwell':
+            code, F = 4, 0
+        else:
+            F = s_.get('feed', 0.0)
+            if _is_g0(s_):
+                code = 0
+            elif s_.get('kind') == 'arc':
+                code = 2 if s_.get('clockwise') else 3
+                if s_.get('prog_arc'):
+                    arc = [r4(v) for v in s_['prog_arc']]
+            else:
+                code = _CODE_G.get(s_.get('kind'), 1)
+        blocks.append([r4(t0), r4(t1), s_.get('line'), code, r4(ps[0]), r4(ps[1]), r4(pe[0]), r4(pe[1])]
+                      + arc + [round(float(F), 1)])
+        t_prev, last = t1, pe
+    return blocks
+
+
+def player_cnc_data(cfg, channels_segments, timelines, total_time):
+    out = []
+    for i in range(N_CH):
+        ch = cfg['channels'][i]
+        dia = ch.get('dia_mode') == 'diameter'
+        ax = ch.get('dia_axis', 'X')
+        out.append({'L': (ch['code'] or '').strip().split('\n'),
+                    'B': build_block_table(channels_segments[i], timelines[i], total_time),
+                    'fx': 2 if (dia and 'X' in ax) else 1, 'fy': 2 if (dia and 'Y' in ax) else 1,
+                    'yo': round(float(ch.get('y_offset', 0.0)), 4)})
+    return out
+
+
+def player_env_data(timelines, radii, mold_points, limits, show, max_samples=20000):
+    M, Nrm, _ = mold_rays(mold_points)
+    if len(M) == 0:
+        return None
+    r4 = lambda a: [round(float(v), 4) for v in np.asarray(a).ravel()]
+    S = []
+    for i in range(N_CH):
+        C, T = tool_samples(timelines[i], radii[i])
+        if len(C) > max_samples:                                    # çok uzun programlarda seyrelt
+            idx = np.linspace(0, len(C) - 1, max_samples).round().astype(int)
+            C, T = C[idx], T[idx]
+        S.append({'c': r4(C), 't': [round(float(v), 4) for v in T]})
+    return {'M': r4(M), 'N': [round(float(v), 6) for v in Nrm.ravel()], 'S': S,
+            'lim': [float(limits[i] if limits[i] > 0 else radii[i]) for i in range(N_CH)],
+            'col': CHANNEL_ENV_COLORS[:N_CH], 'show': bool(show)}
+
+
 def build_player_data(channels_segments, start_points, radii, mold_points, timelines, total_time,
-                      speed0=1.0, rate=30, xname='X', yname='Y'):
+                      speed0=1.0, rate=30, xname='X', yname='Y', env=None, cnc=None):
     xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points)
     n = int(min(max(np.ceil(total_time * rate), 2), 6000))
     dt = total_time / n
@@ -1499,10 +1964,11 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
         chans.append(c)
     return {'T': r3(total_time), 'n': n, 'dt': dt, 'b': [r3(xmin), r3(xmax), r3(ymin), r3(ymax)],
             'mold': [[r3(p[0]), r3(p[1])] for p in mold_points], 'r': [r3(r) for r in radii],
-            'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans}
+            'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans,
+            'env': env, 'cnc': cnc}
 
 
-def build_player_html(data, height=720):
+def build_player_html(data, height=960):
     doc = PLAYER_TEMPLATE.replace('__DATA__', json.dumps(data, separators=(',', ':')))
     return (f'<iframe srcdoc="{html.escape(doc, quote=True)}" sandbox="allow-scripts" allow="fullscreen" '
             f'style="width:100%;height:{height}px;border:1px solid #ddd;border-radius:8px;background:#fff"></iframe>')
@@ -1511,11 +1977,11 @@ def build_player_html(data, height=720):
 # ===== Hücre 18 =====
 import gradio as gr
 
-N_ANIM_OUT = 13   # run_all çıktı sayısı
+N_ANIM_OUT = 11   # run_all çıktı sayısı
 
 
 def _split_vals(vals):
-    """vals = N_CFG cfg + fps + speed + ac_start + ac_end + ac_step + 4 grafik seçeneği"""
+    """vals = N_CFG cfg + fps + speed + ac_start + ac_end + ac_step + N_OPT grafik seçeneği"""
     cfg = cfg_from_values(vals[:N_CFG])
     fps = int(_num(vals[N_CFG], 20))
     speed = _num(vals[N_CFG + 1], 1.0) or 1.0
@@ -1529,10 +1995,19 @@ def _plot_kw(opts):
                 label_font=opts['label_font'], label_shift=opts['label_shift'])
 
 
-def _static_plots(segs, starts, radii, mold_pts, opts):
-    comp = fig_to_svg_card(plot_comparison_fig(segs, starts, radii, mold_pts, opts['xname'], opts['yname']))
+def _envelopes(timelines, radii, mold_pts, opts, force=False):
+    """Radüs izi (form yüzeyi) - gösterim kapalıysa ve zorlanmadıysa hesaplanmaz."""
+    if (not opts['show_env'] and not force) or len(mold_pts) < 2:
+        return None
+    return compute_envelopes(timelines, radii, mold_pts, [opts['env_limit']] * N_CH)
+
+
+def _static_plots(segs, starts, radii, mold_pts, opts, envs=None):
+    comp = fig_to_svg_card(plot_comparison_fig(segs, starts, radii, mold_pts, opts['xname'], opts['yname'],
+                                               envelopes=envs))
     if len(mold_pts) > 1:
-        ind = [fig_to_svg_card(plot_channel_fig(i, segs, starts, radii, mold_pts, **_plot_kw(opts)))
+        ind = [fig_to_svg_card(plot_channel_fig(i, segs, starts, radii, mold_pts, **_plot_kw(opts),
+                                                envelope=(envs[i] if envs else None)))
                for i in range(N_CH)]
     else:
         ind = ["<p>Kalıp noktası yetersiz.</p>"] * N_CH
@@ -1540,7 +2015,7 @@ def _static_plots(segs, starts, radii, mold_pts, opts):
 
 
 # -------------------------------------------------------------
-# 1) Ana çalıştırma: animasyon + analizler + AutoCAD kodları
+# 1) Ana çalıştırma: animasyon + analizler + hızlı oynatıcı
 # -------------------------------------------------------------
 def run_all(*vals):
     try:
@@ -1554,43 +2029,42 @@ def run_all(*vals):
                                         opts['xname'], opts['yname'])
         frame0 = render_frame_image(token, 0)
 
-        comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts)
+        envs = _envelopes(timelines, radii, mold_pts, opts)
+        comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, envs)
         table = distance_table(segs, mold_pts)
 
-        end_used = ac_e if ac_e > ac_s else total_time
         try:
-            circ_txt = autocad_circles_text(timelines, total_time, radii, ac_s, end_used, ac_st)
-        except ValueError as ve:
-            circ_txt = f"Hata: {ve}"
-        path_txt = autocad_paths_text(segs)
-
-        try:
+            env_d = (player_env_data(timelines, radii, mold_pts, [opts['env_limit']] * N_CH, opts['show_env'])
+                     if len(mold_pts) > 1 else None)
+            cnc_d = player_cnc_data(cfg, segs, timelines, total_time)
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
-                                                              xname=opts['xname'], yname=opts['yname']))
+                                                              xname=opts['xname'], yname=opts['yname'],
+                                                              env=env_d, cnc=cnc_d))
         except Exception:
             player_html = "<p>Hızlı oynatıcı hazırlanamadı:</p><pre>" + html.escape(traceback.format_exc()) + "</pre>"
 
         status = (note + "\n" if note else "") + \
-                 (f"Simülasyon hazır. Toplam süre: {total_time:.2f} sn — animasyon kare sayısı: {n_frames} — "
-                  f"AutoCAD çember aralığı: {ac_s:g}–{end_used:.2f} sn")
+                 (f"Simülasyon hazır. Toplam süre: {total_time:.2f} sn — animasyon kare sayısı: {n_frames}")
         return (frame0,
                 gr.update(minimum=0, maximum=n_frames, value=0),
                 gr.update(value=playback_interval(fps, speed), active=False),
                 token,
                 comp_html, ind_html[0], ind_html[1], ind_html[2],
-                table, circ_txt, path_txt, player_html, status)
+                table, player_html, status)
     except Exception:
         err = "Simülasyon hazırlanırken hata oluştu:\n" + traceback.format_exc()
         return tuple([gr.update()] * (N_ANIM_OUT - 1) + [err])
 
 
 def redraw_plots(*vals):
-    """Yazı boyutu / kaydırma / eksen adı değişince yalnızca statik grafikleri yeniden çizer."""
+    """Yazı boyutu / kaydırma / eksen adı / radüs izi ayarı değişince yalnızca statik grafikleri yeniden çizer."""
     try:
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
-        comp, ind = _static_plots(segs, starts, radii, mold_pts, opts)
+        timelines, total_time = synchronize(segs)
+        envs = _envelopes(timelines, radii, mold_pts, opts)
+        comp, ind = _static_plots(segs, starts, radii, mold_pts, opts, envs)
         return comp, ind[0], ind[1], ind[2], "Grafikler güncellendi."
     except Exception:
         return (gr.update(),) * 4 + ("Grafikler yeniden çizilirken hata oluştu:\n" + traceback.format_exc(),)
@@ -1666,31 +2140,35 @@ def make_mp4(*vals):
 
 
 # -------------------------------------------------------------
-# 4) AutoCAD kodlarını tek başına yeniden üret
+# 4) DXF çıktısı (AutoCAD'de doğrudan açılır)
 # -------------------------------------------------------------
-def gen_circles_only(*vals):
+def make_dxf(*vals):
+    """vals = all_inputs + [seçili DXF katmanları]"""
     try:
-        cfg, fps, speed, ac_s, ac_e, ac_st, _opts = _split_vals(vals)
+        layers = vals[-1] or []
+        if not layers:
+            return None, "DXF için en az bir katman seç."
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-1])
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
             total_time = 1.0
+        envs = _envelopes(timelines, radii, mold_pts, opts, force=True) if 'envelope' in layers else None
         end_used = ac_e if ac_e > ac_s else total_time
-        txt = autocad_circles_text(timelines, total_time, radii, ac_s, end_used, ac_st)
-        return txt, (note + "\n" if note else "") + f"AutoCAD çember kodları oluşturuldu ({ac_s:g}–{end_used:.2f} sn, adım {ac_st:g} sn)."
+        txt, summary = build_dxf_text(layers, segs, radii, mold_pts, timelines, total_time,
+                                      ac_s, end_used, ac_st, envs)
+        out_dir = tempfile.mkdtemp(prefix='cnc_dxf_')
+        path = os.path.join(out_dir, 'cnc_simulasyon.dxf')
+        with open(path, 'w', encoding='ascii', newline='\r\n') as f:
+            f.write(txt)
+        msg = ((note + "\n") if note else "") + "DXF hazır: cnc_simulasyon.dxf (birim mm). Katmanlar: " + "; ".join(summary)
+        if 'circles' in layers:
+            msg += f"\nÇemberler: {ac_s:g}–{end_used:.2f} sn, adım {ac_st:g} sn."
+        return path, msg
     except ValueError as ve:
-        return gr.update(), f"Hata: {ve}"
+        return None, f"Hata: {ve}"
     except Exception:
-        return gr.update(), "AutoCAD kodları oluşturulurken hata oluştu:\n" + traceback.format_exc()
-
-
-def gen_paths_only(*vals):
-    try:
-        cfg = cfg_from_values(vals[:N_CFG])
-        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
-        return autocad_paths_text(segs), (note + "\n" if note else "") + "AutoCAD çizim yolları oluşturuldu."
-    except Exception:
-        return gr.update(), "AutoCAD çizim yolları oluşturulurken hata oluştu:\n" + traceback.format_exc()
+        return None, "DXF oluşturulurken hata oluştu:\n" + traceback.format_exc()
 
 
 # -------------------------------------------------------------
@@ -1750,7 +2228,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     gr.Markdown("# 3 Kanallı CNC Simülatörü\n"
                 "Desteklenen komutlar: **G0, G1, G2/G3** (I/J veya R), **G4**, **G40/G41/G42**, **WAIT**. "
                 "Girdileri soldan ayarla, **Çalıştır** butonuna bas; sağdaki sekmelerden animasyonu, grafikleri, "
-                "mesafe tablosunu, AutoCAD kodlarını ve MP4'ü kullan.")
+                "mesafe tablosunu, DXF çıktısını ve MP4'ü kullan.")
 
     with gr.Row():
         # ---------------- SOL: girdiler ----------------
@@ -1799,6 +2277,14 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                 gr.Markdown("Varsayılan X ve Y. Grafiklerde görünen adı değiştirir (G-kodundaki X/Y harfleri aynı kalır). "
                             "Enter'a basınca grafikler güncellenir; animasyon / oynatıcı / MP4'e bir sonraki çalıştırmada yansır.")
 
+            with gr.Accordion("Radüs izi (form yüzeyi)", open=True):
+                gr.Markdown("Takım dairesinin kalıba bakan zarfı: takım ilerlemese, sadece yanaşsa bile uç radüsünün "
+                            "bıraktığı iz. Kalıp ile bu iz arasındaki taralı bölge inceltilmiş malzemedir.")
+                with gr.Row():
+                    show_env = gr.Checkbox(value=DEFAULT_SHOW_ENV, label="Radüs izini göster")
+                    env_limit = gr.Number(value=DEFAULT_ENV_LIMIT, label="İz sınırı / ham malzeme kalınlığı (mm)",
+                                          info="Kalıba bundan uzak kalan yerlerde iz çizilmez. 0 = takım yarıçapı.")
+
             with gr.Row():
                 fps_sl = gr.Slider(5, 40, value=20, step=1, label="FPS")
                 speed_sl = gr.Slider(0.2, 5.0, value=1.0, step=0.2, label="Hız Çarpanı")
@@ -1807,7 +2293,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
 
             with gr.Accordion("Konfigürasyon Yönetimi (JSON)", open=True):
                 gr.Markdown("3 kanalın ve kalıbın tüm ayarlarını (başlangıç, yarıçap, F, Y offset, G-kodları, "
-                            "çizilen yol modu, FPS/hız, AutoCAD zaman ayarları) tek JSON dosyası olarak kaydet / yükle.")
+                            "çizilen yol modu, G0 hızı, FPS/hız, DXF çember zaman ayarları, grafik ve radüs izi ayarları) "
+                            "tek JSON dosyası olarak kaydet / yükle.")
                 json_btn = gr.Button("💾 Ayarları JSON Olarak Kaydet", variant="secondary")
                 json_file_out = gr.File(label="İndirilecek JSON", interactive=False)
                 json_upload = gr.File(label="JSON Ayar Dosyası Yükle", file_types=[".json"], file_count="single")
@@ -1841,7 +2328,10 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                 "oynatıcının içindeki kaydırıcı / hazır düğmelerle istediğin an değiştirebilir, "
                                 "zaman çubuğundan ileri-geri gidebilir, tam ekrana geçebilirsin. "
                                 "1× = gerçek zamanlı simülasyon süresi. Sağdaki panelde takım–kalıp mesafesi canlı görünür; "
-                                "**Ölçümü Başlat / Bitir** ile iki an arasındaki en küçük ve en büyük mesafe sabitlenir.")
+                                "**Ölçümü Başlat / Bitir** ile iki an arasındaki en küçük ve en büyük mesafe sabitlenir. "
+                                "Alttaki CNC ekranında her kanalın çalışan program satırı (vurgulu), eksen konumu ve "
+                                "bloğun bitmesine kalan mesafe görünür. Üst çubuktaki **Radüs izi** ile form yüzeyi "
+                                "anlık olarak açılıp kapatılır.")
                     player_out = gr.HTML()
 
                 with gr.Tab("🎥 MP4"):
@@ -1873,35 +2363,36 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                 "en kısa mesafesi (G0 hariç).")
                     table_out = gr.DataFrame()
 
-                with gr.Tab("💻 AutoCAD Çember"):
-                    gr.Markdown("Seçilen zaman aralığında her kanalın takım merkezine `_CIRCLE` komutu üretir. "
-                                "Bitiş zamanı 0 (veya Başlangıç'tan küçük) ise toplam süre kullanılır.")
+                with gr.Tab("📐 DXF Çıktısı"):
+                    gr.Markdown("Seçilen katmanları **DXF** dosyası olarak verir (AutoCAD R12 formatı, birim mm). "
+                                "Her kanal ve her çizim türü ayrı katmandadır (örn. `K1_KONTUR`, `K2_RADUS_IZI`, "
+                                "`K3_CEMBER`, `KALIP`); AutoCAD'de katmanları ayrı ayrı açıp kapatabilirsin.")
+                    dxf_layers = gr.CheckboxGroup(DXF_LAYER_CHOICES, value=DXF_DEFAULT_LAYERS, label="Katmanlar")
+                    gr.Markdown("**Zaman adımlı takım çemberleri:** seçilen aralıkta her adımda takım merkezine "
+                                "takım yarıçapında çember. Bitiş 0 (veya Başlangıç'tan küçük) ise toplam süre kullanılır.")
                     with gr.Row():
                         ac_start = gr.Number(value=0.0, label="Başlangıç Zamanı (s)")
                         ac_end = gr.Number(value=0.0, label="Bitiş Zamanı (s)  [0 = otomatik]")
                         ac_step = gr.Number(value=0.1, label="Zaman Adımı (s)")
-                    ac_circ_btn = gr.Button("AutoCAD Kodlarını Oluştur", variant="primary")
-                    ac_circ_txt = _textbox(label="Çember Kodları (Kanal Bazlı)", lines=14)
-
-                with gr.Tab("🔀 AutoCAD Path"):
-                    gr.Markdown("Her kanalın işlenmiş kontur (temas noktası) izini `_PLINE` komutlarıyla üretir.")
-                    ac_path_btn = gr.Button("AutoCAD Path Kodlarını Oluştur", variant="primary")
-                    ac_path_txt = _textbox(label="Çizgi Yolu Kodları (PLINE)", lines=14)
+                    dxf_btn = gr.Button("📐 DXF Oluştur", variant="primary")
+                    dxf_file = gr.File(label="DXF indir", interactive=False)
 
     # ---------------- OLAYLAR ----------------
-    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step, lbl_font, lbl_shift, x_name, y_name]
+    opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit]     # sıra: opts_from_values
+    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps
 
     run_btn.click(
         run_all, inputs=all_inputs,
         outputs=[anim_img, frame_sl, play_timer, anim_token, comp_html, ind1, ind2, ind3,
-                 table_out, ac_circ_txt, ac_path_txt, player_out, status])
+                 table_out, player_out, status])
 
-    # statik grafikleri yeniden çiz (yazı boyutu / kaydırma / eksen adı)
+    # statik grafikleri yeniden çiz (yazı boyutu / kaydırma / eksen adı / radüs izi)
     redraw_outputs = [comp_html, ind1, ind2, ind3, status]
     for _c in (lbl_font, lbl_shift):
         _c.release(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
-    for _c in (x_name, y_name):
+    for _c in (x_name, y_name, env_limit):
         _c.submit(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
+    show_env.input(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
     redraw_btn.click(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
 
     # oynatıcı
@@ -1915,12 +2406,11 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     speed_sl.release(anim_retune, inputs=[fps_sl, speed_sl, anim_token], outputs=[frame_sl, play_timer])
 
     # MP4
-    mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps, lbl_font, lbl_shift, x_name, y_name],
+    mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps] + opt_comps,
                   outputs=[video_out, mp4_file, status])
 
-    # AutoCAD
-    ac_circ_btn.click(gen_circles_only, inputs=all_inputs, outputs=[ac_circ_txt, status])
-    ac_path_btn.click(gen_paths_only, inputs=cfg_comps, outputs=[ac_path_txt, status])
+    # DXF
+    dxf_btn.click(make_dxf, inputs=all_inputs + [dxf_layers], outputs=[dxf_file, status])
 
     # JSON
     json_btn.click(export_json, inputs=all_inputs, outputs=[json_file_out, status])
