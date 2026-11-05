@@ -35,6 +35,8 @@ def parse_gcode(text):
             continue
         cmd = {'type': 'CMD', '_line': _ln}
         for letter, value in tokens:
+            if letter.upper() == 'G':      # bir satırda birden fazla G kodu olabilir
+                cmd.setdefault('Gs', []).append(float(value))
             cmd[letter.upper()] = float(value)
         commands.append(cmd)
     return commands
@@ -95,8 +97,8 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
             _app({'type': 'wait'})
             continue
 
-        if 'G' in cmd:
-            g = int(cmd['G'])
+        for _gv in cmd.get('Gs', [cmd['G']] if 'G' in cmd else []):
+            g = int(_gv)
             if g in (0, 1, 2, 3):
                 motion_mode = f'G{g}'
             elif g == 4:
@@ -228,6 +230,15 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
 
         x, y = target_x, target_y
 
+    # Başlangıç noktası: program G41/G42 ile başlıyorsa (ilk hareketten önce veya ilk hareket satırında)
+    # takım merkezi kompanze başlangıçta durur; yoksa girilen nokta takım merkezidir (G40 / G0 konumlama).
+    _first = next((s_ for s_ in segments if s_['type'] == 'move'), None)
+    if _first is not None and _first['comp_mode'] in ('G41', 'G42'):
+        for s_ in segments:
+            if s_ is _first:
+                break
+            if s_['type'] == 'dwell':
+                s_['point'] = tuple(_first['points'][0])
     return segments
 
 
@@ -657,7 +668,8 @@ DIA_AXIS_CHOICES = [('X ekseni', 'X'), ('Y ekseni', 'Y'), ('X ve Y', 'XY')]
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
 N_CFG = MOLD_START + 5 + 1 + 1      # 31: kalıp(5) + çizilen yol modu + G0 hızı
-N_OPT = 6                           # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı
+N_OPT = 10                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
+                                    # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar
 
 
 def _num(v, default=0.0):
@@ -703,7 +715,10 @@ def opts_from_values(v):
             'xname': (str(v[2]).strip() if v[2] is not None else '') or DEFAULT_XNAME,
             'yname': (str(v[3]).strip() if v[3] is not None else '') or DEFAULT_YNAME,
             'show_env': DEFAULT_SHOW_ENV if v[4] is None else bool(v[4]),
-            'env_limit': max(_num(v[5], DEFAULT_ENV_LIMIT), 0.0)}
+            'env_limit': max(_num(v[5], DEFAULT_ENV_LIMIT), 0.0),
+            'pf_use': True if v[6] is None else bool(v[6]),
+            'pf_dx': _num(v[7], 0.0), 'pf_dy': _num(v[8], 0.0),
+            'pf_layers': list(v[9]) if isinstance(v[9], (list, tuple)) else []}
 
 
 # -------------------------------------------------------------
@@ -839,7 +854,7 @@ def _mold_closest_fn(mold_points):
 def mold_rays(mold_points, max_pts=3000, fan_deg=8.0):
     """Kalıp konturunu sıklaştırır ve her noktaya birim normal verir.
     Köşelerde normali yelpaze gibi döndüren ek ışınlar ekler (köşe çevresinde iz kopmasın).
-    Döndürür: (M (N,2), Nrm (N,2), brk (N,) bool: bu noktadan önce iz kopsun mu)"""
+    Döndürür: (M (N,2), Nrm (N,2), fan (N,) bool: köşe yelpazesi ışını mı)"""
     P = np.asarray(mold_points, float)
     if len(P) < 2:
         return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0, bool)
@@ -860,7 +875,7 @@ def mold_rays(mold_points, max_pts=3000, fan_deg=8.0):
             nf = int(abs(np.degrees(da)) // fan_deg)
             for f in range(1, nf + 1):
                 a = a0 + da * f / (nf + 1)
-                M.append(P[k]); N.append((np.cos(a), np.sin(a))); B.append(False)
+                M.append(P[k]); N.append((np.cos(a), np.sin(a))); B.append(True)
         n = max(int(np.ceil(seg_len[k] / step)), 1)
         for j in range(n):
             M.append(P[k] + dirs[k] * seg_len[k] * j / n); N.append(nrm[k]); B.append(False)
@@ -924,13 +939,14 @@ def radius_envelope(M, Nrm, C, tool_r, chunk=384):
     return best
 
 
-def envelope_chunks(M, Nrm, s, limit, brk_jump=None):
+def envelope_chunks(M, Nrm, s, limit, brk_jump=None, ok=None):
     """İşaretli mesafelerden çizilecek iz parçalarını üretir.
     limit'ten uzak (form olmamış) noktalar ve yön değişimleri izi böler.
     Döndürür: [(iz_noktaları (k,2), kalıp_noktaları (k,2)), ...]"""
     if len(M) == 0:
         return []
-    ok = np.isfinite(s) & (np.abs(s) <= limit)
+    if ok is None:
+        ok = np.isfinite(s) & (np.abs(s) <= limit)
     E = M + Nrm * np.where(ok, s, 0.0)[:, None]
     side = np.sign(s)
     if brk_jump is None:
@@ -981,7 +997,7 @@ def _draw_envelope(ax, env, color, label):
 # 7b) Büyük karşılaştırma grafiği (G0 hariç)
 # -------------------------------------------------------------
 def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xname='X', yname='Y',
-                        envelopes=None):
+                        envelopes=None, form=None):
     fig = Figure(figsize=(14, 10), dpi=100)
     ax = fig.add_subplot(111)
     fig.subplots_adjust(right=0.80)
@@ -995,6 +1011,10 @@ def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xna
     if len(mold_points) > 1:
         ax.plot([p[0] for p in mold_points], [p[1] for p in mold_points],
                 color='black', linewidth=1.2, linestyle='-', label='Kalıp Konturu (Sabit)')
+    if form and form.get('pf_chains'):
+        draw_preform_outline(ax, form['pf_chains'])
+    if form and form.get('final'):
+        draw_final_form(ax, form['final'])
 
     for i in range(N_CH):
         drawn = set()
@@ -1105,7 +1125,7 @@ def _place_distance_labels(fig, ax, labels, polylines, fontsize=7, shift=0.0):
 
 
 def plot_channel_fig(i, channels_segments, start_points, radii, mold_points,
-                     xname='X', yname='Y', label_font=7.0, label_shift=0.0, envelope=None):
+                     xname='X', yname='Y', label_font=7.0, label_shift=0.0, envelope=None, pf_chains=None):
     closest = _mold_closest_fn(mold_points)
     xl, yl = _plot_limits(mold_points, start_points, radii, 3.0)
 
@@ -1154,6 +1174,10 @@ def plot_channel_fig(i, channels_segments, start_points, radii, mold_points,
                 polylines.append([kp, cp])
                 labels.append((kp, f"{d:.2f}mm", (kp[0] - cp[0], kp[1] - cp[1])))
 
+    if pf_chains:
+        draw_preform_outline(ax, pf_chains)
+        for A, _cl in pf_chains:
+            polylines.append(A)
     if envelope:
         _draw_envelope(ax, envelope, CHANNEL_ENV_COLORS[i], 'Radüs İzi (Form Yüzeyi)')
         for E, _Mk in envelope['chunks']:
@@ -1225,8 +1249,10 @@ DXF_LAYER_CHOICES = [
     ('Takım merkezi yolu', 'center'),
     ('Zaman adımlı takım çemberleri', 'circles'),
     ('G0 hareketleri (temas yolu)', 'g0'),
+    ('Ön form (DXF)', 'preform'),
+    ('Son form yüzeyi (ön form ile)', 'final'),
 ]
-DXF_DEFAULT_LAYERS = ['mold', 'contour', 'envelope', 'circles']
+DXF_DEFAULT_LAYERS = ['mold', 'contour', 'envelope', 'circles', 'preform', 'final']
 _DXF_ACI = {'contour': [5, 30, 4], 'envelope': [3, 6, 1], 'center': [8, 8, 8], 'circles': [8, 8, 8], 'g0': [9, 9, 9]}
 _DXF_NAME = {'contour': 'KONTUR', 'envelope': 'RADUS_IZI', 'center': 'TAKIM_MERKEZI', 'circles': 'CEMBER', 'g0': 'G0'}
 
@@ -1339,7 +1365,7 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
         if 'envelope' in layers and envelopes:
             name = f"K{i+1}_{_DXF_NAME['envelope']}"
             w.layer(name, _DXF_ACI['envelope'][i])
-            for E, _Mk in envelopes[i]['chunks']:
+            for E, _Mk in envelopes['ch'][i]['chunks']:
                 w.polyline(name, E)
         if 'circles' in layers:
             name = f"K{i+1}_{_DXF_NAME['circles']}"
@@ -1347,6 +1373,16 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
             for t in circ_start + circ_step * np.arange(n):
                 t_c = max(0.0, min(float(t), total_time))
                 w.circle(name, get_position(timelines[i], t_c, 'points'), radii[i])
+    if envelopes and envelopes.get('pf_chains') and 'preform' in layers:
+        w.layer('ON_FORM', 8)
+        for A, cl in envelopes['pf_chains']:
+            w.polyline('ON_FORM', A)
+    if envelopes and envelopes.get('final') and 'final' in layers:
+        w.layer('SON_FORM', 5)
+        for P, _Mk in envelopes['final']['chunks']:
+            w.polyline('SON_FORM', P)
+    if ('preform' in layers or 'final' in layers) and not (envelopes and envelopes.get('pf_chains')):
+        summary.append('ON_FORM/SON_FORM: ön form yüklenmediği için atlandı')
     for name in w.layers:
         if name != 'KALIP':
             cnt = sum(1 for e_ in w.ent if e_[3] == name)
@@ -1355,6 +1391,521 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
 
 
 # ===== Hücre 16 =====
+# -------------------------------------------------------------
+# ÖN FORM (DXF): lokal malzeme kalınlığı
+#  - DXF'teki ön form çizgileri okunur (LINE, LWPOLYLINE, POLYLINE, ARC, CIRCLE, ELLIPSE, SPLINE)
+#  - Kalıbın her noktasından normal yönünde ışın atılır; ışının ön formun dış yüzeyini kestiği
+#    mesafe o noktadaki malzeme kalınlığıdır (kalıptan dış yüzeye).
+#  - Takım bu kalınlıktan daha derine girdiği yerde form oluşur; 3 kanal aynı parçayı işlediği için
+#    son yüzey, kanalların en derin girdiği yerdir: SON = min(ÖN FORM, K1, K2, K3)
+# -------------------------------------------------------------
+import collections
+
+PF_GAP_TOL = 3.0          # ön formun iç yüzeyi ile kalıp arasında kabul edilen en büyük boşluk (mm)
+
+
+def _dxf_pairs(text):
+    lines = text.splitlines()
+    out = []
+    for i in range(0, len(lines) - 1, 2):
+        try:
+            out.append((int(lines[i].strip()), lines[i + 1].strip()))
+        except ValueError:
+            continue
+    return out
+
+
+def _arc_pts(cx, cy, r, a0, a1, tol=0.02):
+    """a0'dan a1'e (radyan, işaretli tarama) yay noktaları."""
+    if r <= 0:
+        return []
+    sweep = a1 - a0
+    da = 2 * np.arccos(max(min(1 - tol / r, 1.0), -1.0)) if r > tol else 0.5
+    da = min(max(da, 0.005), 0.2)
+    n = max(int(np.ceil(abs(sweep) / da)), 2)
+    a = a0 + sweep * np.arange(n + 1) / n
+    return list(zip(cx + r * np.cos(a), cy + r * np.sin(a)))
+
+
+def _bulge_pts(p1, p2, b, tol=0.02):
+    if abs(b) < 1e-9:
+        return [p1, p2]
+    x1, y1 = p1; x2, y2 = p2
+    dx, dy = x2 - x1, y2 - y1
+    L = float(np.hypot(dx, dy))
+    if L < 1e-12:
+        return [p1]
+    theta = 4 * np.arctan(b)                      # + : saat yönü tersi
+    r = L / (2 * abs(np.sin(theta / 2)))
+    h = L * (1 - b * b) / (4 * b)                 # kiriş ortasından merkeze (sol dik yönde)
+    cx = (x1 + x2) / 2 - dy / L * h
+    cy = (y1 + y2) / 2 + dx / L * h
+    a0 = np.arctan2(y1 - cy, x1 - cx)
+    pts = _arc_pts(cx, cy, r, a0, a0 + theta, tol)
+    if pts:
+        pts[0], pts[-1] = (x1, y1), (x2, y2)
+    return pts
+
+
+def _nurbs_pts(deg, knots, ctrl, weights, closed, n_per_span=24):
+    """De Boor ile (rasyonel) B-spline örnekleme."""
+    P = np.asarray(ctrl, float)
+    n = len(P)
+    if n < 2:
+        return [tuple(p) for p in P]
+    W = np.asarray(weights, float) if (weights is not None and len(weights) == n) else np.ones(n)
+    U = np.asarray(knots, float)
+    p = int(deg)
+    if len(U) != n + p + 1:                        # düğüm vektörü eksikse kıskaç (clamped) düzgün vektör
+        inner = max(n - p - 1, 0)
+        U = np.r_[np.zeros(p + 1), np.arange(1, inner + 1) / (inner + 1), np.ones(p + 1)]
+    Pw = np.c_[P * W[:, None], W]
+    u0, u1 = U[p], U[n]
+    spans = max(len(np.unique(U[p:n + 1])) - 1, 1)
+    us = np.linspace(u0, u1, spans * n_per_span + 1)
+    out = []
+    for u in us:
+        k = int(np.searchsorted(U, u, side='right') - 1)
+        k = min(max(k, p), n - 1)
+        d = [Pw[j + k - p].copy() for j in range(p + 1)]
+        for r in range(1, p + 1):
+            for j in range(p, r - 1, -1):
+                den = U[j + 1 + k - r] - U[j + k - p]
+                a = 0.0 if den == 0 else (u - U[j + k - p]) / den
+                d[j] = (1 - a) * d[j - 1] + a * d[j]
+        out.append((d[p][0] / d[p][2], d[p][1] / d[p][2]))
+    return out
+
+
+def read_dxf_polylines(text):
+    """ASCII DXF metnini okur. Döndürür: {'layers': {katman: [[[x,y],...], ...]}, 'units', 'skipped', 'counts'}"""
+    pairs = _dxf_pairs(text)
+    layers = collections.defaultdict(list)
+    skipped = collections.Counter()
+    counts = collections.Counter()
+    units = None
+    section = None
+    i, n = 0, len(pairs)
+    for k in range(n - 1):                         # birim
+        if pairs[k] == (9, '$INSUNITS') and pairs[k + 1][0] == 70:
+            try:
+                units = int(pairs[k + 1][1])
+            except ValueError:
+                pass
+            break
+
+    def grab(j):
+        """j'den sonraki ilk 0 koduna kadar olan grubu döndürür."""
+        g = []
+        j += 1
+        while j < n and pairs[j][0] != 0:
+            g.append(pairs[j]); j += 1
+        return g, j
+
+    def f(g, code, default=0.0):
+        for c, v in g:
+            if c == code:
+                try:
+                    return float(v)
+                except ValueError:
+                    return default
+        return default
+
+    def lay(g):
+        for c, v in g:
+            if c == 8:
+                return v or '0'
+        return '0'
+
+    def ocs(g, pts):                               # 2D OCS: extrusion -Z ise X aynalanır
+        return [(-x, y) for x, y in pts] if f(g, 230, 1.0) < 0 else pts
+
+    while i < n:
+        c, v = pairs[i]
+        if c == 0 and v == 'SECTION' and i + 1 < n:
+            section = pairs[i + 1][1]
+            i += 2
+            continue
+        if c == 0 and v == 'ENDSEC':
+            section = None
+            i += 1
+            continue
+        if section != 'ENTITIES' or c != 0:
+            i += 1
+            continue
+        etype = v
+        g, j = grab(i)
+        L = lay(g)
+        pts = None
+        if etype == 'LINE':
+            pts = [(f(g, 10), f(g, 20)), (f(g, 11), f(g, 21))]
+        elif etype == 'LWPOLYLINE':
+            verts, bul = [], []
+            for cc, vv in g:
+                if cc == 10:
+                    verts.append([float(vv), 0.0]); bul.append(0.0)
+                elif cc == 20 and verts:
+                    verts[-1][1] = float(vv)
+                elif cc == 42 and verts:
+                    bul[-1] = float(vv)
+            closed = int(f(g, 70)) & 1
+            if closed and len(verts) > 1:
+                verts.append(list(verts[0])); bul.append(0.0)
+            pts = []
+            for a in range(len(verts) - 1):
+                seg = _bulge_pts(tuple(verts[a]), tuple(verts[a + 1]), bul[a])
+                pts.extend(seg if not pts else seg[1:])
+            pts = ocs(g, pts)
+        elif etype == 'POLYLINE':
+            flags = int(f(g, 70))
+            verts, bul = [], []
+            while j < n and pairs[j] == (0, 'VERTEX'):
+                vg, j = grab(j)
+                if int(f(vg, 70)) & 16:            # spline çerçeve noktası, atla
+                    continue
+                verts.append((f(vg, 10), f(vg, 20))); bul.append(f(vg, 42))
+            if j < n and pairs[j] == (0, 'SEQEND'):
+                _sg, j = grab(j)
+            if flags & (16 | 64):                  # 3B ağ / yüzey
+                skipped['POLYLINE(3B)'] += 1
+                i = j
+                continue
+            if (flags & 1) and len(verts) > 1:
+                verts.append(verts[0]); bul.append(0.0)
+            pts = []
+            for a in range(len(verts) - 1):
+                seg = _bulge_pts(verts[a], verts[a + 1], bul[a])
+                pts.extend(seg if not pts else seg[1:])
+            pts = ocs(g, pts)
+        elif etype in ('ARC', 'CIRCLE'):
+            cx, cy, r = f(g, 10), f(g, 20), f(g, 40)
+            if etype == 'CIRCLE':
+                a0, a1 = 0.0, 2 * np.pi
+            else:
+                a0, a1 = np.radians(f(g, 50)), np.radians(f(g, 51))
+                while a1 <= a0:
+                    a1 += 2 * np.pi
+            pts = ocs(g, _arc_pts(cx, cy, r, a0, a1))
+        elif etype == 'ELLIPSE':
+            cx, cy, mx, my = f(g, 10), f(g, 20), f(g, 11), f(g, 21)
+            ratio, t0, t1 = f(g, 40, 1.0), f(g, 41, 0.0), f(g, 42, 2 * np.pi)
+            while t1 <= t0:
+                t1 += 2 * np.pi
+            t = np.linspace(t0, t1, max(int((t1 - t0) / 0.02), 8) + 1)
+            ux, uy = mx, my
+            vx, vy = -my * ratio, mx * ratio
+            pts = list(zip(cx + ux * np.cos(t) + vx * np.sin(t), cy + uy * np.cos(t) + vy * np.sin(t)))
+            if f(g, 230, 1.0) < 0:
+                pts = [(2 * cx - x, y) for x, y in pts]
+        elif etype == 'SPLINE':
+            deg = int(f(g, 71, 3))
+            knots = [float(vv) for cc, vv in g if cc == 40]
+            wts = [float(vv) for cc, vv in g if cc == 41]
+            ctrl, fit = [], []
+            for cc, vv in g:
+                if cc == 10:
+                    ctrl.append([float(vv), 0.0])
+                elif cc == 20 and ctrl:
+                    ctrl[-1][1] = float(vv)
+                elif cc == 11:
+                    fit.append([float(vv), 0.0])
+                elif cc == 21 and fit:
+                    fit[-1][1] = float(vv)
+            if len(ctrl) >= 2:
+                pts = _nurbs_pts(deg, knots, ctrl, wts if wts else None, int(f(g, 70)) & 1)
+            elif len(fit) >= 2:
+                pts = [tuple(p) for p in fit]
+        if pts is not None and len(pts) >= 2:
+            layers[L].append([[round(float(x), 6), round(float(y), 6)] for x, y in pts])
+            counts[etype] += 1
+        elif pts is None:
+            skipped[etype] += 1
+        i = j
+    return {'layers': dict(layers), 'units': units, 'skipped': dict(skipped), 'counts': dict(counts)}
+
+
+def load_preform_file(path):
+    """Yüklenen DXF dosyasını okur, mm'ye çevirir. Döndürür: (state, mesaj)"""
+    raw = open(path, 'rb').read()
+    if raw[:22] == b'AutoCAD Binary DXF\r\n\x1a\x00':
+        raise ValueError("Binary DXF desteklenmiyor. AutoCAD'de DXF'i ASCII olarak kaydet (SAVEAS > DXF).")
+    text = None
+    for enc in ('utf-8', 'cp1254', 'latin-1'):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    res = read_dxf_polylines(text)
+    if not res['layers']:
+        extra = (" Okunmayan nesneler: " + ", ".join(f"{k}×{v}" for k, v in res['skipped'].items())) if res['skipped'] else ""
+        raise ValueError("DXF'te okunabilir çizgi bulunamadı (LINE/POLYLINE/ARC/SPLINE...)." + extra)
+    scale, unit_note = 1.0, "mm kabul edildi"
+    if res['units'] == 1:
+        scale, unit_note = 25.4, "inç → mm çevrildi"
+    elif res['units'] == 5:
+        scale, unit_note = 10.0, "cm → mm çevrildi"
+    elif res['units'] == 6:
+        scale, unit_note = 1000.0, "m → mm çevrildi"
+    elif res['units'] == 4:
+        unit_note = "mm"
+    if scale != 1.0:
+        res['layers'] = {k: [[[x * scale, y * scale] for x, y in pl] for pl in v] for k, v in res['layers'].items()}
+    state = {'name': os.path.basename(path), 'layers': res['layers']}
+    msg = (f"Ön form yüklendi: {state['name']} — birim: {unit_note}. Nesneler: "
+           + ", ".join(f"{k}×{v}" for k, v in res['counts'].items())
+           + ". Katmanlar: " + ", ".join(f"{k} ({len(v)})" for k, v in res['layers'].items()))
+    if res['skipped']:
+        msg += ("\nOkunmayan nesneler: " + ", ".join(f"{k}×{v}" for k, v in res['skipped'].items())
+                + (" — blok (INSERT) içindeki çizgiler için AutoCAD'de EXPLODE uygula." if 'INSERT' in res['skipped'] else ""))
+    return state, msg
+
+
+def preform_layer_choices(state):
+    if not state or not state.get('layers'):
+        return []
+    return [(f"{k} ({len(v)} çizgi)", k) for k, v in state['layers'].items()]
+
+
+def preform_chains(state, selected, dx=0.0, dy=0.0, tol=0.01):
+    """Seçili katmanlardaki çizgileri uç uca birleştirir.
+    Döndürür: [(noktalar (k,2), kapalı_mı), ...]"""
+    if not state or not state.get('layers'):
+        return []
+    sel = set(selected) if selected else set(state['layers'])
+    pls = [np.asarray(pl, float) + (dx, dy) for k, v in state['layers'].items() if k in sel for pl in v]
+    pls = [p for p in pls if len(p) >= 2]
+    used = [False] * len(pls)
+    chains = []
+    for s0 in range(len(pls)):
+        if used[s0]:
+            continue
+        used[s0] = True
+        ch = [p for p in pls[s0]]
+        grown = True
+        while grown:
+            grown = False
+            if np.hypot(*(np.asarray(ch[0]) - ch[-1])) < tol and len(ch) > 2:
+                break
+            for k in range(len(pls)):
+                if used[k]:
+                    continue
+                p = pls[k]
+                if np.hypot(*(p[0] - ch[-1])) < tol:
+                    ch.extend(p[1:]); used[k] = grown = True
+                elif np.hypot(*(p[-1] - ch[-1])) < tol:
+                    ch.extend(p[::-1][1:]); used[k] = grown = True
+                elif np.hypot(*(p[-1] - ch[0])) < tol:
+                    ch[:0] = list(p[:-1]); used[k] = grown = True
+                elif np.hypot(*(p[0] - ch[0])) < tol:
+                    ch[:0] = list(p[::-1][:-1]); used[k] = grown = True
+                if grown:
+                    break
+        A = np.asarray(ch, float)
+        closed = len(A) > 3 and np.hypot(*(A[0] - A[-1])) < tol
+        if closed:
+            A[-1] = A[0]
+        chains.append((A, bool(closed)))
+    return chains
+
+
+def preform_thickness(M, Nrm, chains, gap_tol=PF_GAP_TOL, chunk=192):
+    """Her kalıp ışını için ön formun dış yüzeyine olan mesafe (normal + ve - yönü).
+    Kapalı konturlar: parite ile 'malzeme içi' aralığı; açık çizgiler: ilk kesişim.
+    Döndürür: (Tp, Tm) - yoksa nan."""
+    Nm = len(M)
+    Tp = np.full(Nm, np.nan)
+    Tm = np.full(Nm, np.nan)
+    if Nm == 0 or not chains:
+        return Tp, Tm
+    closed = [c for c, cl in chains if cl]
+    use = closed if closed else [c for c, cl in chains]
+    A = np.vstack([c[:-1] for c in use])
+    E = np.vstack([c[1:] - c[:-1] for c in use])
+    eps = 1e-6
+    for a in range(0, Nm, chunk):
+        Mc, Nc = M[a:a + chunk], Nrm[a:a + chunk]
+        den = Nc[:, None, 0] * E[None, :, 1] - Nc[:, None, 1] * E[None, :, 0]
+        wx = A[None, :, 0] - Mc[:, None, 0]
+        wy = A[None, :, 1] - Mc[:, None, 1]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            d = (wx * E[None, :, 1] - wy * E[None, :, 0]) / den
+            u = (wx * Nc[:, None, 1] - wy * Nc[:, None, 0]) / den
+        ok = (np.abs(den) > 1e-12) & (u >= 0) & (u < 1)
+        d = np.where(ok, d, np.nan)
+        for sgn, T in ((1, Tp), (-1, Tm)):
+            dd = np.sort(np.where(sgn * d > eps, sgn * d, np.inf), axis=1)
+            cnt = np.isfinite(dd).sum(axis=1)
+            d1 = dd[:, 0]
+            d2 = dd[:, 1] if dd.shape[1] > 1 else np.full(len(dd), np.inf)
+            if closed:
+                inside = (cnt % 2) == 1
+                res = np.where(inside, d1, np.where((cnt >= 2) & (d1 <= gap_tol), d2, np.nan))
+            else:
+                res = np.where(cnt >= 1, d1, np.nan)
+            T[a:a + chunk] = np.where(np.isfinite(res), res, np.nan)
+    if not closed:                                  # açık çizgi: uzak, alakasız kesişimleri at
+        for T in (Tp, Tm):
+            fin = np.isfinite(T)
+            if fin.any():
+                med = float(np.median(T[fin]))
+                T[fin & (T > 3 * med + 5)] = np.nan
+    return Tp, Tm
+
+
+def _chunks_from_mask(ok, pts, brk):
+    """ok maskesi doğru olan ardışık ışınları, sıçramada (brk) bölerek indeks listelerine ayırır."""
+    out, cur = [], []
+    for i in range(len(ok)):
+        if not ok[i]:
+            if len(cur) > 1:
+                out.append(cur)
+            cur = []
+            continue
+        if cur and np.hypot(*(pts[i] - pts[cur[-1]])) > brk:
+            if len(cur) > 1:
+                out.append(cur)
+            cur = []
+        cur.append(i)
+    if len(cur) > 1:
+        out.append(cur)
+    return out
+
+
+def compute_form(timelines, radii, mold_points, limit, preform=None):
+    """Radüs izi + (varsa) ön forma göre son form.
+    preform: {'chains': [...]} (preform_chains çıktısı) veya None.
+    Döndürür: {'ch': [kanal izleri], 'final': {...} veya None, 'pf_chains': [...]}"""
+    M, Nrm, fan = mold_rays(mold_points)
+    S = []
+    for i in range(N_CH):
+        C, _T = tool_samples(timelines[i], radii[i])
+        S.append(radius_envelope(M, Nrm, C, radii[i]))
+    chains = (preform or {}).get('chains') or []
+    if not chains or len(M) == 0:
+        ch = []
+        for i in range(N_CH):
+            lim = limit if limit > 0 else radii[i]
+            ch.append({'chunks': envelope_chunks(M, Nrm, S[i], lim), 'limit': lim})
+        return {'ch': ch, 'final': None, 'pf_chains': []}
+
+    Tp, Tm = preform_thickness(M, Nrm, chains)
+    hp, hm = np.isfinite(Tp), np.isfinite(Tm)
+    Sa = np.vstack([np.where(np.isfinite(s), np.abs(s), np.inf) for s in S])
+    kbest = np.argmin(Sa, axis=0)
+    sbest = np.array([S[kbest[j]][j] for j in range(len(M))])
+    tool_neg = np.isfinite(sbest) & (sbest < 0)
+    side = np.where(hp & ~hm, 1, np.where(hm & ~hp, -1, np.where(hp & hm, np.where(tool_neg, -1, 1), 0)))
+    T = np.where(side > 0, Tp, np.where(side < 0, Tm, np.nan))
+    has = np.isfinite(T)
+    U = np.full(len(M), np.inf)
+    ch = []
+    med_T = float(np.median(T[has])) if has.any() else 5.0
+    brk = max(2.0, 0.5 * med_T)
+    for i in range(N_CH):
+        s = S[i]
+        same = np.isfinite(s) & ((s == 0) | (np.sign(s) == side))
+        u = np.where(same & has, np.abs(s), np.inf)
+        U = np.minimum(U, u)
+        okc = has & (u < T - 1e-6)
+        ch.append({'chunks': envelope_chunks(M, Nrm, s, med_T, ok=okc), 'limit': med_T})
+    F = np.where(has, np.minimum(T, U), np.nan)
+    formed = has & (U < T - 1e-6)
+    sd = side.astype(float)
+    P_out = M + Nrm * (sd * np.where(has, T, 0.0))[:, None]
+    P_fin = M + Nrm * (sd * np.where(has, F, 0.0))[:, None]
+    final_chunks = [(P_fin[idx], M[idx]) for idx in _chunks_from_mask(has, P_fin, brk)]
+    disp_chunks = [(P_out[idx], P_fin[idx]) for idx in _chunks_from_mask(formed, P_fin, brk)]
+    seg = np.r_[0.0, np.hypot(*(M[1:] - M[:-1]).T)]
+    arc = np.cumsum(seg)
+    prof = {'arc': arc, 'x': M[:, 0], 'y': M[:, 1], 'T': T, 'F': F, 'formed': formed, 'main': ~fan}
+    return {'ch': ch,
+            'final': {'chunks': final_chunks, 'disp': disp_chunks, 'profile': prof,
+                      'M': M, 'N': Nrm, 'side': side, 'T': T},
+            'pf_chains': chains}
+
+
+# ---------- çizim yardımcıları ----------
+PF_COLOR, FINAL_COLOR, DISP_COLOR = '#7f7f7f', '#1f3a5f', '#d62728'
+
+
+def draw_preform_outline(ax, chains, label='Ön Form (DXF)'):
+    first = True
+    for A, _cl in chains:
+        ax.plot(A[:, 0], A[:, 1], color=PF_COLOR, linewidth=1.3, linestyle=(0, (8, 3, 2, 3)),
+                label=(label if first else ''), zorder=2)
+        first = False
+
+
+def draw_final_form(ax, final):
+    first = True
+    for P, Mk in final['chunks']:
+        poly = np.vstack([P, Mk[::-1]])
+        ax.fill(poly[:, 0], poly[:, 1], color=FINAL_COLOR, alpha=0.10, linewidth=0, zorder=1)
+        ax.plot(P[:, 0], P[:, 1], color=FINAL_COLOR, linewidth=1.8,
+                label=('Son Form Yüzeyi (tüm kanallar)' if first else ''), zorder=4)
+        first = False
+    first = True
+    for Po, Pf in final['disp']:
+        poly = np.vstack([Po, Pf[::-1]])
+        ax.fill(poly[:, 0], poly[:, 1], facecolor=DISP_COLOR, alpha=0.18, edgecolor=DISP_COLOR,
+                hatch='////', linewidth=0, label=('Akıtılan / ezilen malzeme' if first else ''), zorder=1)
+        first = False
+
+
+def thickness_profile(form, step_mm=1.0):
+    """Et kalınlığı profili: grafik (SVG kartı), özet metni, tablo."""
+    cols = ['Kalıp boyunca (mm)', 'X', 'Y', 'Ön form (mm)', 'Son (mm)', 'İnceltme (%)']
+    if not form or not form.get('final'):
+        return ("<p>Et kalınlığı profili için <b>Ön form (DXF)</b> yükleyip simülasyonu çalıştır.</p>",
+                "", pd.DataFrame(columns=cols))
+    p = form['final']['profile']
+    m = p['main'] & np.isfinite(p['T'])
+    if not m.any():
+        return ("<p>Ön form kalıbın hiçbir noktasının üzerinde bulunamadı. DXF koordinatlarını / "
+                "kaydırma değerlerini kontrol et.</p>", "", pd.DataFrame(columns=cols))
+    arc, T, F = p['arc'], p['T'], p['F']
+    red = np.where(m & (T > 1e-9), (T - F) / np.where(T > 1e-9, T, 1) * 100, np.nan)
+    fig = Figure(figsize=(14, 6.5), dpi=100)
+    ax = fig.add_subplot(111)
+    fig.subplots_adjust(right=0.86)
+    Ta = np.where(m, T, np.nan); Fa = np.where(m, F, np.nan)
+    ax.fill_between(arc, Fa, Ta, where=m & p['formed'], color=DISP_COLOR, alpha=0.18, label='İnceltme')
+    ax.plot(arc, Ta, color=PF_COLOR, linewidth=1.6, linestyle='--', label='Ön form kalınlığı')
+    ax.plot(arc, Fa, color=FINAL_COLOR, linewidth=2.2, label='Son kalınlık')
+    ax.set_xlabel('Kalıp konturu boyunca mesafe (mm) — kalıp başlangıcından', fontsize=11)
+    ax.set_ylabel('Et kalınlığı (kalıptan dış yüzeye, mm)', fontsize=11)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax2 = ax.twinx()
+    ax2.plot(arc, np.where(m & p['formed'], red, np.nan), color=DISP_COLOR, linewidth=1.0, alpha=0.8,
+             label='İnceltme oranı (%)')
+    ax2.set_ylabel('İnceltme oranı (%)', color=DISP_COLOR, fontsize=11)
+    ax2.tick_params(axis='y', colors=DISP_COLOR)
+    ax2.set_ylim(0, 100)
+    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, shadow=True)
+    ax.set_title('Et Kalınlığı Profili (Ön Form → Son Form)', fontsize=14, pad=12)
+    fm = m & p['formed']
+    lines = [f"**Ön form kalınlığı:** {np.nanmin(Ta):.3f} – {np.nanmax(Ta):.3f} mm"]
+    if fm.any():
+        lines += [f"**Formlanan bölge:** kalıp boyunca {arc[fm].min():.1f} – {arc[fm].max():.1f} mm",
+                  f"**Son kalınlık (formlanan bölgede):** en az {np.nanmin(F[fm]):.3f} mm, en çok {np.nanmax(F[fm]):.3f} mm, "
+                  f"ortalama {np.nanmean(F[fm]):.3f} mm",
+                  f"**En büyük inceltme:** %{np.nanmax(red[fm]):.1f} (kalıp boyunca {arc[fm][np.nanargmax(red[fm])]:.1f} mm)"]
+    else:
+        lines.append("**Takım ön forma hiç girmedi** — form oluşmadı.")
+    idx = np.where(m)[0]
+    keep, last = [], -1e18
+    for j in idx:
+        if arc[j] - last >= step_mm - 1e-9:
+            keep.append(j); last = arc[j]
+    df = pd.DataFrame({cols[0]: np.round(arc[keep], 3), cols[1]: np.round(p['x'][keep], 3),
+                       cols[2]: np.round(p['y'][keep], 3), cols[3]: np.round(T[keep], 4),
+                       cols[4]: np.round(F[keep], 4), cols[5]: np.round(np.nan_to_num(red[keep]), 2)})
+    return fig_to_svg_card(fig), "  \n".join(lines), df
+
+
+# ===== Hücre 18 =====
 # -------------------------------------------------------------
 # ANİMASYON SAHNESİ (canlı oynatıcı ve MP4 aynı kodu kullanır)
 # -------------------------------------------------------------
@@ -1387,7 +1938,7 @@ def build_scene(channels_segments, start_points, radii, mold_points, xname='X', 
         ax.plot([p[0] for p in mold_points], [p[1] for p in mold_points],
                 color='black', linewidth=1.0, linestyle='-', label='Kalıp (sabit)')
 
-    sc = {'fig': fig, 'canvas': canvas, 'contact_lines': [], 'tool_circles': [],
+    sc = {'fig': fig, 'canvas': canvas, 'starts': list(start_points), 'contact_lines': [], 'tool_circles': [],
           'spoke_lines': [], 'contact_dots': [], 'tool_centers': []}
     for i in range(N_CH):
         (cline,) = ax.plot([], [], color=CHANNEL_COLORS[i], linewidth=2.2, label=f'Kanal {i+1} — kontur')
@@ -1406,8 +1957,11 @@ def build_scene(channels_segments, start_points, radii, mold_points, xname='X', 
 
 def render_scene(sc, timelines, total_time, t):
     for i in range(N_CH):
-        center_pos = get_position(timelines[i], t, 'points')
-        contact_pos = get_position(timelines[i], t, 'orig_points')
+        if timelines[i]:
+            center_pos = get_position(timelines[i], t, 'points')
+            contact_pos = get_position(timelines[i], t, 'orig_points')
+        else:                                       # hareketsiz kanal: başlangıç noktasında dursun
+            center_pos = contact_pos = tuple(sc['starts'][i])
         trail = get_trail(timelines[i], t, 'orig_points')
         if trail:
             sc['contact_lines'][i].set_data([p[0] for p in trail], [p[1] for p in trail])
@@ -1506,13 +2060,18 @@ def mp4_generator(channels_segments, start_points, radii, mold_points, timelines
 # -------------------------------------------------------------
 # JSON kaydet / yükle (Colab bölüm 11 ile uyumlu + y_offset ve AutoCAD ayarları eklendi)
 # -------------------------------------------------------------
-def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts):
+def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, preform=None):
     data = {'channels': [], 'mold': dict(cfg['mold']),
             'settings': {'contact_mode': cfg['contact_mode'], 'g0_feed': cfg['g0_feed'], 'fps': fps, 'speed': speed},
             'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step},
             'plot': {'label_font': opts['label_font'], 'label_shift': opts['label_shift'],
                      'xname': opts['xname'], 'yname': opts['yname'],
-                     'show_env': opts['show_env'], 'env_limit': opts['env_limit']}}
+                     'show_env': opts['show_env'], 'env_limit': opts['env_limit']},
+            'preform': {'use': opts['pf_use'], 'dx': opts['pf_dx'], 'dy': opts['pf_dy'],
+                        'selected': opts['pf_layers'],
+                        'name': (preform or {}).get('name'),
+                        'layers': {k: [[[round(x, 4), round(y, 4)] for x, y in pl] for pl in v]
+                                   for k, v in ((preform or {}).get('layers') or {}).items()}}}
     for idx, ch in enumerate(cfg['channels']):
         data['channels'].append({'channel_id': idx + 1, 'x0': ch['x0'], 'y0': ch['y0'], 'tr': ch['tr'],
                                  'fd': ch['fd'], 'y_offset': ch['y_offset'], 'code': ch['code'],
@@ -1545,6 +2104,17 @@ def json_dict_to_updates(data, gr_update):
     pl = data.get('plot', {}) or {}
     for key in ('label_font', 'label_shift', 'xname', 'yname', 'show_env', 'env_limit'):
         ups.append(pick(pl, key))
+    pf = data.get('preform', {}) or {}
+    for key in ('use', 'dx', 'dy'):
+        ups.append(pick(pf, key))
+    if pf.get('layers'):
+        st = {'name': pf.get('name') or 'ön form', 'layers': pf['layers']}
+        sel = [k for k in (pf.get('selected') or []) if k in st['layers']] or list(st['layers'])
+        ups.append(gr_update(choices=preform_layer_choices(st), value=sel))
+        ups.append(st)                                  # gr.State: değer doğrudan verilir
+    else:
+        ups.append(gr_update())
+        ups.append(gr_update())                         # State değişmez
     return ups
 
 
@@ -1706,24 +2276,55 @@ if(EV){ for(var ch0=0;ch0<NC;ch0++){ var K=EV.S[ch0].t.length, arr0=new Float64A
 function upperBound(A,x){var lo=0,hi=A.length; while(lo<hi){var m=(lo+hi)>>1; if(A[m]<=x) lo=m+1; else hi=m;} return lo;}
 function envAt(ch){ var j=upperBound(EV.S[ch].t,t+1e-9), c=Math.floor(j/CP), ca=envCache[ch];
   if(ca.j===j) return ca.a; var a=envCk[ch][c].slice(); applySamples(a,ch,c*CP,j); ca.j=j; ca.a=a; return a; }
+// ön form (varsa): ışın başına lokal malzeme kalınlığı (T) ve malzemenin olduğu taraf (SD)
+var HASPF=!!(EV&&EV.T), Ta=null, SD=null;
+if(HASPF){ Ta=new Float64Array(EV.T); SD=new Int8Array(EV.sd); }
+function okv(i,v,L){
+  if(!isFinite(v)) return false;
+  if(HASPF){ var T=Ta[i]; if(!(T>0)) return false; if(v!==0 && ((v>0)!==(SD[i]>0))) return false; return Math.abs(v)<T-1e-6; }
+  return Math.abs(v)<=L;
+}
+function runs(ok,px,py,brk){ var out=[], cur=[];
+  for(var i=0;i<NM;i++){ if(!ok(i)){ if(cur.length>1) out.push(cur); cur=[]; continue; }
+    if(cur.length){ var j=cur[cur.length-1]; if(Math.hypot(px(i)-px(j),py(i)-py(j))>brk){ if(cur.length>1) out.push(cur); cur=[]; } }
+    cur.push(i); }
+  if(cur.length>1) out.push(cur); return out; }
+function polyPath(run,fx,fy,X,Y,back){ for(var q=0;q<run.length;q++){var i=run[q]; if(q) ctx.lineTo(X(fx(i)),Y(fy(i))); else ctx.moveTo(X(fx(i)),Y(fy(i)));}
+  if(back){ for(var q2=run.length-1;q2>=0;q2--){var i2=run[q2]; ctx.lineTo(X(back[0](i2)),Y(back[1](i2)));} ctx.closePath(); } }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
-  for(var ch=0;ch<NC;ch++){ var s=envAt(ch), L=EV.lim[ch], brk=Math.max(2,0.5*L), col=EV.col[ch], run=[];
-    var flush=function(){ if(run.length>1){
-        ctx.beginPath(); for(var q=0;q<run.length;q++){var i=run[q], ex=X(Mx[i]+Nx[i]*s[i]), ey=Y(My[i]+Ny[i]*s[i]); if(q) ctx.lineTo(ex,ey); else ctx.moveTo(ex,ey);}
-        for(var q2=run.length-1;q2>=0;q2--){ctx.lineTo(X(Mx[run[q2]]),Y(My[run[q2]]));}
-        ctx.closePath(); ctx.fillStyle=hex2rgba(col,0.16); ctx.fill();
-        ctx.beginPath(); for(var q3=0;q3<run.length;q3++){var i3=run[q3], ex3=X(Mx[i3]+Nx[i3]*s[i3]), ey3=Y(My[i3]+Ny[i3]*s[i3]); if(q3) ctx.lineTo(ex3,ey3); else ctx.moveTo(ex3,ey3);}
-        ctx.setLineDash([6,3]); ctx.strokeStyle=col; ctx.lineWidth=1.8; ctx.stroke(); ctx.setLineDash([]); }
-      run=[]; };
-    for(var i=0;i<NM;i++){ var v=s[i];
-      if(!(isFinite(v)&&Math.abs(v)<=L)){flush();continue;}
-      if(run.length){ var j=run[run.length-1], sj=s[j];
-        var side=(v!==0&&sj!==0&&((v>0)!==(sj>0)));
-        var jump=Math.hypot((Mx[i]+Nx[i]*v)-(Mx[j]+Nx[j]*sj),(My[i]+Ny[i]*v)-(My[j]+Ny[j]*sj));
-        if(side||jump>brk) flush(); }
-      run.push(i); }
-    flush(); }
+  var SS=[]; for(var c0=0;c0<NC;c0++) SS.push(envAt(c0));
+  var F=null, BRK=Math.max(2,0.5*(EV.medT||EV.lim[0]));
+  if(HASPF){
+    F=new Float64Array(NM);
+    for(var i=0;i<NM;i++){ var T=Ta[i]; if(!(T>0)){F[i]=NaN;continue;} var u=T;
+      for(var c1=0;c1<NC;c1++){ var v=SS[c1][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } F[i]=u; }
+    var fx=function(i){return Mx[i]+Nx[i]*SD[i]*F[i];}, fy=function(i){return My[i]+Ny[i]*SD[i]*F[i];};
+    var ox=function(i){return Mx[i]+Nx[i]*SD[i]*Ta[i];}, oy=function(i){return My[i]+Ny[i]*SD[i]*Ta[i];};
+    var mx=function(i){return Mx[i];}, my=function(i){return My[i];};
+    var has=function(i){return Ta[i]>0;}, frm=function(i){return Ta[i]>0 && F[i]<Ta[i]-1e-6;};
+    var RF=runs(has,fx,fy,BRK), RD=runs(frm,fx,fy,BRK);
+    ctx.fillStyle='rgba(31,58,95,0.10)'; RF.forEach(function(r){ctx.beginPath(); polyPath(r,fx,fy,X,Y,[mx,my]); ctx.fill();});
+    ctx.fillStyle='rgba(214,39,40,0.20)'; RD.forEach(function(r){ctx.beginPath(); polyPath(r,ox,oy,X,Y,[fx,fy]); ctx.fill();});
+    ctx.strokeStyle='#7f7f7f'; ctx.lineWidth=1.3; ctx.setLineDash([8,3,2,3]);
+    (EV.pf||[]).forEach(function(pl){ ctx.beginPath(); for(var q=0;q<pl.length;q+=2){ if(q) ctx.lineTo(X(pl[q]),Y(pl[q+1])); else ctx.moveTo(X(pl[q]),Y(pl[q+1])); } ctx.stroke(); });
+    ctx.setLineDash([]);
+  }
+  for(var ch=0;ch<NC;ch++){ (function(ch){ var s=SS[ch], L=EV.lim[ch], col=EV.col[ch];
+    var ex=function(i){return Mx[i]+Nx[i]*s[i];}, ey=function(i){return My[i]+Ny[i]*s[i];};
+    var ok=function(i){return okv(i,s[i],L);};
+    var brk=HASPF?BRK:Math.max(2,0.5*L);
+    // yön değişiminde de böl
+    var R=runs(ok,ex,ey,brk), R2=[];
+    R.forEach(function(r){ var cur=[r[0]]; for(var q=1;q<r.length;q++){ var a=s[r[q]], b=s[r[q-1]];
+        if(a!==0&&b!==0&&((a>0)!==(b>0))){ if(cur.length>1) R2.push(cur); cur=[]; } cur.push(r[q]); } if(cur.length>1) R2.push(cur); });
+    R2.forEach(function(r){
+      if(!HASPF){ ctx.beginPath(); polyPath(r,ex,ey,X,Y,[function(i){return Mx[i];},function(i){return My[i];}]); ctx.fillStyle=hex2rgba(col,0.16); ctx.fill(); }
+      ctx.beginPath(); polyPath(r,ex,ey,X,Y,null); ctx.setLineDash([6,3]); ctx.strokeStyle=col; ctx.lineWidth=1.8; ctx.stroke(); ctx.setLineDash([]); });
+  })(ch); }
+  if(HASPF){ ctx.strokeStyle='#1f3a5f'; ctx.lineWidth=2.2;
+    runs(function(i){return Ta[i]>0;},function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},BRK)
+      .forEach(function(r){ ctx.beginPath(); polyPath(r,function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},X,Y,null); ctx.stroke(); }); }
 }
 
 // ---- CNC EKRANI: program satırları, eksen konumu, kalan mesafe ----
@@ -1833,7 +2434,9 @@ function draw(){
   function leg(col,txt,y){ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(lgx,y); ctx.lineTo(lgx+22,y); ctx.stroke(); ctx.fillStyle='#222'; ctx.fillText(txt,lgx+28,y+4);}
   leg('#000','Kalıp (sabit)',lgy+8);
   for(var qq=0;qq<D.col.length;qq++) leg(D.col[qq],'Kanal '+(qq+1)+' — kontur',lgy+28+qq*20);
-  if(EV&&envC.checked){ for(var qe=0;qe<NC;qe++){ ctx.setLineDash([6,3]); leg(EV.col[qe],'Kanal '+(qe+1)+' — radüs izi',lgy+28+(D.col.length+qe)*20); ctx.setLineDash([]); } }
+  if(EV&&envC.checked){ for(var qe=0;qe<NC;qe++){ ctx.setLineDash([6,3]); leg(EV.col[qe],'Kanal '+(qe+1)+' — radüs izi',lgy+28+(D.col.length+qe)*20); ctx.setLineDash([]); }
+    if(HASPF){ var yb=lgy+28+(D.col.length+NC)*20; ctx.setLineDash([8,3,2,3]); leg('#7f7f7f','Ön form (DXF)',yb); ctx.setLineDash([]);
+      leg('#1f3a5f','Son form yüzeyi',yb+20); ctx.fillStyle='rgba(214,39,40,0.35)'; ctx.fillRect(lgx,yb+36,22,8); ctx.fillStyle='#222'; ctx.fillText('Akıtılan malzeme',lgx+28,yb+44); } }
 }
 function ui(){tm.value=Math.round(t/D.T*10000); tv.textContent=t.toFixed(2)+' / '+D.T.toFixed(2)+' s'; updatePanel(); updateCNC();}
 function setT(nt){t=nt; measStep(); draw(); ui();}
@@ -1918,7 +2521,7 @@ def player_cnc_data(cfg, channels_segments, timelines, total_time):
     return out
 
 
-def player_env_data(timelines, radii, mold_points, limits, show, max_samples=20000):
+def player_env_data(timelines, radii, mold_points, limits, show, max_samples=20000, form=None):
     M, Nrm, _ = mold_rays(mold_points)
     if len(M) == 0:
         return None
@@ -1930,9 +2533,20 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
             idx = np.linspace(0, len(C) - 1, max_samples).round().astype(int)
             C, T = C[idx], T[idx]
         S.append({'c': r4(C), 't': [round(float(v), 4) for v in T]})
-    return {'M': r4(M), 'N': [round(float(v), 6) for v in Nrm.ravel()], 'S': S,
-            'lim': [float(limits[i] if limits[i] > 0 else radii[i]) for i in range(N_CH)],
-            'col': CHANNEL_ENV_COLORS[:N_CH], 'show': bool(show)}
+    out = {'M': r4(M), 'N': [round(float(v), 6) for v in Nrm.ravel()], 'S': S,
+           'lim': [float(limits[i] if limits[i] > 0 else radii[i]) for i in range(N_CH)],
+           'col': CHANNEL_ENV_COLORS[:N_CH], 'show': bool(show)}
+    fin = (form or {}).get('final')
+    if fin is not None and len(fin['T']) == len(M):
+        T = np.asarray(fin['T'], float)
+        has = np.isfinite(T)
+        out['T'] = [round(float(v), 4) if h else -1.0 for v, h in zip(T, has)]
+        out['sd'] = [int(v) for v in fin['side']]
+        tmax = float(np.max(T[has])) if has.any() else 1.0
+        out['lim'] = [tmax] * N_CH                          # takım örneklerini elemek için üst sınır
+        out['medT'] = float(np.median(T[has])) if has.any() else 1.0
+        out['pf'] = [[round(float(v), 4) for v in np.asarray(A).ravel()] for A, _cl in form['pf_chains']]
+    return out
 
 
 def build_player_data(channels_segments, start_points, radii, mold_points, timelines, total_time,
@@ -1949,8 +2563,11 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
         c = {'F': F, 'cx': [], 'cy': [], 'px': [], 'py': [], 'm': [], 'hx': [], 'hy': []}
         for k in range(n + 1):
             t = k * dt
-            cp = get_position(tl, t, 'points')
-            pp = get_position(tl, t, 'orig_points')
+            if tl:
+                cp = get_position(tl, t, 'points')
+                pp = get_position(tl, t, 'orig_points')
+            else:                                   # hareketsiz kanal: başlangıç noktasında dursun
+                cp = pp = start_points[i]
             tr = get_trail(tl, t, 'orig_points')
             m, head = len(tr), None
             if m > 0 and (m > len(full) or not _same_pt(tr[-1], full[m - 1])):
@@ -1974,10 +2591,10 @@ def build_player_html(data, height=960):
             f'style="width:100%;height:{height}px;border:1px solid #ddd;border-radius:8px;background:#fff"></iframe>')
 
 
-# ===== Hücre 18 =====
+# ===== Hücre 20 =====
 import gradio as gr
 
-N_ANIM_OUT = 11   # run_all çıktı sayısı
+N_ANIM_OUT = 14   # run_all çıktı sayısı
 
 
 def _split_vals(vals):
@@ -1987,6 +2604,8 @@ def _split_vals(vals):
     speed = _num(vals[N_CFG + 1], 1.0) or 1.0
     ac_s, ac_e, ac_st = (_num(vals[N_CFG + 2], 0.0), _num(vals[N_CFG + 3], 0.0), _num(vals[N_CFG + 4], 0.1))
     opts = opts_from_values(vals[N_CFG + 5:N_CFG + 5 + N_OPT])
+    k = N_CFG + 5 + N_OPT
+    opts['pf_state'] = vals[k] if len(vals) > k and isinstance(vals[k], dict) else None
     return cfg, fps, speed, ac_s, ac_e, ac_st, opts
 
 
@@ -1995,19 +2614,32 @@ def _plot_kw(opts):
                 label_font=opts['label_font'], label_shift=opts['label_shift'])
 
 
-def _envelopes(timelines, radii, mold_pts, opts, force=False):
-    """Radüs izi (form yüzeyi) - gösterim kapalıysa ve zorlanmadıysa hesaplanmaz."""
-    if (not opts['show_env'] and not force) or len(mold_pts) < 2:
+def _preform(opts):
+    """Kullanılacak ön form zincirleri (yüklü ve 'kullan' işaretliyse)."""
+    st = opts.get('pf_state')
+    if not opts.get('pf_use') or not st or not st.get('layers'):
         return None
-    return compute_envelopes(timelines, radii, mold_pts, [opts['env_limit']] * N_CH)
+    chains = preform_chains(st, opts.get('pf_layers'), opts.get('pf_dx', 0.0), opts.get('pf_dy', 0.0))
+    return {'chains': chains} if chains else None
 
 
-def _static_plots(segs, starts, radii, mold_pts, opts, envs=None):
+def _envelopes(timelines, radii, mold_pts, opts, force=False):
+    """Radüs izi + (varsa) ön forma göre son form. Gösterim kapalı, ön form yok ve zorlanmadıysa hesaplanmaz."""
+    pf = _preform(opts)
+    if (not opts['show_env'] and not force and pf is None) or len(mold_pts) < 2:
+        return None
+    return compute_form(timelines, radii, mold_pts, opts['env_limit'], pf)
+
+
+def _static_plots(segs, starts, radii, mold_pts, opts, form=None):
+    show = bool(form) and opts['show_env']
     comp = fig_to_svg_card(plot_comparison_fig(segs, starts, radii, mold_pts, opts['xname'], opts['yname'],
-                                               envelopes=envs))
+                                               envelopes=(form['ch'] if show else None),
+                                               form=(form if form and form.get('final') else None)))
     if len(mold_pts) > 1:
         ind = [fig_to_svg_card(plot_channel_fig(i, segs, starts, radii, mold_pts, **_plot_kw(opts),
-                                                envelope=(envs[i] if envs else None)))
+                                                envelope=(form['ch'][i] if show else None),
+                                                pf_chains=(form['pf_chains'] if form else None)))
                for i in range(N_CH)]
     else:
         ind = ["<p>Kalıp noktası yetersiz.</p>"] * N_CH
@@ -2029,13 +2661,14 @@ def run_all(*vals):
                                         opts['xname'], opts['yname'])
         frame0 = render_frame_image(token, 0)
 
-        envs = _envelopes(timelines, radii, mold_pts, opts)
-        comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, envs)
+        form = _envelopes(timelines, radii, mold_pts, opts)
+        comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, form)
         table = distance_table(segs, mold_pts)
+        th_html, th_md, th_df = thickness_profile(form)
 
         try:
-            env_d = (player_env_data(timelines, radii, mold_pts, [opts['env_limit']] * N_CH, opts['show_env'])
-                     if len(mold_pts) > 1 else None)
+            env_d = (player_env_data(timelines, radii, mold_pts, [opts['env_limit']] * N_CH, opts['show_env'],
+                                     form=form) if len(mold_pts) > 1 else None)
             cnc_d = player_cnc_data(cfg, segs, timelines, total_time)
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
@@ -2046,12 +2679,15 @@ def run_all(*vals):
 
         status = (note + "\n" if note else "") + \
                  (f"Simülasyon hazır. Toplam süre: {total_time:.2f} sn — animasyon kare sayısı: {n_frames}")
+        if opts.get('pf_state') and opts.get('pf_use'):
+            status += ("\nÖn form kullanıldı — radüs izi lokal malzeme kalınlığıyla sınırlandı (Et Kalınlığı sekmesi)."
+                       if form and form.get('final') else "\nÖn form seçili ama kullanılabilir çizgi bulunamadı (katman seçimini kontrol et).")
         return (frame0,
                 gr.update(minimum=0, maximum=n_frames, value=0),
                 gr.update(value=playback_interval(fps, speed), active=False),
                 token,
                 comp_html, ind_html[0], ind_html[1], ind_html[2],
-                table, player_html, status)
+                table, player_html, th_html, th_md, th_df, status)
     except Exception:
         err = "Simülasyon hazırlanırken hata oluştu:\n" + traceback.format_exc()
         return tuple([gr.update()] * (N_ANIM_OUT - 1) + [err])
@@ -2063,11 +2699,25 @@ def redraw_plots(*vals):
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
-        envs = _envelopes(timelines, radii, mold_pts, opts)
-        comp, ind = _static_plots(segs, starts, radii, mold_pts, opts, envs)
-        return comp, ind[0], ind[1], ind[2], "Grafikler güncellendi."
+        form = _envelopes(timelines, radii, mold_pts, opts)
+        comp, ind = _static_plots(segs, starts, radii, mold_pts, opts, form)
+        th_html, th_md, th_df = thickness_profile(form)
+        return comp, ind[0], ind[1], ind[2], th_html, th_md, th_df, "Grafikler güncellendi."
     except Exception:
-        return (gr.update(),) * 4 + ("Grafikler yeniden çizilirken hata oluştu:\n" + traceback.format_exc(),)
+        return (gr.update(),) * 7 + ("Grafikler yeniden çizilirken hata oluştu:\n" + traceback.format_exc(),)
+
+
+def upload_preform(file_obj):
+    """Ön form DXF yüklenince: state + katman listesi + durum mesajı."""
+    if file_obj is None:
+        return None, gr.update(choices=[], value=[]), "Ön form kaldırıldı."
+    try:
+        path = file_obj if isinstance(file_obj, str) else getattr(file_obj, 'name', None) or file_obj['name']
+        st, msg = load_preform_file(path)
+        return st, gr.update(choices=preform_layer_choices(st), value=list(st['layers'])), \
+            msg + "\nKatman seçimini kontrol et, sonra 'Çalıştır'a bas."
+    except Exception as e:
+        return gr.update(), gr.update(), f"Ön form DXF okunamadı: {e}"
 
 
 # -------------------------------------------------------------
@@ -2153,7 +2803,8 @@ def make_dxf(*vals):
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
             total_time = 1.0
-        envs = _envelopes(timelines, radii, mold_pts, opts, force=True) if 'envelope' in layers else None
+        envs = (_envelopes(timelines, radii, mold_pts, opts, force=True)
+                if {'envelope', 'preform', 'final'} & set(layers) else None)
         end_used = ac_e if ac_e > ac_s else total_time
         txt, summary = build_dxf_text(layers, segs, radii, mold_pts, timelines, total_time,
                                       ac_s, end_used, ac_st, envs)
@@ -2177,7 +2828,7 @@ def make_dxf(*vals):
 def export_json(*vals):
     try:
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
-        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st, opts)
+        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st, opts, opts.get('pf_state'))
         out_dir = tempfile.mkdtemp(prefix='cnc_cfg_')
         path = os.path.join(out_dir, 'gcode_simulator_config.json')
         with open(path, 'w', encoding='utf-8') as f:
@@ -2188,7 +2839,7 @@ def export_json(*vals):
 
 
 def import_json(file_obj):
-    n_out = N_CFG + 2 + 3 + N_OPT + 1
+    n_out = N_CFG + 2 + 3 + N_OPT + 1 + 1
     if file_obj is None:
         return tuple([gr.update()] * (n_out - 1) + ["JSON dosyası seçilmedi."])
     try:
@@ -2285,6 +2936,21 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     env_limit = gr.Number(value=DEFAULT_ENV_LIMIT, label="İz sınırı / ham malzeme kalınlığı (mm)",
                                           info="Kalıba bundan uzak kalan yerlerde iz çizilmez. 0 = takım yarıçapı.")
 
+            with gr.Accordion("Ön form (DXF) — lokal malzeme kalınlığı", open=False):
+                gr.Markdown("Ön formun kesitini **kalıp koordinatlarında** DXF olarak yükle. Kalıbın her noktasında "
+                            "ön formun dış yüzeyine olan mesafe o noktadaki malzeme kalınlığı olur; radüs izi sabit "
+                            "sınır yerine bu kalınlıkla sınırlanır. Son form yüzeyi 3 kanalın en derin girdiği yerdir. "
+                            "En iyi sonuç için ön formu **kapalı kontur** (iç ve dış yüzey) olarak çiz; tek bir dış yüzey "
+                            "çizgisi de kabul edilir. Okunan nesneler: LINE, POLYLINE, LWPOLYLINE, ARC, CIRCLE, ELLIPSE, SPLINE "
+                            "(bloklar için EXPLODE).")
+                pf_file = gr.File(label="Ön form DXF yükle", file_types=[".dxf"], file_count="single")
+                pf_layers = gr.CheckboxGroup(choices=[], value=[], label="Kullanılacak DXF katmanları")
+                with gr.Row():
+                    pf_use = gr.Checkbox(value=True, label="Ön formu kullan")
+                    pf_dx = gr.Number(value=0.0, label="Ön form kaydırma X (mm)")
+                    pf_dy = gr.Number(value=0.0, label="Ön form kaydırma Y (mm)")
+            pf_state = gr.State(None)
+
             with gr.Row():
                 fps_sl = gr.Slider(5, 40, value=20, step=1, label="FPS")
                 speed_sl = gr.Slider(0.2, 5.0, value=1.0, step=0.2, label="Hız Çarpanı")
@@ -2358,6 +3024,13 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                         with gr.Tab("Kanal 3"):
                             ind3 = gr.HTML()
 
+                with gr.Tab("📊 Et Kalınlığı"):
+                    gr.Markdown("Ön form yüklüyse: kalıp konturu boyunca ön form kalınlığı, son kalınlık (3 kanalın "
+                                "birleşik etkisi) ve inceltme oranı. Kalınlık = kalıptan dış yüzeye mesafe.")
+                    thick_html = gr.HTML()
+                    thick_md = gr.Markdown()
+                    thick_df = gr.DataFrame(label="Kalınlık tablosu (~1 mm aralıkla)")
+
                 with gr.Tab("📏 Mesafe Tablosu"):
                     gr.Markdown("Her hareket segmentinin başlangıç / orta / bitiş noktasının kalıp konturuna olan "
                                 "en kısa mesafesi (G0 hariç).")
@@ -2378,21 +3051,27 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     dxf_file = gr.File(label="DXF indir", interactive=False)
 
     # ---------------- OLAYLAR ----------------
-    opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit]     # sıra: opts_from_values
-    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps
+    opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit,
+                 pf_use, pf_dx, pf_dy, pf_layers]                              # sıra: opts_from_values
+    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps + [pf_state]
 
     run_btn.click(
         run_all, inputs=all_inputs,
         outputs=[anim_img, frame_sl, play_timer, anim_token, comp_html, ind1, ind2, ind3,
-                 table_out, player_out, status])
+                 table_out, player_out, thick_html, thick_md, thick_df, status])
 
     # statik grafikleri yeniden çiz (yazı boyutu / kaydırma / eksen adı / radüs izi)
-    redraw_outputs = [comp_html, ind1, ind2, ind3, status]
+    redraw_outputs = [comp_html, ind1, ind2, ind3, thick_html, thick_md, thick_df, status]
     for _c in (lbl_font, lbl_shift):
         _c.release(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
-    for _c in (x_name, y_name, env_limit):
+    for _c in (x_name, y_name, env_limit, pf_dx, pf_dy):
         _c.submit(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
-    show_env.input(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
+    for _c in (show_env, pf_use, pf_layers):
+        _c.input(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
+
+    # ön form DXF
+    pf_file.upload(upload_preform, inputs=pf_file, outputs=[pf_state, pf_layers, status])
+    pf_file.clear(lambda: upload_preform(None), outputs=[pf_state, pf_layers, status])
     redraw_btn.click(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
 
     # oynatıcı
