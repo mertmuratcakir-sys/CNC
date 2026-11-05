@@ -668,8 +668,8 @@ DIA_AXIS_CHOICES = [('X ekseni', 'X'), ('Y ekseni', 'Y'), ('X ve Y', 'XY')]
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
 N_CFG = MOLD_START + 5 + 1 + 1      # 31: kalıp(5) + çizilen yol modu + G0 hızı
-N_OPT = 10                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
-                                    # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar
+N_OPT = 12                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
+                                    # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen
 
 
 def _num(v, default=0.0):
@@ -718,7 +718,9 @@ def opts_from_values(v):
             'env_limit': max(_num(v[5], DEFAULT_ENV_LIMIT), 0.0),
             'pf_use': True if v[6] is None else bool(v[6]),
             'pf_dx': _num(v[7], 0.0), 'pf_dy': _num(v[8], 0.0),
-            'pf_layers': list(v[9]) if isinstance(v[9], (list, tuple)) else []}
+            'pf_layers': list(v[9]) if isinstance(v[9], (list, tuple)) else [],
+            'pf_model': v[10] if v[10] in ('shear', 'flow') else 'shear',
+            'pf_radial': v[11] if v[11] in ('auto', 'X', 'Y') else 'auto'}
 
 
 # -------------------------------------------------------------
@@ -983,11 +985,12 @@ def compute_envelopes(timelines, radii, mold_points, limits):
     return out
 
 
-def _draw_envelope(ax, env, color, label):
+def _draw_envelope(ax, env, color, label, fill=True):
     first = True
     for E, Mk in env['chunks']:
         poly = np.vstack([E, Mk[::-1]])
-        ax.fill(poly[:, 0], poly[:, 1], color=color, alpha=0.13, linewidth=0, zorder=1)
+        if fill:
+            ax.fill(poly[:, 0], poly[:, 1], color=color, alpha=0.32, linewidth=0, zorder=1)
         ax.plot(E[:, 0], E[:, 1], color=color, linewidth=1.6, linestyle=(0, (5, 2)),
                 label=(label if first else ''), zorder=3)
         first = False
@@ -1030,7 +1033,8 @@ def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xna
                         drawn.add(key)
                     ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, linewidth=3.0, label=lbl)
         if envelopes:
-            _draw_envelope(ax, envelopes[i], CHANNEL_ENV_COLORS[i], f'Kanal {i+1} - Radüs İzi (Form Yüzeyi)')
+            _draw_envelope(ax, envelopes[i], CHANNEL_ENV_COLORS[i], f'Kanal {i+1} - Radüs İzi (Form Yüzeyi)',
+                           fill=not (form and form.get('final')))
         sx, sy = start_points[i]
         ax.plot(sx, sy, 'o', color=CHANNEL_COLORS[0], markersize=8,
                 label=f'Kanal {i+1} Başlangıç ({sx:.1f}, {sy:.1f})')
@@ -1381,6 +1385,10 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
         w.layer('SON_FORM', 5)
         for P, _Mk in envelopes['final']['chunks']:
             w.polyline('SON_FORM', P)
+        for _lbl, _col, chunks in envelopes['final'].get('lines', []):
+            w.layer('IDEAL_FORM', 6)
+            for P in chunks:
+                w.polyline('IDEAL_FORM', P)
     if ('preform' in layers or 'final' in layers) and not (envelopes and envelopes.get('pf_chains')):
         summary.append('ON_FORM/SON_FORM: ön form yüklenmediği için atlandı')
     for name in w.layers:
@@ -1772,28 +1780,147 @@ def _chunks_from_mask(ok, pts, brk):
     return out
 
 
+PF_MODEL_CHOICES = [
+    ('Shear forming (sıvama + inceltme): sinüs kuralı  t = t₀·sin α — kalınlık yalnız DXF\'ten', 'shear'),
+    ('Kalıp üzerinde (flow forming): kalınlık = kalıptan ön form dış yüzeyine', 'flow'),
+]
+PF_RADIAL_CHOICES = [
+    ('Otomatik (çap ayarından; yoksa X)', 'auto'),
+    ('Radyal eksen X (dönme ekseni Y yönünde)', 'X'),
+    ('Radyal eksen Y (dönme ekseni X yönünde)', 'Y'),
+]
+
+
+def resolve_radial(choice, cfg):
+    """Radyal eksen: seçim 'auto' ise kalıbın / kanalların çap ayarından bulunur, yoksa X."""
+    if choice in ('X', 'Y'):
+        return choice, 'seçildi'
+    for d in [cfg.get('mold', {})] + list(cfg.get('channels', [])):
+        if d.get('dia_mode') == 'diameter':
+            ax = d.get('dia_axis', 'X')
+            return ('Y' if ax == 'Y' else 'X'), 'çap ayarından'
+    return 'X', 'varsayılan'
+
+
+def preform_axial_thickness(M, chains, rad_idx, chunk=256):
+    """Shear forming için: her kalıp ışınının radyal koordinatında, dönme eksenine paralel
+    doğrunun ön form (kapalı kontur) içinden geçen toplam uzunluğu = eksenel ön form kalınlığı t₀.
+    Döndürür: t0 (N,) - o yarıçapta malzeme yoksa nan."""
+    Nm = len(M)
+    t0 = np.full(Nm, np.nan)
+    closed = [c for c, cl in chains if cl]
+    if Nm == 0 or not closed:
+        return t0
+    ax_idx = 1 - rad_idx
+    A = np.vstack([c[:-1] for c in closed]); B = np.vstack([c[1:] for c in closed])
+    ra, rb = A[:, rad_idx], B[:, rad_idx]
+    za, zb = A[:, ax_idx], B[:, ax_idx]
+    rho_all = M[:, rad_idx]
+    for a in range(0, Nm, chunk):
+        rho = rho_all[a:a + chunk][:, None]
+        cross = ((ra[None] <= rho) & (rb[None] > rho)) | ((rb[None] <= rho) & (ra[None] > rho))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z = za[None] + (rho - ra[None]) / (rb - ra)[None] * (zb - za)[None]
+        z = np.sort(np.where(cross, z, np.inf), axis=1)
+        cnt = cross.sum(axis=1)
+        tot = np.zeros(len(rho))
+        for k in range(0, z.shape[1] - 1, 2):
+            pair = (k + 1) < cnt
+            if not pair.any():
+                break
+            tot += np.where(pair, z[:, k + 1] - z[:, k], 0.0)
+        t0[a:a + chunk] = np.where(cnt >= 2, tot, np.nan)
+    return t0
+
+
+def _tool_side(S, n):
+    """Her ışın için takımın bulunduğu taraf (+1/-1); takım yoksa genel çoğunluk tarafı."""
+    Sa = np.vstack([np.where(np.isfinite(s), np.abs(s), np.inf) for s in S])
+    kbest = np.argmin(Sa, axis=0)
+    sbest = np.array([S[kbest[j]][j] for j in range(n)])
+    loc = np.where(np.isfinite(sbest) & (sbest != 0), np.sign(sbest), 0)
+    glob = 1 if loc.sum() >= 0 else -1
+    return np.where(loc != 0, loc, glob).astype(int), sbest
+
+
 def compute_form(timelines, radii, mold_points, limit, preform=None):
     """Radüs izi + (varsa) ön forma göre son form.
-    preform: {'chains': [...]} (preform_chains çıktısı) veya None.
+    preform: {'chains': [...], 'model': 'shear'|'flow', 'radial': 'X'|'Y'} veya None.
     Döndürür: {'ch': [kanal izleri], 'final': {...} veya None, 'pf_chains': [...]}"""
     M, Nrm, fan = mold_rays(mold_points)
     S = []
     for i in range(N_CH):
         C, _T = tool_samples(timelines[i], radii[i])
         S.append(radius_envelope(M, Nrm, C, radii[i]))
-    chains = (preform or {}).get('chains') or []
+    pf = preform or {}
+    chains = pf.get('chains') or []
     if not chains or len(M) == 0:
         ch = []
         for i in range(N_CH):
             lim = limit if limit > 0 else radii[i]
             ch.append({'chunks': envelope_chunks(M, Nrm, S[i], lim), 'limit': lim})
         return {'ch': ch, 'final': None, 'pf_chains': []}
+    seg = np.r_[0.0, np.hypot(*(M[1:] - M[:-1]).T)]
+    arc = np.cumsum(seg)
+    if pf.get('model', 'shear') == 'shear':
+        return _form_shear(M, Nrm, fan, S, chains, pf.get('radial', 'X'), arc)
+    return _form_flow(M, Nrm, fan, S, chains, arc)
 
+
+def _form_shear(M, Nrm, fan, S, chains, radial, arc):
+    """SHEAR FORMING (sinüs kuralı): malzeme aynı yarıçapta kalarak eksen yönünde kalıba sıvanır.
+    İdeal son et kalınlığı (kalıba dik) = t₀(r) · sin α, α = kalıp yüzeyinin dönme ekseniyle açısı.
+    Gerçek et kalınlığı = takım boşluğu (kalıptan takım izine). Fark: aşırı / eksik inceltme."""
+    rad_idx = 0 if radial == 'X' else 1
+    axis = np.array([0.0, 1.0]) if radial == 'X' else np.array([1.0, 0.0])
+    t0 = preform_axial_thickness(M, chains, rad_idx)
+    sin_a = np.abs(Nrm @ axis)
+    Ti = t0 * sin_a
+    has = np.isfinite(t0) & (t0 > 1e-9)
+    side, _sb = _tool_side(S, len(M))
+    sd = side.astype(float)
+    U = np.full(len(M), np.inf)
+    ch = []
+    ref = float(np.median(t0[has])) if has.any() else 5.0
+    brk = max(2.0, 0.5 * ref)
+    for i in range(N_CH):
+        s = S[i]
+        same = np.isfinite(s) & ((s == 0) | (np.sign(s) == side))
+        okc = has & same & (np.abs(s) <= t0 + 1e-9)        # takım boşluğu ön form kalınlığından az -> şekillendiriyor
+        U = np.minimum(U, np.where(okc, np.abs(s), np.inf))
+        ch.append({'chunks': envelope_chunks(M, Nrm, s, ref, ok=okc), 'limit': ref})
+    formed = np.isfinite(U)
+    F = np.where(formed, U, np.nan)
+    P_act = M + Nrm * (sd * np.nan_to_num(F))[:, None]
+    P_id = M + Nrm * (sd * np.nan_to_num(Ti))[:, None]
+    tol = 0.01
+    over = formed & (F < Ti - tol)
+    under = formed & (F > Ti + tol)
+    final = {
+        'mode': 'shear',
+        'chunks': [(P_act[idx], M[idx]) for idx in _chunks_from_mask(formed, P_act, brk)],
+        'line_label': 'Gerçek son yüzey (takım boşluğu)',
+        'regions': [('Aşırı inceltme (sinüs kuralından ince)', DISP_COLOR,
+                     [(P_id[idx], P_act[idx]) for idx in _chunks_from_mask(over, P_act, brk)]),
+                    ('Eksik inceltme / malzeme fazlası', UNDER_COLOR,
+                     [(P_act[idx], P_id[idx]) for idx in _chunks_from_mask(under, P_act, brk)])],
+        'lines': [('İdeal son yüzey (sinüs kuralı t₀·sin α)', IDEAL_COLOR,
+                   [P_id[idx] for idx in _chunks_from_mask(has & (Ti > 1e-6), P_id, brk)])],
+        'profile': {'arc': arc, 'x': M[:, 0], 'y': M[:, 1], 'T0': np.where(has, t0, np.nan),
+                    'T': np.where(has, Ti, np.nan), 'F': F, 'formed': formed, 'main': ~fan,
+                    'alpha': np.degrees(np.arcsin(np.clip(sin_a, 0, 1)))},
+        'M': M, 'N': Nrm, 'side': side, 'T': np.where(has, t0, np.nan), 'Ti': np.where(has, Ti, np.nan),
+        'radial': radial,
+    }
+    return {'ch': ch, 'final': final, 'pf_chains': chains}
+
+
+def _form_flow(M, Nrm, fan, S, chains, arc):
+    """KALIP ÜZERİNDE (flow forming): ön form kalıbın üzerinde; kalınlık = kalıptan ön form dış yüzeyine.
+    Son yüzey = min(ön form, takım izi)."""
     Tp, Tm = preform_thickness(M, Nrm, chains)
     hp, hm = np.isfinite(Tp), np.isfinite(Tm)
-    Sa = np.vstack([np.where(np.isfinite(s), np.abs(s), np.inf) for s in S])
-    kbest = np.argmin(Sa, axis=0)
-    sbest = np.array([S[kbest[j]][j] for j in range(len(M))])
+    side_t, sbest = _tool_side(S, len(M))
     tool_neg = np.isfinite(sbest) & (sbest < 0)
     side = np.where(hp & ~hm, 1, np.where(hm & ~hp, -1, np.where(hp & hm, np.where(tool_neg, -1, 1), 0)))
     T = np.where(side > 0, Tp, np.where(side < 0, Tm, np.nan))
@@ -1814,19 +1941,24 @@ def compute_form(timelines, radii, mold_points, limit, preform=None):
     sd = side.astype(float)
     P_out = M + Nrm * (sd * np.where(has, T, 0.0))[:, None]
     P_fin = M + Nrm * (sd * np.where(has, F, 0.0))[:, None]
-    final_chunks = [(P_fin[idx], M[idx]) for idx in _chunks_from_mask(has, P_fin, brk)]
-    disp_chunks = [(P_out[idx], P_fin[idx]) for idx in _chunks_from_mask(formed, P_fin, brk)]
-    seg = np.r_[0.0, np.hypot(*(M[1:] - M[:-1]).T)]
-    arc = np.cumsum(seg)
-    prof = {'arc': arc, 'x': M[:, 0], 'y': M[:, 1], 'T': T, 'F': F, 'formed': formed, 'main': ~fan}
-    return {'ch': ch,
-            'final': {'chunks': final_chunks, 'disp': disp_chunks, 'profile': prof,
-                      'M': M, 'N': Nrm, 'side': side, 'T': T},
-            'pf_chains': chains}
+    final = {
+        'mode': 'flow',
+        'chunks': [(P_fin[idx], M[idx]) for idx in _chunks_from_mask(has, P_fin, brk)],
+        'line_label': 'Son form yüzeyi (tüm kanallar)',
+        'regions': [('Akıtılan / ezilen malzeme', DISP_COLOR,
+                     [(P_out[idx], P_fin[idx]) for idx in _chunks_from_mask(formed, P_fin, brk)])],
+        'lines': [],
+        'profile': {'arc': arc, 'x': M[:, 0], 'y': M[:, 1], 'T0': T, 'T': T, 'F': F,
+                    'formed': formed, 'main': ~fan, 'alpha': None},
+        'M': M, 'N': Nrm, 'side': side, 'T': T, 'Ti': None,
+    }
+    return {'ch': ch, 'final': final, 'pf_chains': chains}
 
 
 # ---------- çizim yardımcıları ----------
 PF_COLOR, FINAL_COLOR, DISP_COLOR = '#7f7f7f', '#1f3a5f', '#d62728'
+FILL_COLOR, FILL_ALPHA = '#2f7fd8', 0.38           # kalıp ile son yüzey arası (et) dolgusu
+UNDER_COLOR, IDEAL_COLOR = '#ff7f0e', '#6a3d9a'
 
 
 def draw_preform_outline(ax, chains, label='Ön Form (DXF)'):
@@ -1841,67 +1973,112 @@ def draw_final_form(ax, final):
     first = True
     for P, Mk in final['chunks']:
         poly = np.vstack([P, Mk[::-1]])
-        ax.fill(poly[:, 0], poly[:, 1], color=FINAL_COLOR, alpha=0.10, linewidth=0, zorder=1)
+        ax.fill(poly[:, 0], poly[:, 1], color=FILL_COLOR, alpha=FILL_ALPHA, linewidth=0, zorder=1)
         ax.plot(P[:, 0], P[:, 1], color=FINAL_COLOR, linewidth=1.8,
-                label=('Son Form Yüzeyi (tüm kanallar)' if first else ''), zorder=4)
+                label=(final.get('line_label', 'Son form yüzeyi') if first else ''), zorder=4)
         first = False
-    first = True
-    for Po, Pf in final['disp']:
-        poly = np.vstack([Po, Pf[::-1]])
-        ax.fill(poly[:, 0], poly[:, 1], facecolor=DISP_COLOR, alpha=0.18, edgecolor=DISP_COLOR,
-                hatch='////', linewidth=0, label=('Akıtılan / ezilen malzeme' if first else ''), zorder=1)
-        first = False
+    for label, color, chunks in final.get('regions', []):
+        first = True
+        for Pa, Pb in chunks:
+            poly = np.vstack([Pa, Pb[::-1]])
+            ax.fill(poly[:, 0], poly[:, 1], facecolor=color, alpha=0.30, edgecolor=color,
+                    hatch='////', linewidth=0, label=(label if first else ''), zorder=2)
+            first = False
+    for label, color, chunks in final.get('lines', []):
+        first = True
+        for P in chunks:
+            ax.plot(P[:, 0], P[:, 1], color=color, linewidth=1.5, linestyle=(0, (4, 2)),
+                    label=(label if first else ''), zorder=5)
+            first = False
 
 
 def thickness_profile(form, step_mm=1.0):
     """Et kalınlığı profili: grafik (SVG kartı), özet metni, tablo."""
-    cols = ['Kalıp boyunca (mm)', 'X', 'Y', 'Ön form (mm)', 'Son (mm)', 'İnceltme (%)']
     if not form or not form.get('final'):
         return ("<p>Et kalınlığı profili için <b>Ön form (DXF)</b> yükleyip simülasyonu çalıştır.</p>",
-                "", pd.DataFrame(columns=cols))
-    p = form['final']['profile']
-    m = p['main'] & np.isfinite(p['T'])
+                "", pd.DataFrame())
+    fin = form['final']
+    p = fin['profile']
+    shear = fin.get('mode') == 'shear'
+    m = p['main'] & np.isfinite(p['T0'])
     if not m.any():
-        return ("<p>Ön form kalıbın hiçbir noktasının üzerinde bulunamadı. DXF koordinatlarını / "
-                "kaydırma değerlerini kontrol et.</p>", "", pd.DataFrame(columns=cols))
-    arc, T, F = p['arc'], p['T'], p['F']
-    red = np.where(m & (T > 1e-9), (T - F) / np.where(T > 1e-9, T, 1) * 100, np.nan)
+        why = ("Ön formun radyal aralığı kalıpla örtüşmüyor — radyal ekseni ve DXF koordinatlarını kontrol et."
+               if shear else "Ön form kalıbın hiçbir noktasının üzerinde bulunamadı. DXF koordinatlarını / kaydırmayı kontrol et.")
+        return f"<p>{why}</p>", "", pd.DataFrame()
+    arc, T0, T, F, fm = p['arc'], p['T0'], p['T'], p['F'], m & p['formed']
     fig = Figure(figsize=(14, 6.5), dpi=100)
     ax = fig.add_subplot(111)
     fig.subplots_adjust(right=0.86)
-    Ta = np.where(m, T, np.nan); Fa = np.where(m, F, np.nan)
-    ax.fill_between(arc, Fa, Ta, where=m & p['formed'], color=DISP_COLOR, alpha=0.18, label='İnceltme')
-    ax.plot(arc, Ta, color=PF_COLOR, linewidth=1.6, linestyle='--', label='Ön form kalınlığı')
-    ax.plot(arc, Fa, color=FINAL_COLOR, linewidth=2.2, label='Son kalınlık')
-    ax.set_xlabel('Kalıp konturu boyunca mesafe (mm) — kalıp başlangıcından', fontsize=11)
-    ax.set_ylabel('Et kalınlığı (kalıptan dış yüzeye, mm)', fontsize=11)
-    ax.grid(True, linestyle='--', alpha=0.5)
+    W = lambda a, mask: np.where(mask, a, np.nan)
     ax2 = ax.twinx()
-    ax2.plot(arc, np.where(m & p['formed'], red, np.nan), color=DISP_COLOR, linewidth=1.0, alpha=0.8,
-             label='İnceltme oranı (%)')
-    ax2.set_ylabel('İnceltme oranı (%)', color=DISP_COLOR, fontsize=11)
-    ax2.tick_params(axis='y', colors=DISP_COLOR)
-    ax2.set_ylim(0, 100)
+    if shear:
+        dev = np.where(fm & (T > 1e-9), (F - T) / np.where(T > 1e-9, T, 1) * 100, np.nan)
+        ax.plot(arc, W(T0, m), color=PF_COLOR, linewidth=1.5, linestyle='--', label='Ön form eksenel kalınlığı t₀')
+        ax.plot(arc, W(T, m), color=IDEAL_COLOR, linewidth=1.8, linestyle=(0, (4, 2)), label='İdeal (sinüs kuralı) t₀·sin α')
+        ax.plot(arc, W(F, fm), color=FINAL_COLOR, linewidth=2.4, label='Gerçek (takım boşluğu)')
+        ax.fill_between(arc, W(F, fm), W(T, fm), where=fm & (F < T), color=DISP_COLOR, alpha=0.25, label='Aşırı inceltme')
+        ax.fill_between(arc, W(F, fm), W(T, fm), where=fm & (F > T), color=UNDER_COLOR, alpha=0.25, label='Eksik inceltme')
+        ax2.plot(arc, W(dev, fm), color='#444', linewidth=0.9, alpha=0.8, label='Sapma (%) — + kalın / − ince')
+        ax2.axhline(0, color='#444', linewidth=0.6, linestyle=':')
+        ax2.set_ylabel('Sinüs kuralından sapma (%)', fontsize=11)
+        ax.set_title('Et Kalınlığı — Shear Forming (sinüs kuralı ile karşılaştırma)', fontsize=14, pad=12)
+    else:
+        dev = np.where(fm & (T > 1e-9), (T - F) / np.where(T > 1e-9, T, 1) * 100, np.nan)
+        ax.fill_between(arc, W(F, m), W(T, m), where=fm, color=DISP_COLOR, alpha=0.18, label='İnceltme')
+        ax.plot(arc, W(T, m), color=PF_COLOR, linewidth=1.6, linestyle='--', label='Ön form kalınlığı')
+        ax.plot(arc, W(F, m), color=FINAL_COLOR, linewidth=2.2, label='Son kalınlık')
+        ax2.plot(arc, W(dev, fm), color=DISP_COLOR, linewidth=1.0, alpha=0.8, label='İnceltme oranı (%)')
+        ax2.set_ylabel('İnceltme oranı (%)', color=DISP_COLOR, fontsize=11)
+        ax2.tick_params(axis='y', colors=DISP_COLOR)
+        ax2.set_ylim(0, 100)
+        ax.set_title('Et Kalınlığı Profili (Ön Form → Son Form)', fontsize=14, pad=12)
+    ax.set_xlabel('Kalıp konturu boyunca mesafe (mm) — kalıp başlangıcından', fontsize=11)
+    ax.set_ylabel('Et kalınlığı (kalıba dik, mm)', fontsize=11)
+    ax.grid(True, linestyle='--', alpha=0.5)
     h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, shadow=True)
-    ax.set_title('Et Kalınlığı Profili (Ön Form → Son Form)', fontsize=14, pad=12)
-    fm = m & p['formed']
-    lines = [f"**Ön form kalınlığı:** {np.nanmin(Ta):.3f} – {np.nanmax(Ta):.3f} mm"]
-    if fm.any():
-        lines += [f"**Formlanan bölge:** kalıp boyunca {arc[fm].min():.1f} – {arc[fm].max():.1f} mm",
-                  f"**Son kalınlık (formlanan bölgede):** en az {np.nanmin(F[fm]):.3f} mm, en çok {np.nanmax(F[fm]):.3f} mm, "
-                  f"ortalama {np.nanmean(F[fm]):.3f} mm",
-                  f"**En büyük inceltme:** %{np.nanmax(red[fm]):.1f} (kalıp boyunca {arc[fm][np.nanargmax(red[fm])]:.1f} mm)"]
+
+    lines = []
+    if shear:
+        al = p['alpha']
+        lines.append(f"**Model:** shear forming, sinüs kuralı (radyal eksen {fin.get('radial', 'X')}). "
+                     f"**Ön form eksenel kalınlığı t₀:** {np.nanmin(T0[m]):.3f} – {np.nanmax(T0[m]):.3f} mm")
+        if fm.any():
+            lines += [f"**Şekillenen bölge:** kalıp boyunca {arc[fm].min():.1f} – {arc[fm].max():.1f} mm "
+                      f"(kalıp açısı α {np.nanmin(al[fm]):.1f}° – {np.nanmax(al[fm]):.1f}°)",
+                      f"**Gerçek et kalınlığı:** {np.nanmin(F[fm]):.3f} – {np.nanmax(F[fm]):.3f} mm; "
+                      f"**ideal:** {np.nanmin(T[fm]):.3f} – {np.nanmax(T[fm]):.3f} mm"]
+            d = F[fm] - T[fm]
+            k_lo, k_hi = int(np.nanargmin(d)), int(np.nanargmax(d))
+            lines.append(f"**En büyük aşırı inceltme:** {min(d[k_lo], 0):+.3f} mm (kalıp boyunca {arc[fm][k_lo]:.1f} mm) — "
+                         f"**en büyük eksik inceltme:** {max(d[k_hi], 0):+.3f} mm (kalıp boyunca {arc[fm][k_hi]:.1f} mm)")
+        else:
+            lines.append("**Takım ön form kalınlığından daha dar bir boşlukla hiç geçmedi** — şekillenme yok.")
+        cols = ['Kalıp boyunca (mm)', 'X', 'Y', 'Kalıp açısı α (°)', 't₀ eksenel (mm)', 'İdeal t₀·sin α (mm)',
+                'Gerçek (mm)', 'Sapma (mm)', 'Sapma (%)']
     else:
-        lines.append("**Takım ön forma hiç girmedi** — form oluşmadı.")
+        lines.append(f"**Model:** kalıp üzerinde. **Ön form kalınlığı:** {np.nanmin(T[m]):.3f} – {np.nanmax(T[m]):.3f} mm")
+        if fm.any():
+            lines += [f"**Formlanan bölge:** kalıp boyunca {arc[fm].min():.1f} – {arc[fm].max():.1f} mm",
+                      f"**Son kalınlık:** en az {np.nanmin(F[fm]):.3f} mm, en çok {np.nanmax(F[fm]):.3f} mm, "
+                      f"ortalama {np.nanmean(F[fm]):.3f} mm",
+                      f"**En büyük inceltme:** %{np.nanmax(dev[fm]):.1f} (kalıp boyunca {arc[fm][np.nanargmax(dev[fm])]:.1f} mm)"]
+        else:
+            lines.append("**Takım ön forma hiç girmedi** — form oluşmadı.")
+        cols = ['Kalıp boyunca (mm)', 'X', 'Y', 'Ön form (mm)', 'Son (mm)', 'İnceltme (%)']
     idx = np.where(m)[0]
     keep, last = [], -1e18
     for j in idx:
         if arc[j] - last >= step_mm - 1e-9:
             keep.append(j); last = arc[j]
-    df = pd.DataFrame({cols[0]: np.round(arc[keep], 3), cols[1]: np.round(p['x'][keep], 3),
-                       cols[2]: np.round(p['y'][keep], 3), cols[3]: np.round(T[keep], 4),
-                       cols[4]: np.round(F[keep], 4), cols[5]: np.round(np.nan_to_num(red[keep]), 2)})
+    r = lambda a, n=4: np.round(a[keep], n)
+    if shear:
+        df = pd.DataFrame({cols[0]: r(arc, 3), cols[1]: r(p['x'], 3), cols[2]: r(p['y'], 3),
+                           cols[3]: r(p['alpha'], 2), cols[4]: r(T0), cols[5]: r(T), cols[6]: r(F),
+                           cols[7]: np.round((F - T)[keep], 4), cols[8]: np.round(dev[keep], 2)})
+    else:
+        df = pd.DataFrame({cols[0]: r(arc, 3), cols[1]: r(p['x'], 3), cols[2]: r(p['y'], 3),
+                           cols[3]: r(T), cols[4]: r(F), cols[5]: np.round(np.nan_to_num(dev[keep]), 2)})
     return fig_to_svg_card(fig), "  \n".join(lines), df
 
 
@@ -2068,6 +2245,7 @@ def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, prefor
                      'xname': opts['xname'], 'yname': opts['yname'],
                      'show_env': opts['show_env'], 'env_limit': opts['env_limit']},
             'preform': {'use': opts['pf_use'], 'dx': opts['pf_dx'], 'dy': opts['pf_dy'],
+                        'model': opts['pf_model'], 'radial': opts['pf_radial'],
                         'selected': opts['pf_layers'],
                         'name': (preform or {}).get('name'),
                         'layers': {k: [[[round(x, 4), round(y, 4)] for x, y in pl] for pl in v]
@@ -2111,9 +2289,13 @@ def json_dict_to_updates(data, gr_update):
         st = {'name': pf.get('name') or 'ön form', 'layers': pf['layers']}
         sel = [k for k in (pf.get('selected') or []) if k in st['layers']] or list(st['layers'])
         ups.append(gr_update(choices=preform_layer_choices(st), value=sel))
-        ups.append(st)                                  # gr.State: değer doğrudan verilir
     else:
         ups.append(gr_update())
+    for key in ('model', 'radial'):
+        ups.append(pick(pf, key))
+    if pf.get('layers'):
+        ups.append(st)                                  # gr.State: değer doğrudan verilir
+    else:
         ups.append(gr_update())                         # State değişmez
     return ups
 
@@ -2277,11 +2459,12 @@ function upperBound(A,x){var lo=0,hi=A.length; while(lo<hi){var m=(lo+hi)>>1; if
 function envAt(ch){ var j=upperBound(EV.S[ch].t,t+1e-9), c=Math.floor(j/CP), ca=envCache[ch];
   if(ca.j===j) return ca.a; var a=envCk[ch][c].slice(); applySamples(a,ch,c*CP,j); ca.j=j; ca.a=a; return a; }
 // ön form (varsa): ışın başına lokal malzeme kalınlığı (T) ve malzemenin olduğu taraf (SD)
-var HASPF=!!(EV&&EV.T), Ta=null, SD=null;
-if(HASPF){ Ta=new Float64Array(EV.T); SD=new Int8Array(EV.sd); }
+var HASPF=!!(EV&&EV.T), SHEAR=!!(EV&&EV.mode==='shear'), Ta=null, SD=null, TI=null;
+if(HASPF){ Ta=new Float64Array(EV.T); SD=new Int8Array(EV.sd); if(SHEAR) TI=new Float64Array(EV.Ti); }
 function okv(i,v,L){
   if(!isFinite(v)) return false;
-  if(HASPF){ var T=Ta[i]; if(!(T>0)) return false; if(v!==0 && ((v>0)!==(SD[i]>0))) return false; return Math.abs(v)<T-1e-6; }
+  if(HASPF){ var T=Ta[i]; if(!(T>0)) return false; if(v!==0 && ((v>0)!==(SD[i]>0))) return false;
+    return SHEAR ? Math.abs(v)<=T+1e-9 : Math.abs(v)<T-1e-6; }
   return Math.abs(v)<=L;
 }
 function runs(ok,px,py,brk){ var out=[], cur=[];
@@ -2297,15 +2480,26 @@ function drawEnv(X,Y){
   var F=null, BRK=Math.max(2,0.5*(EV.medT||EV.lim[0]));
   if(HASPF){
     F=new Float64Array(NM);
-    for(var i=0;i<NM;i++){ var T=Ta[i]; if(!(T>0)){F[i]=NaN;continue;} var u=T;
-      for(var c1=0;c1<NC;c1++){ var v=SS[c1][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } F[i]=u; }
+    for(var i=0;i<NM;i++){ var T=Ta[i]; if(!(T>0)){F[i]=NaN;continue;} var u=SHEAR?Infinity:T;
+      for(var c1=0;c1<NC;c1++){ var v=SS[c1][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } F[i]=isFinite(u)?u:NaN; }
     var fx=function(i){return Mx[i]+Nx[i]*SD[i]*F[i];}, fy=function(i){return My[i]+Ny[i]*SD[i]*F[i];};
-    var ox=function(i){return Mx[i]+Nx[i]*SD[i]*Ta[i];}, oy=function(i){return My[i]+Ny[i]*SD[i]*Ta[i];};
     var mx=function(i){return Mx[i];}, my=function(i){return My[i];};
-    var has=function(i){return Ta[i]>0;}, frm=function(i){return Ta[i]>0 && F[i]<Ta[i]-1e-6;};
-    var RF=runs(has,fx,fy,BRK), RD=runs(frm,fx,fy,BRK);
-    ctx.fillStyle='rgba(31,58,95,0.10)'; RF.forEach(function(r){ctx.beginPath(); polyPath(r,fx,fy,X,Y,[mx,my]); ctx.fill();});
-    ctx.fillStyle='rgba(214,39,40,0.20)'; RD.forEach(function(r){ctx.beginPath(); polyPath(r,ox,oy,X,Y,[fx,fy]); ctx.fill();});
+    var has=function(i){return Ta[i]>0 && isFinite(F[i]);};
+    var RF=runs(has,fx,fy,BRK);
+    ctx.fillStyle='rgba(47,127,216,0.38)'; RF.forEach(function(r){ctx.beginPath(); polyPath(r,fx,fy,X,Y,[mx,my]); ctx.fill();});
+    if(SHEAR){
+      var ix=function(i){return Mx[i]+Nx[i]*SD[i]*TI[i];}, iy=function(i){return My[i]+Ny[i]*SD[i]*TI[i];};
+      var ov=function(i){return has(i) && F[i]<TI[i]-0.01;}, un=function(i){return has(i) && F[i]>TI[i]+0.01;};
+      ctx.fillStyle='rgba(214,39,40,0.32)'; runs(ov,fx,fy,BRK).forEach(function(r){ctx.beginPath(); polyPath(r,ix,iy,X,Y,[fx,fy]); ctx.fill();});
+      ctx.fillStyle='rgba(255,127,14,0.32)'; runs(un,fx,fy,BRK).forEach(function(r){ctx.beginPath(); polyPath(r,fx,fy,X,Y,[ix,iy]); ctx.fill();});
+      ctx.strokeStyle='#6a3d9a'; ctx.lineWidth=1.6; ctx.setLineDash([4,2]);
+      runs(function(i){return Ta[i]>0 && TI[i]>1e-6;},ix,iy,BRK).forEach(function(r){ctx.beginPath(); polyPath(r,ix,iy,X,Y,null); ctx.stroke();});
+      ctx.setLineDash([]);
+    } else {
+      var ox=function(i){return Mx[i]+Nx[i]*SD[i]*Ta[i];}, oy=function(i){return My[i]+Ny[i]*SD[i]*Ta[i];};
+      var frm=function(i){return Ta[i]>0 && F[i]<Ta[i]-1e-6;};
+      ctx.fillStyle='rgba(214,39,40,0.28)'; runs(frm,fx,fy,BRK).forEach(function(r){ctx.beginPath(); polyPath(r,ox,oy,X,Y,[fx,fy]); ctx.fill();});
+    }
     ctx.strokeStyle='#7f7f7f'; ctx.lineWidth=1.3; ctx.setLineDash([8,3,2,3]);
     (EV.pf||[]).forEach(function(pl){ ctx.beginPath(); for(var q=0;q<pl.length;q+=2){ if(q) ctx.lineTo(X(pl[q]),Y(pl[q+1])); else ctx.moveTo(X(pl[q]),Y(pl[q+1])); } ctx.stroke(); });
     ctx.setLineDash([]);
@@ -2319,11 +2513,11 @@ function drawEnv(X,Y){
     R.forEach(function(r){ var cur=[r[0]]; for(var q=1;q<r.length;q++){ var a=s[r[q]], b=s[r[q-1]];
         if(a!==0&&b!==0&&((a>0)!==(b>0))){ if(cur.length>1) R2.push(cur); cur=[]; } cur.push(r[q]); } if(cur.length>1) R2.push(cur); });
     R2.forEach(function(r){
-      if(!HASPF){ ctx.beginPath(); polyPath(r,ex,ey,X,Y,[function(i){return Mx[i];},function(i){return My[i];}]); ctx.fillStyle=hex2rgba(col,0.16); ctx.fill(); }
+      if(!HASPF){ ctx.beginPath(); polyPath(r,ex,ey,X,Y,[function(i){return Mx[i];},function(i){return My[i];}]); ctx.fillStyle=hex2rgba(col,0.32); ctx.fill(); }
       ctx.beginPath(); polyPath(r,ex,ey,X,Y,null); ctx.setLineDash([6,3]); ctx.strokeStyle=col; ctx.lineWidth=1.8; ctx.stroke(); ctx.setLineDash([]); });
   })(ch); }
   if(HASPF){ ctx.strokeStyle='#1f3a5f'; ctx.lineWidth=2.2;
-    runs(function(i){return Ta[i]>0;},function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},BRK)
+    runs(function(i){return Ta[i]>0 && isFinite(F[i]);},function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},BRK)
       .forEach(function(r){ ctx.beginPath(); polyPath(r,function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},X,Y,null); ctx.stroke(); }); }
 }
 
@@ -2354,7 +2548,7 @@ function updateCNC(){
     var cd=cards[i], B=c.B, k=blockAt(B,t), L=c.L;
     var b=(k>=0)?B[k]:null, done=(!b)||(k===B.length-1&&t>b[1]+1e-6);
     var cur=-1, px=0, py=0, rx=0, ry=0, rem=0, status='', remLbl='Yol', remTxt='';
-    if(!b){ status='—'; }
+    if(!b){ status='—'; if(c.p0){ px=c.p0[0]; py=c.p0[1]; } }
     else {
       cur=(b[2]===null)?-1:b[2];
       var code=b[3], f=(b[1]>b[0])?Math.min(Math.max((t-b[0])/(b[1]-b[0]),0),1):1; if(done) f=1;
@@ -2436,7 +2630,12 @@ function draw(){
   for(var qq=0;qq<D.col.length;qq++) leg(D.col[qq],'Kanal '+(qq+1)+' — kontur',lgy+28+qq*20);
   if(EV&&envC.checked){ for(var qe=0;qe<NC;qe++){ ctx.setLineDash([6,3]); leg(EV.col[qe],'Kanal '+(qe+1)+' — radüs izi',lgy+28+(D.col.length+qe)*20); ctx.setLineDash([]); }
     if(HASPF){ var yb=lgy+28+(D.col.length+NC)*20; ctx.setLineDash([8,3,2,3]); leg('#7f7f7f','Ön form (DXF)',yb); ctx.setLineDash([]);
-      leg('#1f3a5f','Son form yüzeyi',yb+20); ctx.fillStyle='rgba(214,39,40,0.35)'; ctx.fillRect(lgx,yb+36,22,8); ctx.fillStyle='#222'; ctx.fillText('Akıtılan malzeme',lgx+28,yb+44); } }
+      leg('#1f3a5f',SHEAR?'Gerçek son yüzey':'Son form yüzeyi',yb+20);
+      var box=function(c,txt,y){ ctx.fillStyle=c; ctx.fillRect(lgx,y,22,8); ctx.fillStyle='#222'; ctx.fillText(txt,lgx+28,y+8); };
+      box('rgba(47,127,216,0.55)','Et (kalıp–yüzey)',yb+36);
+      if(SHEAR){ ctx.setLineDash([4,2]); leg('#6a3d9a','İdeal (t₀·sin α)',yb+60); ctx.setLineDash([]);
+        box('rgba(214,39,40,0.5)','Aşırı inceltme',yb+72); box('rgba(255,127,14,0.5)','Eksik inceltme',yb+88); }
+      else box('rgba(214,39,40,0.45)','Akıtılan malzeme',yb+52); } }
 }
 function ui(){tm.value=Math.round(t/D.T*10000); tv.textContent=t.toFixed(2)+' / '+D.T.toFixed(2)+' s'; updatePanel(); updateCNC();}
 function setT(nt){t=nt; measStep(); draw(); ui();}
@@ -2508,7 +2707,7 @@ def build_block_table(segs, timeline, total_time):
     return blocks
 
 
-def player_cnc_data(cfg, channels_segments, timelines, total_time):
+def player_cnc_data(cfg, channels_segments, timelines, total_time, start_points=None):
     out = []
     for i in range(N_CH):
         ch = cfg['channels'][i]
@@ -2517,7 +2716,8 @@ def player_cnc_data(cfg, channels_segments, timelines, total_time):
         out.append({'L': (ch['code'] or '').strip().split('\n'),
                     'B': build_block_table(channels_segments[i], timelines[i], total_time),
                     'fx': 2 if (dia and 'X' in ax) else 1, 'fy': 2 if (dia and 'Y' in ax) else 1,
-                    'yo': round(float(ch.get('y_offset', 0.0)), 4)})
+                    'yo': round(float(ch.get('y_offset', 0.0)), 4),
+                    'p0': [round(float(v), 4) for v in (start_points[i] if start_points else (ch['x0'], ch['y0']))]})
     return out
 
 
@@ -2538,6 +2738,10 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
            'col': CHANNEL_ENV_COLORS[:N_CH], 'show': bool(show)}
     fin = (form or {}).get('final')
     if fin is not None and len(fin['T']) == len(M):
+        out['mode'] = fin.get('mode', 'flow')
+        if fin.get('Ti') is not None:
+            Ti = np.asarray(fin['Ti'], float)
+            out['Ti'] = [round(float(v), 4) if np.isfinite(v) else -1.0 for v in Ti]
         T = np.asarray(fin['T'], float)
         has = np.isfinite(T)
         out['T'] = [round(float(v), 4) if h else -1.0 for v, h in zip(T, has)]
@@ -2614,18 +2818,40 @@ def _plot_kw(opts):
                 label_font=opts['label_font'], label_shift=opts['label_shift'])
 
 
-def _preform(opts):
-    """Kullanılacak ön form zincirleri (yüklü ve 'kullan' işaretliyse)."""
+def _preform(opts, cfg=None):
+    """Kullanılacak ön form (yüklü ve 'kullan' işaretliyse): zincirler + model + radyal eksen."""
     st = opts.get('pf_state')
     if not opts.get('pf_use') or not st or not st.get('layers'):
         return None
     chains = preform_chains(st, opts.get('pf_layers'), opts.get('pf_dx', 0.0), opts.get('pf_dy', 0.0))
-    return {'chains': chains} if chains else None
+    if not chains:
+        return None
+    radial, why = resolve_radial(opts.get('pf_radial', 'auto'), cfg or {})
+    return {'chains': chains, 'model': opts.get('pf_model', 'shear'), 'radial': radial, 'radial_why': why}
 
 
-def _envelopes(timelines, radii, mold_pts, opts, force=False):
+def _pf_note(opts, cfg, form):
+    if not (opts.get('pf_state') and opts.get('pf_use')):
+        return ""
+    if not (form and form.get('final')):
+        return "\nÖn form seçili ama kullanılabilir çizgi bulunamadı (katman seçimini kontrol et)."
+    fin = form['final']
+    if fin.get('mode') == 'shear':
+        pf = _preform(opts, cfg)
+        closed = any(cl for _A, cl in form['pf_chains'])
+        msg = (f"\nÖn form: shear forming (sinüs kuralı t₀·sin α), radyal eksen {pf['radial']} ({pf['radial_why']}). "
+               "Kalınlık yalnız DXF'teki ön formdan alındı (Et Kalınlığı sekmesi).")
+        if not closed:
+            msg += "\nUYARI: Shear forming için ön form KAPALI kontur olmalı (eksenel kalınlık okunamadı)."
+        elif not np.isfinite(fin['T']).any():
+            msg += "\nUYARI: Ön formun radyal aralığı kalıpla örtüşmüyor — radyal ekseni kontrol et."
+        return msg
+    return "\nÖn form: kalıp üzerinde modeli — radüs izi lokal malzeme kalınlığıyla sınırlandı (Et Kalınlığı sekmesi)."
+
+
+def _envelopes(timelines, radii, mold_pts, opts, force=False, cfg=None):
     """Radüs izi + (varsa) ön forma göre son form. Gösterim kapalı, ön form yok ve zorlanmadıysa hesaplanmaz."""
-    pf = _preform(opts)
+    pf = _preform(opts, cfg)
     if (not opts['show_env'] and not force and pf is None) or len(mold_pts) < 2:
         return None
     return compute_form(timelines, radii, mold_pts, opts['env_limit'], pf)
@@ -2661,7 +2887,7 @@ def run_all(*vals):
                                         opts['xname'], opts['yname'])
         frame0 = render_frame_image(token, 0)
 
-        form = _envelopes(timelines, radii, mold_pts, opts)
+        form = _envelopes(timelines, radii, mold_pts, opts, cfg=cfg)
         comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, form)
         table = distance_table(segs, mold_pts)
         th_html, th_md, th_df = thickness_profile(form)
@@ -2669,7 +2895,7 @@ def run_all(*vals):
         try:
             env_d = (player_env_data(timelines, radii, mold_pts, [opts['env_limit']] * N_CH, opts['show_env'],
                                      form=form) if len(mold_pts) > 1 else None)
-            cnc_d = player_cnc_data(cfg, segs, timelines, total_time)
+            cnc_d = player_cnc_data(cfg, segs, timelines, total_time, starts)
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
                                                               xname=opts['xname'], yname=opts['yname'],
@@ -2679,9 +2905,7 @@ def run_all(*vals):
 
         status = (note + "\n" if note else "") + \
                  (f"Simülasyon hazır. Toplam süre: {total_time:.2f} sn — animasyon kare sayısı: {n_frames}")
-        if opts.get('pf_state') and opts.get('pf_use'):
-            status += ("\nÖn form kullanıldı — radüs izi lokal malzeme kalınlığıyla sınırlandı (Et Kalınlığı sekmesi)."
-                       if form and form.get('final') else "\nÖn form seçili ama kullanılabilir çizgi bulunamadı (katman seçimini kontrol et).")
+        status += _pf_note(opts, cfg, form)
         return (frame0,
                 gr.update(minimum=0, maximum=n_frames, value=0),
                 gr.update(value=playback_interval(fps, speed), active=False),
@@ -2699,7 +2923,7 @@ def redraw_plots(*vals):
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
-        form = _envelopes(timelines, radii, mold_pts, opts)
+        form = _envelopes(timelines, radii, mold_pts, opts, cfg=cfg)
         comp, ind = _static_plots(segs, starts, radii, mold_pts, opts, form)
         th_html, th_md, th_df = thickness_profile(form)
         return comp, ind[0], ind[1], ind[2], th_html, th_md, th_df, "Grafikler güncellendi."
@@ -2803,7 +3027,7 @@ def make_dxf(*vals):
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
             total_time = 1.0
-        envs = (_envelopes(timelines, radii, mold_pts, opts, force=True)
+        envs = (_envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg)
                 if {'envelope', 'preform', 'final'} & set(layers) else None)
         end_used = ac_e if ac_e > ac_s else total_time
         txt, summary = build_dxf_text(layers, segs, radii, mold_pts, timelines, total_time,
@@ -2937,14 +3161,18 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                           info="Kalıba bundan uzak kalan yerlerde iz çizilmez. 0 = takım yarıçapı.")
 
             with gr.Accordion("Ön form (DXF) — lokal malzeme kalınlığı", open=False):
-                gr.Markdown("Ön formun kesitini **kalıp koordinatlarında** DXF olarak yükle. Kalıbın her noktasında "
-                            "ön formun dış yüzeyine olan mesafe o noktadaki malzeme kalınlığı olur; radüs izi sabit "
-                            "sınır yerine bu kalınlıkla sınırlanır. Son form yüzeyi 3 kanalın en derin girdiği yerdir. "
-                            "En iyi sonuç için ön formu **kapalı kontur** (iç ve dış yüzey) olarak çiz; tek bir dış yüzey "
-                            "çizgisi de kabul edilir. Okunan nesneler: LINE, POLYLINE, LWPOLYLINE, ARC, CIRCLE, ELLIPSE, SPLINE "
-                            "(bloklar için EXPLODE).")
+                gr.Markdown("Ön formun kesitini **kalıp koordinatlarında**, **kapalı kontur** (iç + dış yüzey) olarak "
+                            "DXF'e çizip yükle. **Shear forming** modelinde kalınlık yalnız DXF'ten alınır: her yarıçapta "
+                            "ön formun eksen yönündeki kalınlığı t₀ okunur, malzeme aynı yarıçapta kalıba sıvanır ve "
+                            "ideal et kalınlığı **t₀·sin α** olur (α: kalıp yüzeyi ile dönme ekseni arası açı). Gerçek et "
+                            "kalınlığı takım boşluğudur; fark aşırı / eksik inceltme olarak gösterilir. "
+                            "Okunan nesneler: LINE, POLYLINE, LWPOLYLINE, ARC, CIRCLE, ELLIPSE, SPLINE (bloklar için EXPLODE).")
                 pf_file = gr.File(label="Ön form DXF yükle", file_types=[".dxf"], file_count="single")
                 pf_layers = gr.CheckboxGroup(choices=[], value=[], label="Kullanılacak DXF katmanları")
+                pf_model = gr.Dropdown(PF_MODEL_CHOICES, value='shear', label="Ön form modeli")
+                pf_radial = gr.Dropdown(PF_RADIAL_CHOICES, value='auto', label="Radyal eksen (shear forming için)",
+                                        info="Malzeme aynı yarıçapta kalarak kalıba sıvanır; sin α kalıp yüzeyinin "
+                                             "dönme ekseniyle açısından hesaplanır.")
                 with gr.Row():
                     pf_use = gr.Checkbox(value=True, label="Ön formu kullan")
                     pf_dx = gr.Number(value=0.0, label="Ön form kaydırma X (mm)")
@@ -3025,8 +3253,9 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                             ind3 = gr.HTML()
 
                 with gr.Tab("📊 Et Kalınlığı"):
-                    gr.Markdown("Ön form yüklüyse: kalıp konturu boyunca ön form kalınlığı, son kalınlık (3 kanalın "
-                                "birleşik etkisi) ve inceltme oranı. Kalınlık = kalıptan dış yüzeye mesafe.")
+                    gr.Markdown("Ön form yüklüyse, kalıp konturu boyunca et kalınlığı (kalıba dik). Shear forming modelinde: "
+                                "ön form eksenel kalınlığı t₀, ideal t₀·sin α ve gerçek kalınlık (3 kanalın en dar takım "
+                                "boşluğu) ile sapma; + değer sinüs kuralından kalın (eksik inceltme), − değer ince (aşırı inceltme).")
                     thick_html = gr.HTML()
                     thick_md = gr.Markdown()
                     thick_df = gr.DataFrame(label="Kalınlık tablosu (~1 mm aralıkla)")
@@ -3052,7 +3281,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
 
     # ---------------- OLAYLAR ----------------
     opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit,
-                 pf_use, pf_dx, pf_dy, pf_layers]                              # sıra: opts_from_values
+                 pf_use, pf_dx, pf_dy, pf_layers, pf_model, pf_radial]         # sıra: opts_from_values
     all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps + [pf_state]
 
     run_btn.click(
@@ -3066,7 +3295,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
         _c.release(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
     for _c in (x_name, y_name, env_limit, pf_dx, pf_dy):
         _c.submit(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
-    for _c in (show_env, pf_use, pf_layers):
+    for _c in (show_env, pf_use, pf_layers, pf_model, pf_radial):
         _c.input(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
 
     # ön form DXF
