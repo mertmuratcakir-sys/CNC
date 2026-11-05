@@ -719,7 +719,7 @@ def opts_from_values(v):
             'pf_use': True if v[6] is None else bool(v[6]),
             'pf_dx': _num(v[7], 0.0), 'pf_dy': _num(v[8], 0.0),
             'pf_layers': list(v[9]) if isinstance(v[9], (list, tuple)) else [],
-            'pf_model': v[10] if v[10] in ('shear', 'flow') else 'shear',
+            'pf_model': v[10] if v[10] in ('strip', 'shear', 'flow') else 'strip',
             'pf_radial': v[11] if v[11] in ('auto', 'X', 'Y') else 'auto',
             'pf_sim': bool(v[12]) if v[12] is not None else False}
 
@@ -822,11 +822,41 @@ def _is_g0(seg):
     return seg.get('feed', 1000.0) >= 3000.0          # eski segmentler için yedek kural
 
 
-def _plot_limits(mold_points, start_points, radii, margin_mult):
-    all_x = [p[0] for p in mold_points] + [s[0] for s in start_points]
-    all_y = [p[1] for p in mold_points] + [s[1] for s in start_points]
-    margin = max(15.0, max(radii) * margin_mult)
+def _plot_limits(mold_points, start_points, radii, margin_mult, segs=None, extra=None):
+    act = [any(s.get('type') in ('move', 'dwell') for s in sg) for sg in segs] if segs else [True] * len(start_points)
+    sp = [p for p, a in zip(start_points, act) if a]
+    all_x = [p[0] for p in mold_points] + [s[0] for s in sp]
+    all_y = [p[1] for p in mold_points] + [s[1] for s in sp]
+    for P in (extra or []):
+        P = np.asarray(P, float)
+        if len(P):
+            all_x.extend(P[:, 0]); all_y.extend(P[:, 1])
+    if segs:
+        for sg, a in zip(segs, act):
+            if not a:
+                continue
+            for s in sg:
+                if s.get('type') == 'move' and not _is_g0(s) and s.get('orig_points'):
+                    P = np.asarray(s['orig_points'], float)
+                    all_x.extend(P[:, 0]); all_y.extend(P[:, 1])
+    ra = [r for r, a in zip(radii, act) if a] or [0.0]
+    margin = max(5.0, max(ra) * margin_mult * 0.5)
     return (min(all_x) - margin, max(all_x) + margin), (min(all_y) - margin, max(all_y) + margin)
+
+
+def _form_extra(form):
+    """Grafik sınırlarına eklenecek ön form ve ürün noktaları."""
+    out = []
+    if not form:
+        return out
+    out += [A for A, _cl in form.get('pf_chains') or []]
+    sm = (form.get('final') or {}).get('sim')
+    if sm and sm.get('ok') and sm.get('final') is not None:
+        f = sm['final']
+        polys = ([f.get('stay')] + [P for g in f['groups'] for P in (g['wall'], g.get('rem'))]) if 'groups' in f \
+            else [f.get('wall'), f.get('rem')]
+        out += [P for P in polys if P is not None]
+    return out
 
 
 def _mold_closest_fn(mold_points):
@@ -1044,11 +1074,13 @@ def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xna
         if envelopes:
             _draw_envelope(ax, envelopes[i], CHANNEL_ENV_COLORS[i], f'Kanal {i+1} - Radüs İzi (Form Yüzeyi)',
                            fill=not (form and form.get('final')))
+        if not any(_s.get('type') in ('move', 'dwell') for _s in channels_segments[i]):
+            continue
         sx, sy = start_points[i]
         ax.plot(sx, sy, 'o', color=CHANNEL_COLORS[0], markersize=8,
                 label=f'Kanal {i+1} Başlangıç ({sx:.1f}, {sy:.1f})')
 
-    xl, yl = _plot_limits(mold_points, start_points, radii, 3.0)
+    xl, yl = _plot_limits(mold_points, start_points, radii, 3.0, channels_segments, _form_extra(form))
     ax.set_xlim(*xl)
     ax.set_ylim(*yl)
     ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0), borderaxespad=0, fontsize=9, shadow=True)
@@ -1140,7 +1172,8 @@ def _place_distance_labels(fig, ax, labels, polylines, fontsize=7, shift=0.0):
 def plot_channel_fig(i, channels_segments, start_points, radii, mold_points,
                      xname='X', yname='Y', label_font=7.0, label_shift=0.0, envelope=None, pf_chains=None):
     closest = _mold_closest_fn(mold_points)
-    xl, yl = _plot_limits(mold_points, start_points, radii, 3.0)
+    xl, yl = _plot_limits(mold_points, start_points, radii, 3.0, channels_segments,
+                          [A for A, _cl in (pf_chains or [])])
 
     fig = Figure(figsize=(16, 11), dpi=100)
     ax = fig.add_subplot(111)
@@ -1404,7 +1437,10 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
     if 'product' in layers:
         if _sm and _sm.get('ok') and _sm.get('final') is not None:
             w.layer('URUN', 4)
-            for P in (_sm['final'].get('wall'), _sm['final'].get('bridge'), _sm['final'].get('rem')):
+            _f = _sm['final']
+            _ps = ([_f.get('stay')] + [P for g in _f['groups'] for P in (g['wall'], g.get('bridge'), g.get('rem'))]
+                   if 'groups' in _f else [_f.get('wall'), _f.get('bridge'), _f.get('rem')])
+            for P in _ps:
                 if P is not None:
                     w.polyline('URUN', P)
         else:
@@ -1668,17 +1704,11 @@ def load_preform_file(path):
     if not res['layers']:
         extra = (" Okunmayan nesneler: " + ", ".join(f"{k}×{v}" for k, v in res['skipped'].items())) if res['skipped'] else ""
         raise ValueError("DXF'te okunabilir çizgi bulunamadı (LINE/POLYLINE/ARC/SPLINE...)." + extra)
-    scale, unit_note = 1.0, "mm kabul edildi"
-    if res['units'] == 1:
-        scale, unit_note = 25.4, "inç → mm çevrildi"
-    elif res['units'] == 5:
-        scale, unit_note = 10.0, "cm → mm çevrildi"
-    elif res['units'] == 6:
-        scale, unit_note = 1000.0, "m → mm çevrildi"
-    elif res['units'] == 4:
-        unit_note = "mm"
-    if scale != 1.0:
-        res['layers'] = {k: [[[x * scale, y * scale] for x, y in pl] for pl in v] for k, v in res['layers'].items()}
+    # Koordinatlar her zaman mm kabul edilir (kalıp koordinatlarına uyacak şekilde çizildiği için).
+    # Başlıktaki birim ($INSUNITS) çoğu şablonda yanlış kalır (ör. AutoCAD Mechanical ANSI şablonu = inç),
+    # bu yüzden ölçekleme YAPILMAZ; sadece bilgi verilir.
+    _u = {0: 'birimsiz', 1: 'inç', 2: 'feet', 4: 'mm', 5: 'cm', 6: 'm'}.get(res['units'], str(res['units']))
+    unit_note = "mm" if res['units'] in (None, 0, 4) else f"mm kabul edildi (DXF başlığında '{_u}' yazıyor, ölçekleme yapılmadı)"
     state = {'name': os.path.basename(path), 'layers': res['layers']}
     msg = (f"Ön form yüklendi: {state['name']} — birim: {unit_note}. Nesneler: "
            + ", ".join(f"{k}×{v}" for k, v in res['counts'].items())
@@ -1801,7 +1831,8 @@ def _chunks_from_mask(ok, pts, brk):
 
 
 PF_MODEL_CHOICES = [
-    ('Shear forming (sıvama + inceltme): sinüs kuralı  t = t₀·sin α — kalınlık yalnız DXF\'ten', 'shear'),
+    ('Sac ön form (sıvama + inceltme): kalınlık = sacın kendi kalınlığı (DXF), malzeme sac boyunca akar', 'strip'),
+    ('Shear forming (disk/koni ön form): sinüs kuralı  t = t₀·sin α', 'shear'),
     ('Kalıp üzerinde (flow forming): kalınlık = kalıptan ön form dış yüzeyine', 'flow'),
 ]
 PF_RADIAL_CHOICES = [
@@ -1882,7 +1913,12 @@ def compute_form(timelines, radii, mold_points, limit, preform=None):
         return {'ch': ch, 'final': None, 'pf_chains': []}
     seg = np.r_[0.0, np.hypot(*(M[1:] - M[:-1]).T)]
     arc = np.cumsum(seg)
-    if pf.get('model', 'shear') == 'shear':
+    model = pf.get('model', 'strip')
+    if model == 'strip':
+        out = _form_strip(M, Nrm, fan, S, chains, pf.get('radial', 'Y'), arc, timelines, radii,
+                          bool(pf.get('sim')))
+        return out
+    if model == 'shear':
         out = _form_shear(M, Nrm, fan, S, chains, pf.get('radial', 'Y'), arc)
     else:
         out = _form_flow(M, Nrm, fan, S, chains, arc)
@@ -1900,6 +1936,291 @@ def compute_form(timelines, radii, mold_points, limit, preform=None):
             sim['F'], sim['formed'] = Fs, fs
             sim['final'] = sim_state(fin, sim, Fs, fs)
     return out
+
+
+# -------------------------------------------------------------
+# SAC ÖN FORM MODELİ (sıvama + inceltme)
+#  Ön form ince bir sactır: kapalı konturdan orta hat + lokal kalınlık çıkarılır (yalnız DXF'ten).
+#  Malzeme koordinatı = sac orta hattı boyunca yay uzunluğu σ. Makaranın geçtiği yerde sac kalıba
+#  sıvanır, kalınlık = min(takım boşluğu, sac kalınlığı). Her pas (ışınların ilk şekillendiği zamanın
+#  sırasına göre yönü bulunur) kendi başlangıç kesitinden malzeme tüketir; kalan sac, o pasın ucuna
+#  hacim korunarak taşınır (uçta uzama). Paslar arasındaki dokunulmamış sac yerinde kalır.
+# -------------------------------------------------------------
+STRIP_TOL = 1.0          # takım boşluğu ≤ (en büyük sac kalınlığı + bu pay) ise makara saca iş yapıyor (mm)
+
+
+def _densify_closed(P, step):
+    out = []
+    for a_, b_ in zip(P[:-1], P[1:]):
+        L = float(np.hypot(*(b_ - a_)))
+        n = max(int(np.ceil(L / step)), 1)
+        for k in range(n):
+            out.append(a_ + (b_ - a_) * k / n)
+    out.append(P[-1])
+    return np.asarray(out)
+
+
+def _resample(P, n):
+    d = np.r_[0.0, np.cumsum(np.hypot(*(P[1:] - P[:-1]).T))]
+    u = np.linspace(0, d[-1], n)
+    return np.c_[np.interp(u, d, P[:, 0]), np.interp(u, d, P[:, 1])]
+
+
+def _project_on_polyline(Q, P):
+    """Q noktalarının P çoklu çizgisi üzerindeki en yakın noktası ve P boyunca parametresi."""
+    A, AB = P[:-1], P[1:] - P[:-1]
+    L2 = np.maximum((AB ** 2).sum(1), 1e-18)
+    segl = np.sqrt(L2)
+    cum = np.r_[0.0, np.cumsum(segl)]
+    out = np.empty_like(Q); par = np.empty(len(Q))
+    for a_ in range(0, len(Q), 256):
+        q = Q[a_:a_ + 256]
+        t = np.clip(((q[:, None, :] - A[None]) * AB[None]).sum(2) / L2[None], 0, 1)
+        pr = A[None] + t[..., None] * AB[None]
+        d2 = ((pr - q[:, None, :]) ** 2).sum(2)
+        k = d2.argmin(1); r = np.arange(len(q))
+        out[a_:a_ + 256] = pr[r, k]
+        par[a_:a_ + 256] = cum[k] + t[r, k] * segl[k]
+    return out, par
+
+
+def strip_from_polygon(poly, ri, n=900):
+    """Kapalı ince sac konturundan: iki yüzey (A, B), orta hat, kalınlık ve kümülatif hacim tablosu."""
+    P = np.asarray(poly, float)
+    if not np.allclose(P[0], P[-1]):
+        P = np.vstack([P, P[:1]])
+    per = float(np.hypot(*(P[1:] - P[:-1]).T).sum())
+    D = _densify_closed(P, max(per / 4000.0, 0.05))[:-1]
+    sub = D[::max(len(D) // 600, 1)]
+    dd = ((sub[:, None, :] - sub[None]) ** 2).sum(2)
+    i, j = np.unravel_index(int(dd.argmax()), dd.shape)
+    ia = int(np.argmin(((D - sub[i]) ** 2).sum(1))); ib = int(np.argmin(((D - sub[j]) ** 2).sum(1)))
+    if ia > ib:
+        ia, ib = ib, ia
+    S1 = D[ia:ib + 1]
+    S2 = np.vstack([D[ib:], D[:ia + 1]])[::-1]          # iki yüzey de a ucundan b ucuna
+    base, other = (S1, S2) if len(S1) >= len(S2) else (S2, S1)
+    pA = _resample(base, n)
+    pB, _par = _project_on_polyline(pA, other)
+    mid = 0.5 * (pA + pB)
+    t = np.hypot(*(pA - pB).T)
+    sig = np.r_[0.0, np.cumsum(np.hypot(*(mid[1:] - mid[:-1]).T))]
+    rmid = np.abs(mid[:, ri])
+    dens = 2 * np.pi * rmid * t
+    V = np.r_[0.0, np.cumsum(0.5 * (dens[1:] + dens[:-1]) * np.diff(sig))]
+    poly_s = np.vstack([pA, pB[::-1], pA[:1]])
+    Vp = poly_volume(poly_s, ri)
+    if V[-1] <= 0 or Vp <= 0:
+        return {'ok': False, 'why': 'Sac kalınlığı / hacmi hesaplanamadı.'}
+    V = V * (Vp / V[-1])                                   # toplamı poligon hacmine eşitle
+    return {'ok': True, 'sig': sig, 'pA': pA, 'pB': pB, 'mid': mid, 't': t, 'V': V, 'Vtot': float(Vp),
+            'poly': poly_s, 'ri': ri, 'tmax': float(np.percentile(t, 98)), 'tmed': float(np.median(t))}
+
+
+def strip_ray_map(strip, M, N):
+    """Her kalıp ışınının sac orta hattını kestiği yerin σ değeri (kesmezse en yakın nokta)."""
+    mid, sig = strip['mid'], strip['sig']
+    A, E = mid[:-1], mid[1:] - mid[:-1]
+    segl = np.hypot(*E.T)
+    out = np.empty(len(M)); hits = np.zeros(len(M), bool)
+    for a_ in range(0, len(M), 256):
+        Mc, Nc = M[a_:a_ + 256], N[a_:a_ + 256]
+        den = Nc[:, None, 0] * E[None, :, 1] - Nc[:, None, 1] * E[None, :, 0]
+        wx = A[None, :, 0] - Mc[:, None, 0]; wy = A[None, :, 1] - Mc[:, None, 1]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            d = (wx * E[None, :, 1] - wy * E[None, :, 0]) / den
+            u = (wx * Nc[:, None, 1] - wy * Nc[:, None, 0]) / den
+        ok = (np.abs(den) > 1e-12) & (u >= 0) & (u <= 1)
+        dabs = np.where(ok, np.abs(d), np.inf)
+        k = dabs.argmin(1); r = np.arange(len(Mc))
+        hit = np.isfinite(dabs[r, k])
+        sh = sig[k] + np.clip(u[r, k], 0, 1) * segl[k]
+        _pr, par = _project_on_polyline(Mc, mid)
+        out[a_:a_ + 256] = np.where(hit, sh, par)
+        hits[a_:a_ + 256] = hit
+    return out, hits
+
+
+def first_formed_times(timelines, radii, M, N, side, thr):
+    """Her ışının ilk şekillendiği zaman (takım boşluğu ≤ thr, aynı tarafta). Hiç olmadıysa inf."""
+    tau = np.full(len(M), np.inf)
+    for i in range(N_CH):
+        C, T = tool_samples(timelines[i], radii[i])
+        if len(C) == 0:
+            continue
+        r2 = float(radii[i]) ** 2
+        for a_ in range(0, len(C), 256):
+            Cc, Tc = C[a_:a_ + 256], T[a_:a_ + 256]
+            dx = M[:, None, 0] - Cc[None, :, 0]; dy = M[:, None, 1] - Cc[None, :, 1]
+            b = N[:, None, 0] * dx + N[:, None, 1] * dy
+            ct = dx * dx + dy * dy - r2
+            disc = b * b - ct
+            with np.errstate(invalid='ignore'):
+                sq = np.sqrt(np.maximum(disc, 0))
+            s_ = np.where(ct <= 0, 0.0, -b + np.sign(b) * sq)
+            okm = ((ct <= 0) | (disc >= 0)) & ((s_ == 0) | (np.sign(s_) == side[:, None])) & (np.abs(s_) <= thr)
+            anyk = okm.any(1)
+            first = np.where(anyk, Tc[np.argmax(okm, axis=1)], np.inf)
+            tau = np.minimum(tau, first)
+    return tau
+
+
+def strip_groups(tau, arc, gap_mm=6.0):
+    """Şekillenen ışınları ardışık gruplara ayırır, her grubun ilerleme yönünü (+1/-1 ışın sırası)
+    ilk şekillenme zamanından bulur; aynı yönlü gruplar birleşir. Döndürür: gdir (N,) 0/+1/-1"""
+    f = np.isfinite(tau)
+    gdir = np.zeros(len(tau), int)
+    idx = np.where(f)[0]
+    if len(idx) == 0:
+        return gdir
+    runs, cur = [], [idx[0]]
+    for k in idx[1:]:
+        if arc[k] - arc[cur[-1]] > gap_mm:
+            runs.append(cur); cur = []
+        cur.append(k)
+    runs.append(cur)
+    for r in runs:
+        r = np.asarray(r)
+        x, y = arc[r], tau[r]
+        slope = np.polyfit(x, y, 1)[0] if len(r) > 2 and np.ptp(x) > 0 else 0.0
+        gdir[r] = 1 if slope >= 0 else -1
+    return gdir
+
+
+def _strip_section(strip, sg):
+    sig = strip['sig']
+    pa = np.array([np.interp(sg, sig, strip['pA'][:, 0]), np.interp(sg, sig, strip['pA'][:, 1])])
+    pb = np.array([np.interp(sg, sig, strip['pB'][:, 0]), np.interp(sg, sig, strip['pB'][:, 1])])
+    return pa, pb
+
+
+def _strip_poly(strip, s0, s1):
+    """σ ∈ [s0, s1] arasındaki sac parçasının poligonu."""
+    lo, hi = min(s0, s1), max(s0, s1)
+    sig = strip['sig']
+    if hi - lo < 1e-9:
+        return None
+    m = (sig > lo) & (sig < hi)
+    a0, b0 = _strip_section(strip, lo); a1, b1 = _strip_section(strip, hi)
+    A = np.vstack([a0, strip['pA'][m], a1]); B = np.vstack([b0, strip['pB'][m], b1])
+    return np.vstack([A, B[::-1], A[:1]])
+
+
+def strip_state(fin, sim, U, formed):
+    """Verilen anda sac simülasyonu: yerinde kalan sac + her pas için duvar, köprü ve taşınan kalan sac."""
+    M, N = fin['M'], fin['N']
+    sd = np.asarray(sim['side'], float)
+    strip, ds, ri = sim['strip'], fin['ds'], sim['strip']['ri']
+    sig, V, Vt = strip['sig'], strip['V'], strip['Vtot']
+    out = {'groups': [], 'stay': None, 'Vwall': 0.0, 'Vrem': 0.0, 'exhausted': False}
+    starts = {}
+    for d in (1, -1):
+        idx = np.where(formed & (sim['gdir'] == d))[0]
+        if len(idx) == 0:
+            continue
+        trail, front = (idx.min(), idx.max()) if d > 0 else (idx.max(), idx.min())
+        rng = np.arange(trail, front + d, d)
+        w = np.where(formed[rng], np.minimum(np.nan_to_num(U[rng], nan=0.0), sim['W0'][rng]), sim['W0'][rng])
+        w = np.clip(w, 0, None)
+        Mf, Nf, sf = M[rng], N[rng], sd[rng]
+        rmid = np.abs((Mf + Nf * (sf * w / 2)[:, None])[:, ri])
+        dsr = ds[rng] if d > 0 else ds[np.clip(rng + 1, 0, len(ds) - 1)]
+        cum = np.cumsum(2 * np.pi * rmid * w * dsr)
+        s0 = float(sim['sigR'][trail]); m = d * sim['sdir']
+        V0 = float(np.interp(s0, sig, V))
+        avail = (Vt - V0) if m > 0 else V0
+        exh = cum[-1] > avail
+        if exh:
+            kc = max(int(np.searchsorted(cum, avail)), 1)
+            rng, w, Mf, Nf, sf, cum = rng[:kc + 1], w[:kc + 1], Mf[:kc + 1], Nf[:kc + 1], sf[:kc + 1], cum[:kc + 1]
+        Vc = float(min(cum[-1], avail))
+        Pout = Mf + Nf * (sf * w)[:, None]
+        g = {'dir': d, 'm': m, 'wall': np.vstack([Pout, Mf[::-1], Pout[:1]]), 'Vwall': Vc, 's0': s0,
+             'exhausted': bool(exh), 'Lwall': float(np.sum(np.hypot(*(Mf[1:] - Mf[:-1]).T))), 'rem': None, 'bridge': None}
+        sc = float(np.interp(V0 + m * Vc, V, sig))
+        g['sc'] = sc
+        if not exh:
+            send = sig[-1] if m > 0 else 0.0
+            rem = _strip_poly(strip, sc, send)
+            pa, pb = _strip_section(strip, sc)
+            nrm = Nf[-1] * sf[-1]
+            inner, outer = (pa, pb) if np.dot(pa, nrm) <= np.dot(pb, nrm) else (pb, pa)
+            tgt = Mf[-1]
+            if rem is not None:
+                g['rem'] = remap_volume(rem, ri, inner, tgt)
+                g['Vrem'] = poly_volume(g['rem'], ri)
+            g['bridge'] = np.array([tgt, Pout[-1], remap_volume(outer, ri, inner, tgt), tgt])
+        g['elong'] = g['Lwall'] - abs(sc - s0)               # duvar boyu − tüketilen sac boyu
+        out['groups'].append(g)
+        out['Vwall'] += Vc; out['Vrem'] += g.get('Vrem', 0.0)
+        out['exhausted'] |= g['exhausted']
+        starts[m] = s0
+    lo = starts.get(-1, 0.0); hi = starts.get(1, sig[-1])
+    if -1 in starts and 1 in starts and lo > hi:
+        lo = hi = 0.5 * (lo + hi)
+    out['stay'] = _strip_poly(strip, lo, hi)
+    out['Vstay'] = poly_volume(out['stay'], ri) if out['stay'] is not None else 0.0
+    return out
+
+
+def _form_strip(M, Nrm, fan, S, chains, radial, arc, timelines, radii, sim_on):
+    rad = radial if radial in ('X', 'Y') else 'Y'
+    ri = 0 if rad == 'X' else 1
+    poly = _largest_closed(chains)
+    side, _sb = _tool_side(S, len(M))
+    if poly is None:
+        fin = {'mode': 'strip', 'chunks': [], 'regions': [], 'lines': [], 'M': M, 'N': Nrm, 'side': side,
+               'T': np.full(len(M), np.nan), 'Ti': None, 'F': np.full(len(M), np.nan),
+               'formed': np.zeros(len(M), bool), 'W0': np.zeros(len(M)), 'radial': rad,
+               'profile': {'arc': arc, 'x': M[:, 0], 'y': M[:, 1], 'T0': np.full(len(M), np.nan),
+                           'T': np.full(len(M), np.nan), 'F': np.full(len(M), np.nan),
+                           'formed': np.zeros(len(M), bool), 'main': ~fan, 'alpha': None},
+               'ds': np.r_[0.0, np.diff(arc)],
+               'sim': {'ok': False, 'why': 'Sac ön form için DXF kapalı kontur olmalı.'} if sim_on else None}
+        ch = [{'chunks': [], 'limit': 1.0} for _ in range(N_CH)]
+        return {'ch': ch, 'final': fin, 'pf_chains': chains}
+    strip = strip_from_polygon(poly, ri)
+    sigR, hit = strip_ray_map(strip, M, Nrm)
+    W0 = np.interp(sigR, strip['sig'], strip['t'])
+    thr = strip['tmax'] + STRIP_TOL
+    U = np.full(len(M), np.inf)
+    ch = []
+    brk = max(2.0, strip['tmed'])
+    for i in range(N_CH):
+        s_ = S[i]
+        same = np.isfinite(s_) & ((s_ == 0) | (np.sign(s_) == side))
+        okc = same & (np.abs(s_) <= thr)
+        U = np.minimum(U, np.where(okc, np.abs(s_), np.inf))
+        ch.append({'chunks': envelope_chunks(M, Nrm, s_, thr, ok=okc), 'limit': thr})
+    formed = np.isfinite(U)
+    F = np.where(formed, np.minimum(U, W0), np.nan)
+    sd = side.astype(float)
+    P_act = M + Nrm * (sd * np.nan_to_num(F))[:, None]
+    P_id = M + Nrm * (sd * W0)[:, None]
+    thin = formed & (F < W0 - 0.01)
+    ds = np.r_[0.0, np.diff(arc)]
+    fin = {
+        'mode': 'strip',
+        'chunks': [(P_act[idx], M[idx]) for idx in _chunks_from_mask(formed, P_act, brk)],
+        'line_label': 'Kalıba sıvanan sac yüzeyi (takım boşluğu)',
+        'regions': [('İnceltme (sac kalınlığından ince)', DISP_COLOR,
+                     [(P_id[idx], P_act[idx]) for idx in _chunks_from_mask(thin, P_act, brk)])],
+        'lines': [('Sac kalınlığı kalıp üzerinde (inceltmesiz)', IDEAL_COLOR,
+                   [P_id[idx] for idx in _chunks_from_mask(formed, P_id, brk)])],
+        'profile': {'arc': arc, 'x': M[:, 0], 'y': M[:, 1], 'T0': np.where(hit | formed, W0, np.nan),
+                    'T': np.where(hit | formed, W0, np.nan), 'F': F, 'formed': formed, 'main': ~fan, 'alpha': None},
+        'M': M, 'N': Nrm, 'side': side, 'T': W0, 'Ti': W0, 'F': F, 'formed': formed, 'W0': W0, 'thr': thr,
+        'radial': rad, 'ds': ds, 'strip': strip,
+    }
+    if sim_on:
+        tau = first_formed_times(timelines, radii, M, Nrm, side, thr)
+        gdir = strip_groups(tau, arc)
+        sdir = 1 if sigR[-1] >= sigR[0] else -1
+        sim = {'ok': True, 'kind': 'strip', 'strip': strip, 'sigR': sigR, 'W0': W0, 'side': side, 'tau': tau,
+               'gdir': gdir, 'sdir': sdir, 'thr': thr, 'Vtot': strip['Vtot'], 'ri': ri}
+        sim['final'] = strip_state(fin, sim, U, formed)
+        fin['sim'] = sim
+    return {'ch': ch, 'final': fin, 'pf_chains': chains}
 
 
 def _form_shear(M, Nrm, fan, S, chains, radial, arc):
@@ -2186,6 +2507,11 @@ def sim_state(fin, sim, F, formed):
 
 def sim_summary(sim, st):
     """Hacim dengesi ve uç uzaması (malzeme yönünde)."""
+    if sim.get('kind') == 'strip':
+        Vw = st['Vwall']; Vr = sum(g.get('Vrem', 0.0) for g in st['groups']); Vs = st['Vstay']
+        el = {('+' if g['dir'] > 0 else '−'): g['elong'] for g in st['groups']}
+        return {'Vtot': sim['Vtot'], 'Vwall': Vw, 'Vrem': Vr + Vs, 'err': (Vw + Vr + Vs - sim['Vtot']) / sim['Vtot'] * 100,
+                'elong': max(el.values()) if el else 0.0, 'elong_groups': el, 'axis': 'sac', 'exhausted': st['exhausted']}
     k, d = sim['k'], sim['dir']
     ext = (lambda P: float(P[:, k].max() if d > 0 else P[:, k].min()))
     end_old = ext(sim['poly'])
@@ -2202,7 +2528,10 @@ SIM_COLOR = '#3d6fb6'
 
 def draw_sim_product(ax, st, label='Ürün (simülasyon sonu)'):
     first = True
-    for poly in (st.get('wall'), st.get('bridge'), st.get('rem')):
+    polys = [st.get('wall'), st.get('bridge'), st.get('rem')]
+    if 'groups' in st:
+        polys = [st.get('stay')] + [P for g in st['groups'] for P in (g['wall'], g.get('bridge'), g.get('rem'))]
+    for poly in polys:
         if poly is None:
             continue
         ax.fill(poly[:, 0], poly[:, 1], color=SIM_COLOR, alpha=0.55, linewidth=0, zorder=3,
@@ -2313,7 +2642,8 @@ def thickness_profile(form, step_mm=1.0):
         cols = ['Kalıp boyunca (mm)', 'X', 'Y', 'Kalıp açısı α (°)', 't₀ eksenel (mm)', 'İdeal t₀·sin α (mm)',
                 'Gerçek (mm)', 'Sapma (mm)', 'Sapma (%)']
     else:
-        lines.append(f"**Model:** kalıp üzerinde. **Ön form kalınlığı:** {np.nanmin(T[m]):.3f} – {np.nanmax(T[m]):.3f} mm")
+        _mn = 'sac ön form (sıvama + inceltme)' if fin.get('mode') == 'strip' else 'kalıp üzerinde'
+        lines.append(f"**Model:** {_mn}. **Ön form (sac) kalınlığı:** {np.nanmin(T[m]):.3f} – {np.nanmax(T[m]):.3f} mm")
         if fm.any():
             lines += [f"**Formlanan bölge:** kalıp boyunca {arc[fm].min():.1f} – {arc[fm].max():.1f} mm",
                       f"**Son kalınlık:** en az {np.nanmin(F[fm]):.3f} mm, en çok {np.nanmax(F[fm]):.3f} mm, "
@@ -2326,9 +2656,13 @@ def thickness_profile(form, step_mm=1.0):
     if sm is not None:
         if sm.get('ok') and sm.get('final') is not None:
             q = sim_summary(sm, sm['final'])
-            lines.append(f"**Simülasyon (hacim sabit):** ön form {q['Vtot'] / 1000:.2f} cm³ = kalıba sıvanan "
-                         f"{q['Vwall'] / 1000:.2f} + kalan {q['Vrem'] / 1000:.2f} cm³ (fark %{q['err']:.2f}); "
-                         f"**uç uzaması ({q['axis']} yönünde): {q['elong']:.2f} mm**"
+            if q.get('elong_groups') is not None:
+                el = ", ".join(f"{'ileri (+)' if k == '+' else 'geri (−)'} pas: {v:.2f} mm" for k, v in q['elong_groups'].items())
+                el = f"**uç uzaması (sac boyunca): {el or '—'}**"
+            else:
+                el = f"**uç uzaması ({q['axis']} yönünde): {q['elong']:.2f} mm**"
+            lines.append(f"**Simülasyon (hacim sabit):** ön form {q['Vtot']:,.0f} mm³ = kalıba sıvanan "
+                         f"{q['Vwall']:,.0f} + kalan {q['Vrem']:,.0f} mm³ (fark %{q['err']:.2f}); " + el
                          + (" — **malzeme bitti**" if q['exhausted'] else ""))
         else:
             lines.append(f"**Simülasyon çalışmadı:** {sm.get('why', '')}")
@@ -2352,15 +2686,28 @@ def thickness_profile(form, step_mm=1.0):
 # -------------------------------------------------------------
 # ANİMASYON SAHNESİ (canlı oynatıcı ve MP4 aynı kodu kullanır)
 # -------------------------------------------------------------
-def _scene_bounds(channels_segments, start_points, radii, mold_points):
+def channel_active(segs):
+    """Kanalın programında gerçek bir hareket / bekleme var mı (boş kanallar çizime ve sınırlara girmez)."""
+    return any(s.get('type') in ('move', 'dwell') for s in segs)
+
+
+def _scene_bounds(channels_segments, start_points, radii, mold_points, extra=None):
     all_x, all_y = [p[0] for p in mold_points], [p[1] for p in mold_points]
-    for segs, (sx, sy) in zip(channels_segments, start_points):
+    act = [channel_active(s) for s in channels_segments]
+    for P in (extra or []):                                  # ön form / ürün
+        P = np.asarray(P, float)
+        if len(P):
+            all_x.extend(P[:, 0]); all_y.extend(P[:, 1])
+    for segs, (sx, sy), a in zip(channels_segments, start_points, act):
+        if not a:
+            continue
         all_x.append(sx); all_y.append(sy)
         for seg in segs:
             if seg['type'] == 'move':
                 all_x.extend(p[0] for p in seg['orig_points'])
                 all_y.extend(p[1] for p in seg['orig_points'])
-    margin = max(10.0, max(radii) * 2)
+    ra = [r for r, a in zip(radii, act) if a] or [0.0]
+    margin = max(10.0, max(ra) * 2)
     return min(all_x) - margin, max(all_x) + margin, min(all_y) - margin, max(all_y) + margin
 
 
@@ -2666,7 +3013,7 @@ function curDist(i){var q=kf(), p=pos(i,['px','py'],q[0],q[1]); return dpt(p[0],
 
 var meas={on:false,has:false,last:0,tlo:0,thi:0,mn:[],mx:[],tmn:[],tmx:[]};
 function measReset(){meas.mn=[];meas.mx=[];meas.tmn=[];meas.tmx=[]; for(var i=0;i<NC;i++){meas.mn.push(Infinity);meas.mx.push(-Infinity);meas.tmn.push(0);meas.tmx.push(0);}}
-function measPush(i,v,tt){ if(!isFinite(v)) return; if(v<meas.mn[i]){meas.mn[i]=v;meas.tmn[i]=tt;} if(v>meas.mx[i]){meas.mx[i]=v;meas.tmx[i]=tt;} }
+function measPush(i,v,tt){ if(!isFinite(v)||(D.act&&!D.act[i])) return; if(v<meas.mn[i]){meas.mn[i]=v;meas.tmn[i]=tt;} if(v>meas.mx[i]){meas.mx[i]=v;meas.tmx[i]=tt;} }
 function measStep(){
   if(!meas.on) return;
   var lo=Math.min(meas.last,t), hi=Math.max(meas.last,t);
@@ -2695,7 +3042,7 @@ measReset();
 function cellHtml(v,tt){ return isFinite(v)?(fmt(v)+'<span class="tt">@'+fmtT(tt)+' s</span>'):'—'; }
 function updatePanel(){
   for(var i=0;i<NC;i++){
-    document.getElementById('cd'+i).textContent=fmt(curDist(i));
+    document.getElementById('cd'+i).textContent=(D.act&&!D.act[i])?'boş':fmt(curDist(i));
     document.getElementById('mn'+i).innerHTML=cellHtml(meas.mn[i],meas.tmn[i]);
     document.getElementById('mx'+i).innerHTML=cellHtml(meas.mx[i],meas.tmx[i]);
   }
@@ -2726,16 +3073,21 @@ function upperBound(A,x){var lo=0,hi=A.length; while(lo<hi){var m=(lo+hi)>>1; if
 function envAt(ch){ var j=upperBound(EV.S[ch].t,t+1e-9), c=Math.floor(j/CP), ca=envCache[ch];
   if(ca.j===j) return ca.a; var a=envCk[ch][c].slice(); applySamples(a,ch,c*CP,j); ca.j=j; ca.a=a; return a; }
 // ön form (varsa): ışın başına lokal malzeme kalınlığı (T) ve malzemenin olduğu taraf (SD)
-var HASPF=!!(EV&&EV.T), SHEAR=!!(EV&&EV.mode==='shear'), Ta=null, SD=null, TI=null;
+var HASPF=!!(EV&&EV.T), STRIP=!!(EV&&EV.mode==='strip'), SHEAR=!!(EV&&(EV.mode==='shear'||EV.mode==='strip')), Ta=null, SD=null, TI=null;
 if(HASPF){ Ta=new Float64Array(EV.T); SD=new Int8Array(EV.sd); if(SHEAR) TI=new Float64Array(EV.Ti); }
 // dinamik form simülasyonu (hacim sabit)
 var SM=(EV&&EV.sim)?EV.sim:null, SIMD=!!SM, SW0=null, SDS=null, SDSS=null, SIMP=null, SIMEND=0;
-if(SIMD){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.ds); SIMP=[];
+var STS=(SIMD&&SM.kind==='strip'), SPA=null, SPB=null, SSIG=null, SV=null, STAU=null, SGD=null, SSR=null;
+if(STS){ SPA=[]; SPB=[]; for(var q8=0;q8<SM.pax.length;q8++){ SPA.push([SM.pax[q8],SM.pay[q8]]); SPB.push([SM.pbx[q8],SM.pby[q8]]); }
+  SSIG=SM.sig; SV=SM.V; STAU=new Float64Array(SM.tau); SGD=new Int8Array(SM.gdir); SSR=new Float64Array(SM.sigR); }
+if(SIMD && !STS){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.ds); SIMP=[];
   for(var q9=0;q9<SM.poly.length;q9+=2) SIMP.push([SM.poly[q9],SM.poly[q9+1]]);
   SIMEND=SIMP.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
+if(STS){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.ds); }
 function okv(i,v,L){
   if(!isFinite(v)) return false;
-  if(SIMD){ if(v!==0 && ((v>0)!==(SDS[i]>0))) return false; return Math.abs(v)<=SM.tmax+1e-9; }
+  if(SIMD){ if(v!==0 && ((v>0)!==(SDS[i]>0))) return false; return Math.abs(v)<=(SM.kind==='strip'?SM.thr:SM.tmax)+1e-9; }
+  if(STRIP){ if(v!==0 && ((v>0)!==(SD[i]>0))) return false; return Math.abs(v)<=EV.thr+1e-9; }
   if(HASPF){ var T=Ta[i]; if(!(T>0)) return false; if(v!==0 && ((v>0)!==(SD[i]>0))) return false;
     return SHEAR ? Math.abs(v)<=T+1e-9 : Math.abs(v)<T-1e-6; }
   return Math.abs(v)<=L;
@@ -2777,6 +3129,50 @@ function simState(SS){
   var wo=W[end]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],remapV(outer,inner,tgt)];
   st.T=[tgt[0]-inner[0],tgt[1]-inner[1]]; st.c=cc;
   return st; }
+function lerp1(xq,X,Yv){ var n=X.length; if(xq<=X[0]) return Yv[0]; if(xq>=X[n-1]) return Yv[n-1];
+  var j=upperBound(X,xq), i0=j-1, f=(X[j]>X[i0])?(xq-X[i0])/(X[j]-X[i0]):0; return Yv[i0]+(Yv[j]-Yv[i0])*f; }
+function stSec(sg){ return [[lerp1(sg,SSIG,SM.pax),lerp1(sg,SSIG,SM.pay)],[lerp1(sg,SSIG,SM.pbx),lerp1(sg,SSIG,SM.pby)]]; }
+function stPoly(s0,s1){ var lo=Math.min(s0,s1), hi=Math.max(s0,s1); if(hi-lo<1e-9) return null;
+  var a0=stSec(lo), a1=stSec(hi), A=[a0[0]], B=[a0[1]];
+  for(var j=0;j<SSIG.length;j++){ if(SSIG[j]>lo && SSIG[j]<hi){ A.push(SPA[j]); B.push(SPB[j]); } }
+  A.push(a1[0]); B.push(a1[1]); return A.concat(B.reverse()); }
+function stripState(SS){
+  var out={groups:[], Vwall:0, Vrem:0, exh:false}, starts={}, Vt=SM.Vtot, ri=SM.ri, sig=SSIG, V=SV, SIGEND=sig[sig.length-1];
+  var U=new Float64Array(NM), F=new Uint8Array(NM);
+  for(var i=0;i<NM;i++){ var u=Infinity; for(var c=0;c<NC;c++){ var v=SS[c][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); }
+    U[i]=u; F[i]=(STAU[i]>=0 && STAU[i]<=t+1e-9 && isFinite(u))?1:0; }
+  [1,-1].forEach(function(d){
+    var tr=-1, fr=-1; for(var i=0;i<NM;i++){ if(F[i] && SGD[i]===d){ if(tr<0) tr=i; fr=i; } }
+    if(tr<0) return; if(d<0){ var tmp=tr; tr=fr; fr=tmp; }
+    var W=[], idx=[], CUM=[], cum=0;
+    for(var k=tr; d>0?k<=fr:k>=fr; k+=d){ var w=F[k]?Math.min(U[k],SW0[k]):SW0[k]; if(!(w>0)) w=0;
+      var rm=(ri===0)?(Mx[k]+Nx[k]*SDS[k]*w/2):(My[k]+Ny[k]*SDS[k]*w/2);
+      var dsr=(d>0)?SDSS[k]:SDSS[Math.min(k+1,NM-1)];
+      cum+=2*Math.PI*Math.abs(rm)*w*dsr; W.push(w); idx.push(k); CUM.push(cum); }
+    var s0=SSR[tr], m=d*SM.sdir, V0=lerp1(s0,sig,V), avail=(m>0)?(Vt-V0):V0, exh=false;
+    if(cum>avail){ var kc=0; while(kc<CUM.length && CUM[kc]<avail) kc++; kc=Math.max(kc,1); W=W.slice(0,kc+1); idx=idx.slice(0,kc+1); cum=avail; exh=true; }
+    var Pout=idx.map(function(k,q){ return [Mx[k]+Nx[k]*SDS[k]*W[q], My[k]+Ny[k]*SDS[k]*W[q]]; });
+    var wall=Pout.concat(idx.slice().reverse().map(function(k){return [Mx[k],My[k]];}));
+    var sc=lerp1(V0+m*cum,V,sig), g={dir:d, wall:wall, Vwall:cum, exh:exh, s0:s0, sc:sc};
+    var Lw=0; for(var q=1;q<idx.length;q++) Lw+=Math.hypot(Mx[idx[q]]-Mx[idx[q-1]],My[idx[q]]-My[idx[q-1]]);
+    g.elong=Lw-Math.abs(sc-s0);
+    if(!exh){ var ke=idx[idx.length-1], sec=stSec(sc), nx=Nx[ke]*SDS[ke], ny=Ny[ke]*SDS[ke];
+      var inner=(sec[0][0]*nx+sec[0][1]*ny<=sec[1][0]*nx+sec[1][1]*ny)?sec[0]:sec[1], outer=(inner===sec[0])?sec[1]:sec[0], tgt=[Mx[ke],My[ke]];
+      var rem=stPoly(sc, m>0?SIGEND:0); g.rem=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null;
+      g.bridge=[tgt,Pout[Pout.length-1],remapV(outer,inner,tgt)]; }
+    out.groups.push(g); out.Vwall+=cum; out.exh=out.exh||exh; starts[m]=s0; });
+  var lo=(starts[-1]!==undefined)?starts[-1]:0, hi=(starts[1]!==undefined)?starts[1]:SIGEND;
+  if(starts[-1]!==undefined && starts[1]!==undefined && lo>hi){ lo=hi=0.5*(lo+hi); }
+  out.stay=stPoly(lo,hi); return out; }
+function drawStrip(X,Y,st){
+  var fillP=function(P){ if(!P||P.length<3) return; ctx.beginPath(); P.forEach(function(p,q){ if(q) ctx.lineTo(X(p[0]),Y(p[1])); else ctx.moveTo(X(p[0]),Y(p[1])); }); ctx.closePath();
+    ctx.fillStyle='rgba(61,111,182,0.62)'; ctx.fill(); ctx.strokeStyle='#16325c'; ctx.lineWidth=1.1; ctx.stroke(); };
+  fillP(st.stay); st.groups.forEach(function(g){ fillP(g.wall); if(g.bridge) fillP(g.bridge); if(g.rem) fillP(g.rem); });
+  var box=document.getElementById('simstat'); box.style.display='block';
+  var h='<b>Simülasyon — sac (hacim sabit)</b><br>Ön form hacmi: '+Math.round(SM.Vtot).toLocaleString('tr-TR')+' mm³<br>Kalıba sıvanan: %'+(st.Vwall/SM.Vtot*100).toFixed(1);
+  if(!st.groups.length) h+='<br>Makara henüz saca girmedi.';
+  st.groups.forEach(function(g){ h+='<br>'+(g.dir>0?'İleri':'Geri')+' pas uç uzaması: <b>'+g.elong.toFixed(2)+' mm</b>'+(g.exh?' <span style="color:#c0392b">(malzeme bitti)</span>':''); });
+  box.innerHTML=h; }
 function drawSim(X,Y,st){
   var fillP=function(P){ if(!P||P.length<3) return; ctx.beginPath(); P.forEach(function(p,q){ if(q) ctx.lineTo(X(p[0]),Y(p[1])); else ctx.moveTo(X(p[0]),Y(p[1])); }); ctx.closePath();
     ctx.fillStyle='rgba(61,111,182,0.62)'; ctx.fill(); ctx.strokeStyle='#16325c'; ctx.lineWidth=1.1; ctx.stroke(); };
@@ -2801,8 +3197,8 @@ function drawEnv(X,Y){
     ctx.strokeStyle='#9a9a9a'; ctx.lineWidth=1.0; ctx.setLineDash([8,3,2,3]);
     (EV.pf||[]).forEach(function(pl){ ctx.beginPath(); for(var q=0;q<pl.length;q+=2){ if(q) ctx.lineTo(X(pl[q]),Y(pl[q+1])); else ctx.moveTo(X(pl[q]),Y(pl[q+1])); } ctx.stroke(); });
     ctx.setLineDash([]);
-    drawSim(X,Y,simState(SS));
-    if(SHEAR){ ctx.strokeStyle='#6a3d9a'; ctx.lineWidth=1.4; ctx.setLineDash([4,2]);
+    if(STS){ var __st=stripState(SS); window.__ST=__st; drawStrip(X,Y,__st); } else drawSim(X,Y,simState(SS));
+    if(SHEAR && !STS){ ctx.strokeStyle='#6a3d9a'; ctx.lineWidth=1.4; ctx.setLineDash([4,2]);
       var ixs=function(i){return Mx[i]+Nx[i]*SDS[i]*TI[i];}, iys=function(i){return My[i]+Ny[i]*SDS[i]*TI[i];};
       runs(function(i){return Ta[i]>0 && TI[i]>1e-6;},ixs,iys,BRK).forEach(function(r){ctx.beginPath(); polyPath(r,ixs,iys,X,Y,null); ctx.stroke();});
       ctx.setLineDash([]); }
@@ -2810,7 +3206,7 @@ function drawEnv(X,Y){
   if(HASPF && !SIMD){
     F=new Float64Array(NM);
     for(var i=0;i<NM;i++){ var T=Ta[i]; if(!(T>0)){F[i]=NaN;continue;} var u=SHEAR?Infinity:T;
-      for(var c1=0;c1<NC;c1++){ var v=SS[c1][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } F[i]=isFinite(u)?u:NaN; }
+      for(var c1=0;c1<NC;c1++){ var v=SS[c1][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } F[i]=isFinite(u)?(STRIP?Math.min(u,T):u):NaN; }
     var fx=function(i){return Mx[i]+Nx[i]*SD[i]*F[i];}, fy=function(i){return My[i]+Ny[i]*SD[i]*F[i];};
     var mx=function(i){return Mx[i];}, my=function(i){return My[i];};
     var has=function(i){return Ta[i]>0 && isFinite(F[i]);};
@@ -2874,6 +3270,7 @@ function blockAt(B,tt){var lo=0,hi=B.length-1,ans=-1; while(lo<=hi){var m=(lo+hi
 function updateCNC(){
   if(!CN) return;
   CN.forEach(function(c,i){
+    if(D.act && !D.act[i]){ cards[i].st.textContent='BOŞ PROGRAM'; return; }
     var cd=cards[i], B=c.B, k=blockAt(B,t), L=c.L;
     var b=(k>=0)?B[k]:null, done=(!b)||(k===B.length-1&&t>b[1]+1e-6);
     var cur=-1, px=0, py=0, rx=0, ry=0, rem=0, status='', remLbl='Yol', remTxt='';
@@ -2925,6 +3322,7 @@ function draw(){
   drawEnv(X,Y);
   var q=kf(), k=q[0], f=q[1];
   D.ch.forEach(function(c,i){
+    if(D.act && !D.act[i]) return;
     var col=D.col[i];
     ctx.strokeStyle=col; ctx.lineWidth=2.3; ctx.beginPath();
     var pen=false, m=c.m[k];
@@ -2960,13 +3358,13 @@ function draw(){
   if(EV&&envC.checked){ for(var qe=0;qe<NC;qe++){ ctx.setLineDash([6,3]); leg(EV.col[qe],'Kanal '+(qe+1)+' — radüs izi',lgy+28+(D.col.length+qe)*20); ctx.setLineDash([]); }
     if(HASPF && SIMD){ var ys=lgy+28+(D.col.length+NC)*20; ctx.setLineDash([8,3,2,3]); leg('#9a9a9a','Ön form (ilk hali)',ys); ctx.setLineDash([]);
       ctx.fillStyle='rgba(61,111,182,0.75)'; ctx.fillRect(lgx,ys+16,22,8); ctx.fillStyle='#222'; ctx.fillText('Ürün (simülasyon)',lgx+28,ys+24);
-      if(SHEAR){ ctx.setLineDash([4,2]); leg('#6a3d9a','İdeal (t₀·sin α)',ys+40); ctx.setLineDash([]); } }
+      if(SHEAR && !STRIP){ ctx.setLineDash([4,2]); leg('#6a3d9a','İdeal (t₀·sin α)',ys+40); ctx.setLineDash([]); } }
     else if(HASPF){ var yb=lgy+28+(D.col.length+NC)*20; ctx.setLineDash([8,3,2,3]); leg('#7f7f7f','Ön form (DXF)',yb); ctx.setLineDash([]);
       leg('#1f3a5f',SHEAR?'Gerçek son yüzey':'Son form yüzeyi',yb+20);
       var box=function(c,txt,y){ ctx.fillStyle=c; ctx.fillRect(lgx,y,22,8); ctx.fillStyle='#222'; ctx.fillText(txt,lgx+28,y+8); };
       box('rgba(47,127,216,0.55)','Et (kalıp–yüzey)',yb+36);
-      if(SHEAR){ ctx.setLineDash([4,2]); leg('#6a3d9a','İdeal (t₀·sin α)',yb+60); ctx.setLineDash([]);
-        box('rgba(214,39,40,0.5)','Aşırı inceltme',yb+72); box('rgba(255,127,14,0.5)','Eksik inceltme',yb+88); }
+      if(SHEAR){ ctx.setLineDash([4,2]); leg('#6a3d9a',STRIP?'Sac kalınlığı (inceltmesiz)':'İdeal (t₀·sin α)',yb+60); ctx.setLineDash([]);
+        box('rgba(214,39,40,0.5)',STRIP?'İnceltme':'Aşırı inceltme',yb+72); if(!STRIP) box('rgba(255,127,14,0.5)','Eksik inceltme',yb+88); }
       else box('rgba(214,39,40,0.45)','Akıtılan malzeme',yb+52); } }
 }
 function ui(){tm.value=Math.round(t/D.T*10000); tv.textContent=t.toFixed(2)+' / '+D.T.toFixed(2)+' s'; updatePanel(); updateCNC();}
@@ -3071,6 +3469,8 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
     fin = (form or {}).get('final')
     if fin is not None and len(fin['T']) == len(M):
         out['mode'] = fin.get('mode', 'flow')
+        if fin.get('thr') is not None:
+            out['thr'] = float(fin['thr'])
         if fin.get('Ti') is not None:
             Ti = np.asarray(fin['Ti'], float)
             out['Ti'] = [round(float(v), 4) if np.isfinite(v) else -1.0 for v in Ti]
@@ -3079,11 +3479,21 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
         out['T'] = [round(float(v), 4) if h else -1.0 for v, h in zip(T, has)]
         out['sd'] = [int(v) for v in fin['side']]
         tmax = float(np.max(T[has])) if has.any() else 1.0
-        out['lim'] = [tmax] * N_CH                          # takım örneklerini elemek için üst sınır
+        out['lim'] = [max(tmax, float(fin.get('thr') or 0.0))] * N_CH   # takım örneklerini elemek için üst sınır
         out['medT'] = float(np.median(T[has])) if has.any() else 1.0
         out['pf'] = [[round(float(v), 4) for v in np.asarray(A).ravel()] for A, _cl in form['pf_chains']]
         sm = fin.get('sim')
-        if sm and sm.get('ok'):
+        if sm and sm.get('ok') and sm.get('kind') == 'strip':
+            r5 = lambda a: [round(float(v), 5) for v in np.asarray(a, float).ravel()]
+            stp = sm['strip']
+            out['sim'] = {'kind': 'strip', 'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']], 'ds': r5(fin['ds']),
+                          'ri': sm['ri'], 'sdir': int(sm['sdir']), 'thr': float(sm['thr']), 'Vtot': float(stp['Vtot']),
+                          'tau': [round(float(v), 5) if np.isfinite(v) else -1.0 for v in sm['tau']],
+                          'gdir': [int(v) for v in sm['gdir']], 'sigR': r5(sm['sigR']),
+                          'sig': r5(stp['sig']), 'V': [float(v) for v in stp['V']],
+                          'pax': r5(stp['pA'][:, 0]), 'pay': r5(stp['pA'][:, 1]),
+                          'pbx': r5(stp['pB'][:, 0]), 'pby': r5(stp['pB'][:, 1])}
+        elif sm and sm.get('ok'):
             r5 = lambda a: [round(float(v), 5) for v in np.asarray(a, float).ravel()]
             out['sim'] = {'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']], 'ds': r5(fin['ds']),
                           'ri': sm['ri'], 'k': sm['k'], 'dir': sm['dir'], 'tmax': sm['tmax'], 'Vtot': sm['Vtot'],
@@ -3094,8 +3504,8 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
 
 
 def build_player_data(channels_segments, start_points, radii, mold_points, timelines, total_time,
-                      speed0=1.0, rate=30, xname='X', yname='Y', env=None, cnc=None):
-    xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points)
+                      speed0=1.0, rate=30, xname='X', yname='Y', env=None, cnc=None, extra=None):
+    xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points, extra)
     n = int(min(max(np.ceil(total_time * rate), 2), 6000))
     dt = total_time / n
     r3 = lambda v: round(float(v), 3)
@@ -3126,7 +3536,7 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
     return {'T': r3(total_time), 'n': n, 'dt': dt, 'b': [r3(xmin), r3(xmax), r3(ymin), r3(ymax)],
             'mold': [[r3(p[0]), r3(p[1])] for p in mold_points], 'r': [r3(r) for r in radii],
             'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans,
-            'env': env, 'cnc': cnc}
+            'env': env, 'cnc': cnc, 'act': [bool(channel_active(s)) for s in channels_segments]}
 
 
 def build_player_html(data, height=960):
@@ -3167,7 +3577,7 @@ def _preform(opts, cfg=None):
     if not chains:
         return None
     radial, why = resolve_radial(opts.get('pf_radial', 'auto'), cfg or {})
-    return {'chains': chains, 'model': opts.get('pf_model', 'shear'), 'radial': radial, 'radial_why': why,
+    return {'chains': chains, 'model': opts.get('pf_model', 'strip'), 'radial': radial, 'radial_why': why,
             'sim': bool(opts.get('pf_sim'))}
 
 
@@ -3177,6 +3587,14 @@ def _pf_note(opts, cfg, form):
     if not (form and form.get('final')):
         return "\nÖn form seçili ama kullanılabilir çizgi bulunamadı (katman seçimini kontrol et)."
     fin = form['final']
+    if fin.get('mode') == 'strip':
+        pf = _preform(opts, cfg)
+        if not any(cl for _A, cl in form['pf_chains']):
+            return "\nUYARI: Sac ön form modeli için DXF kapalı kontur olmalı."
+        stp = fin.get('strip') or {}
+        return (f"\nÖn form: sac modeli (sıvama + inceltme), parça yarıçapı {pf['radial']} ekseni. "
+                f"Sac kalınlığı DXF'ten: {np.min(stp.get('t', [np.nan])):.2f} – {np.max(stp.get('t', [np.nan])):.2f} mm "
+                f"(ortanca {stp.get('tmed', float('nan')):.2f}). Hacim {stp.get('Vtot', 0):,.0f} mm³.")
     if fin.get('mode') == 'shear':
         pf = _preform(opts, cfg)
         closed = any(cl for _A, cl in form['pf_chains'])
@@ -3240,7 +3658,7 @@ def run_all(*vals):
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
                                                               xname=opts['xname'], yname=opts['yname'],
-                                                              env=env_d, cnc=cnc_d))
+                                                              env=env_d, cnc=cnc_d, extra=_form_extra(form)))
         except Exception:
             player_html = "<p>Hızlı oynatıcı hazırlanamadı:</p><pre>" + html.escape(traceback.format_exc()) + "</pre>"
 
@@ -3251,8 +3669,12 @@ def run_all(*vals):
         if _sm is not None:
             if _sm.get('ok'):
                 q = sim_summary(_sm, _sm['final'])
-                status += (f"\nSimülasyon: hacim sabit (fark %{q['err']:.2f}), uç uzaması {q['elong']:.2f} mm "
-                           f"({q['axis']} yönünde)" + (" — malzeme bitti." if q['exhausted'] else ". Hızlı Oynatıcıda adım adım izle."))
+                if q.get('elong_groups') is not None:
+                    el = ", ".join(f"{'ileri' if k == '+' else 'geri'} pas uzaması {v:.2f} mm" for k, v in q['elong_groups'].items())
+                else:
+                    el = f"uç uzaması {q['elong']:.2f} mm ({q['axis']} yönünde)"
+                status += (f"\nSimülasyon: hacim sabit (fark %{q['err']:.2f}), {el or 'şekillenme yok'}"
+                           + (" — malzeme bitti." if q['exhausted'] else ". Hızlı Oynatıcıda adım adım izle."))
             else:
                 status += "\nSimülasyon çalışmadı: " + _sm.get('why', '')
         return (frame0,
@@ -3518,10 +3940,9 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                             "Okunan nesneler: LINE, POLYLINE, LWPOLYLINE, ARC, CIRCLE, ELLIPSE, SPLINE (bloklar için EXPLODE).")
                 pf_file = gr.File(label="Ön form DXF yükle", file_types=[".dxf"], file_count="single")
                 pf_layers = gr.CheckboxGroup(choices=[], value=[], label="Kullanılacak DXF katmanları")
-                pf_model = gr.Dropdown(PF_MODEL_CHOICES, value='shear', label="Ön form modeli")
-                pf_radial = gr.Dropdown(PF_RADIAL_CHOICES, value='auto', label="Radyal eksen (shear forming için)",
-                                        info="Malzeme aynı yarıçapta kalarak kalıba sıvanır; sin α kalıp yüzeyinin "
-                                             "dönme ekseniyle açısından hesaplanır.")
+                pf_model = gr.Dropdown(PF_MODEL_CHOICES, value='strip', label="Ön form modeli")
+                pf_radial = gr.Dropdown(PF_RADIAL_CHOICES, value='auto', label="Parça yarıçapı ekseni",
+                                        info="Hacim 2π·yarıçap·alan ile hesaplanır. Dönme ekseni bu eksenin 0 çizgisidir.")
                 pf_sim = gr.Checkbox(value=False, label="Simülasyon modu: ön form adım adım şekillensin (hacim sabit)",
                                      info="Makaranın geçtiği yer kalıba sıvanıp takım boşluğu kalınlığına iner; artan hacim "
                                           "kalan malzemeyi ileri iterek uçta uzama olarak görünür. Hızlı Oynatıcıda canlı izlenir.")
