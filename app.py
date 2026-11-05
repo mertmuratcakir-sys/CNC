@@ -853,8 +853,7 @@ def _form_extra(form):
     sm = (form.get('final') or {}).get('sim')
     if sm and sm.get('ok') and sm.get('final') is not None:
         f = sm['final']
-        polys = ([f.get('stay')] + [P for g in f['groups'] for P in (g['wall'], g.get('rem'))]) if 'groups' in f \
-            else [f.get('wall'), f.get('rem')]
+        polys = f['polys'] if 'polys' in f else [f.get('wall'), f.get('rem')]
         out += [P for P in polys if P is not None]
     return out
 
@@ -1438,8 +1437,7 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
         if _sm and _sm.get('ok') and _sm.get('final') is not None:
             w.layer('URUN', 4)
             _f = _sm['final']
-            _ps = ([_f.get('stay')] + [P for g in _f['groups'] for P in (g['wall'], g.get('bridge'), g.get('rem'))]
-                   if 'groups' in _f else [_f.get('wall'), _f.get('bridge'), _f.get('rem')])
+            _ps = _f['polys'] if 'polys' in _f else [_f.get('wall'), _f.get('bridge'), _f.get('rem')]
             for P in _ps:
                 if P is not None:
                     w.polyline('URUN', P)
@@ -2017,6 +2015,17 @@ def strip_from_polygon(poly, ri, n=900):
             'poly': poly_s, 'ri': ri, 'tmax': float(np.percentile(t, 98)), 'tmed': float(np.median(t))}
 
 
+def _flip_strip(strip):
+    """Sac orta hattının yönünü ters çevirir (σ=0 diğer uca geçer); hacim tablosu yeniden kurulur."""
+    st = dict(strip)
+    for k in ('pA', 'pB', 'mid', 't'):
+        st[k] = strip[k][::-1].copy()
+    st['sig'] = np.r_[0.0, np.cumsum(np.hypot(*(st['mid'][1:] - st['mid'][:-1]).T))]
+    st['V'] = strip['Vtot'] - strip['V'][::-1]
+    st['poly'] = np.vstack([st['pA'], st['pB'][::-1], st['pA'][:1]])
+    return st
+
+
 def strip_ray_map(strip, M, N):
     """Her kalıp ışınının sac orta hattını kestiği yerin σ değeri (kesmezse en yakın nokta)."""
     mid, sig = strip['mid'], strip['sig']
@@ -2106,60 +2115,139 @@ def _strip_poly(strip, s0, s1):
     return np.vstack([A, B[::-1], A[:1]])
 
 
+def strip_runs(formed, arc, gap_mm=6.0):
+    """Kalıba sıvanmış ardışık bölgeler (ışın sırası): aralarındaki boşluk gap_mm'den kısaysa birleşir."""
+    idx = np.where(formed)[0]
+    if len(idx) == 0:
+        return []
+    runs, a_ = [], idx[0]
+    for p_, q_ in zip(idx[:-1], idx[1:]):
+        if arc[q_] - arc[p_] > gap_mm:
+            runs.append((int(a_), int(p_))); a_ = q_
+    runs.append((int(a_), int(idx[-1])))
+    return runs
+
+
+def _mold_signed(P, M, N, sd):
+    """P noktalarının kalıba işaretli mesafesi (+ malzeme tarafı, − kalıbın içi), en yakın ışına göre."""
+    out = np.empty(len(P))
+    for a_ in range(0, len(P), 256):
+        q = P[a_:a_ + 256]
+        d2 = ((q[:, None, :] - M[None]) ** 2).sum(2)
+        k = d2.argmin(1)
+        out[a_:a_ + 256] = ((q - M[k]) * (N[k] * sd[k][:, None])).sum(1)
+    return out
+
+
+def _attach_piece(poly, ri, src, tgt, M, N, sd, iters=4):
+    """Uç parçasını hacmi koruyarak (remap) tgt'ye bağlar; kalıba gömülürse yarıçap yönünde kaldırır."""
+    if poly is None:
+        return None, tgt
+    tg = np.array(tgt, float)
+    sub = poly[::max(len(poly) // 160, 1)]
+    for _ in range(iters):
+        Q = remap_volume(sub, ri, src, tg)
+        pen = float(np.max(-_mold_signed(Q, M, N, sd)))
+        if pen <= 0.01:
+            break
+        tg[ri] += (pen + 0.02) * (1.0 if tg[ri] >= 0 else -1.0)
+    return remap_volume(poly, ri, src, tg), tg
+
+
 def strip_state(fin, sim, U, formed):
-    """Verilen anda sac simülasyonu: yerinde kalan sac + her pas için duvar, köprü ve taşınan kalan sac."""
+    """Sac simülasyonu (hacim sabit), verilen anda.
+    Kalıba sıvanmış her bölgenin SABİT NOKTASI = o bölgede ilk şekillenen ışın (malzeme orada kımıldamaz).
+    Bölge iki yana büyür: sol kısmın hacmi sacın sabit noktanın solundan, sağ kısmınki sağından tüketilir.
+    Uçlardaki serbest sac bölgenin ucuna hacim korunarak taşınır (uçta uzama / kısalma; kalıba gömülmez);
+    iki bölge arasında kalan sac yerinde kalır."""
     M, N = fin['M'], fin['N']
     sd = np.asarray(sim['side'], float)
-    strip, ds, ri = sim['strip'], fin['ds'], sim['strip']['ri']
+    strip, ri = sim['strip'], sim['strip']['ri']
     sig, V, Vt = strip['sig'], strip['V'], strip['Vtot']
-    out = {'groups': [], 'stay': None, 'Vwall': 0.0, 'Vrem': 0.0, 'exhausted': False}
-    starts = {}
-    for d in (1, -1):
-        idx = np.where(formed & (sim['gdir'] == d))[0]
-        if len(idx) == 0:
-            continue
-        trail, front = (idx.min(), idx.max()) if d > 0 else (idx.max(), idx.min())
-        rng = np.arange(trail, front + d, d)
-        w = np.where(formed[rng], np.minimum(np.nan_to_num(U[rng], nan=0.0), sim['W0'][rng]), sim['W0'][rng])
-        w = np.clip(w, 0, None)
-        Mf, Nf, sf = M[rng], N[rng], sd[rng]
-        rmid = np.abs((Mf + Nf * (sf * w / 2)[:, None])[:, ri])
-        dsr = ds[rng] if d > 0 else ds[np.clip(rng + 1, 0, len(ds) - 1)]
-        cum = np.cumsum(2 * np.pi * rmid * w * dsr)
-        s0 = float(sim['sigR'][trail]); m = d * sim['sdir']
-        V0 = float(np.interp(s0, sig, V))
-        avail = (Vt - V0) if m > 0 else V0
-        exh = cum[-1] > avail
-        if exh:
-            kc = max(int(np.searchsorted(cum, avail)), 1)
-            rng, w, Mf, Nf, sf, cum = rng[:kc + 1], w[:kc + 1], Mf[:kc + 1], Nf[:kc + 1], sf[:kc + 1], cum[:kc + 1]
-        Vc = float(min(cum[-1], avail))
-        Pout = Mf + Nf * (sf * w)[:, None]
-        g = {'dir': d, 'm': m, 'wall': np.vstack([Pout, Mf[::-1], Pout[:1]]), 'Vwall': Vc, 's0': s0,
-             'exhausted': bool(exh), 'Lwall': float(np.sum(np.hypot(*(Mf[1:] - Mf[:-1]).T))), 'rem': None, 'bridge': None}
-        sc = float(np.interp(V0 + m * Vc, V, sig))
-        g['sc'] = sc
-        if not exh:
-            send = sig[-1] if m > 0 else 0.0
-            rem = _strip_poly(strip, sc, send)
-            pa, pb = _strip_section(strip, sc)
-            nrm = Nf[-1] * sf[-1]
-            inner, outer = (pa, pb) if np.dot(pa, nrm) <= np.dot(pb, nrm) else (pb, pa)
-            tgt = Mf[-1]
-            if rem is not None:
-                g['rem'] = remap_volume(rem, ri, inner, tgt)
-                g['Vrem'] = poly_volume(g['rem'], ri)
-            g['bridge'] = np.array([tgt, Pout[-1], remap_volume(outer, ri, inner, tgt), tgt])
-        g['elong'] = g['Lwall'] - abs(sc - s0)               # duvar boyu − tüketilen sac boyu
-        out['groups'].append(g)
-        out['Vwall'] += Vc; out['Vrem'] += g.get('Vrem', 0.0)
-        out['exhausted'] |= g['exhausted']
-        starts[m] = s0
-    lo = starts.get(-1, 0.0); hi = starts.get(1, sig[-1])
-    if -1 in starts and 1 in starts and lo > hi:
-        lo = hi = 0.5 * (lo + hi)
-    out['stay'] = _strip_poly(strip, lo, hi)
-    out['Vstay'] = poly_volume(out['stay'], ri) if out['stay'] is not None else 0.0
+    sigR, tau, W0, dsc, arc = sim['sigR'], sim['tau'], sim['W0'], sim['dsc'], fin['profile']['arc']
+    out = {'polys': [], 'walls': [], 'pieces': [], 'Vwall': 0.0, 'exhausted': False, 'runs': [], 'elong': {}}
+    runs = strip_runs(formed, arc)
+    if not runs:
+        out['pieces'] = [strip['poly']]
+        out['polys'] = [strip['poly']]
+        out['Vpieces'] = poly_volume(strip['poly'], ri)
+        return out
+    info = []
+    for (a_, b_) in runs:
+        idx = np.arange(a_, b_ + 1)
+        fm = formed[idx]
+        w = np.clip(np.where(fm, np.minimum(np.nan_to_num(U[idx], nan=0.0), W0[idx]), W0[idx]), 0, None)
+        rmid = np.abs((M[idx] + N[idx] * (sd[idx] * w / 2)[:, None])[:, ri])
+        dV = 2 * np.pi * rmid * w * dsc[idx]
+        tf = np.where(fm, tau[idx], np.inf)
+        ties = idx[tf <= tf.min() + 1e-6]               # aynı anda ilk temas eden ışınlar: ortadakini al
+        n = int(ties[len(ties) // 2])
+        sn = float(sigR[n]); Vn = float(np.interp(sn, sig, V))
+        L = idx < n
+        VL, VR = float(dV[L].sum()), float(dV[~L].sum())
+        lo, hi = a_, b_
+        exL = exR = False
+        if VL > Vn:                                    # sol tarafta malzeme bitti
+            cl = np.cumsum(dV[L][::-1]); k = int(np.searchsorted(cl, Vn))
+            lo = max(a_, n - 1 - k); VL = Vn; exL = True
+        if VR > Vt - Vn:                               # sağ tarafta malzeme bitti
+            cr = np.cumsum(dV[~L]); k = int(np.searchsorted(cr, Vt - Vn))
+            hi = min(b_, n + k); VR = Vt - Vn; exR = True
+        keep = (idx >= lo) & (idx <= hi)
+        idk, wk = idx[keep], w[keep]
+        Pout = M[idk] + N[idk] * (sd[idk] * wk)[:, None]
+        wall = np.vstack([Pout, M[idk][::-1], Pout[:1]])
+        sa = float(np.interp(Vn - VL, V, sig)); sb = float(np.interp(Vn + VR, V, sig))
+        info.append({'lo': int(lo), 'hi': int(hi), 'n': n, 'sa': sa, 'sb': sb, 'sn': sn, 'Pout': Pout, 'exL': exL, 'exR': exR,
+                     'eL': float(arc[n] - arc[lo]) - (sn - sa), 'eR': float(arc[hi] - arc[n]) - (sb - sn)})
+        out['walls'].append(wall); out['Vwall'] += VL + VR
+        out['exhausted'] |= exL or exR
+    pieces = []
+
+    def section_io(sg, k):
+        pa, pb = _strip_section(strip, sg)
+        nrm = N[k] * sd[k]
+        return (pa, pb) if np.dot(pa, nrm) <= np.dot(pb, nrm) else (pb, pa)
+
+    def bridge(k, Pout_k, inner, outer):
+        return np.array([M[k], Pout_k, outer, inner, M[k]])
+
+    # sol uç parçası: [0, sa_ilk] -> ilk bölgenin sol ucuna
+    f0 = info[0]
+    if not f0['exL'] and f0['sa'] > 1e-6:
+        inner, outer = section_io(f0['sa'], f0['lo'])
+        pc = _strip_poly(strip, 0.0, f0['sa'])
+        pc2, tg = _attach_piece(pc, ri, inner, M[f0['lo']], M, N, sd)
+        if pc2 is not None:
+            pieces.append(pc2)
+            out['polys'].append(bridge(f0['lo'], f0['Pout'][0], remap_volume(inner, ri, inner, tg),
+                                       remap_volume(outer, ri, inner, tg)))
+    # aradaki parçalar yerinde kalır
+    for f1, f2 in zip(info[:-1], info[1:]):
+        if f2['sa'] - f1['sb'] > 1e-6:
+            pc = _strip_poly(strip, f1['sb'], f2['sa'])
+            if pc is not None:
+                pieces.append(pc)
+                i1, o1 = section_io(f1['sb'], f1['hi']); i2, o2 = section_io(f2['sa'], f2['lo'])
+                out['polys'] += [bridge(f1['hi'], f1['Pout'][-1], i1, o1), bridge(f2['lo'], f2['Pout'][0], i2, o2)]
+    # sağ uç parçası: [sb_son, sonu] -> son bölgenin sağ ucuna
+    fl = info[-1]
+    if not fl['exR'] and sig[-1] - fl['sb'] > 1e-6:
+        inner, outer = section_io(fl['sb'], fl['hi'])
+        pc = _strip_poly(strip, fl['sb'], sig[-1])
+        pc2, tg = _attach_piece(pc, ri, inner, M[fl['hi']], M, N, sd)
+        if pc2 is not None:
+            pieces.append(pc2)
+            out['polys'].append(bridge(fl['hi'], fl['Pout'][-1], remap_volume(inner, ri, inner, tg),
+                                       remap_volume(outer, ri, inner, tg)))
+    out['pieces'] = pieces
+    out['polys'] = out['walls'] + out['polys'] + pieces
+    out['Vpieces'] = float(sum(poly_volume(P_, ri) for P_ in pieces))
+    ax = 1 - ri
+    an = 'X' if ax == 0 else 'Y'
+    up = M[-1, ax] >= M[0, ax]                          # ışın sırası eksen boyunca artıyor mu
+    out['elong'] = {f"{an}{'−' if up else '+'} ucu": info[0]['eL'], f"{an}{'+' if up else '−'} ucu": info[-1]['eR']}
+    out['runs'] = [(f['lo'], f['hi'], f['n']) for f in info]
     return out
 
 
@@ -2181,6 +2269,9 @@ def _form_strip(M, Nrm, fan, S, chains, radial, arc, timelines, radii, sim_on):
         return {'ch': ch, 'final': fin, 'pf_chains': chains}
     strip = strip_from_polygon(poly, ri)
     sigR, hit = strip_ray_map(strip, M, Nrm)
+    if strip.get('ok') and len(sigR) > 1 and sigR[-1] < sigR[0]:     # sacı ışın sırasıyla aynı yöne çevir
+        strip = _flip_strip(strip)
+        sigR, hit = strip_ray_map(strip, M, Nrm)
     W0 = np.interp(sigR, strip['sig'], strip['t'])
     thr = strip['tmax'] + STRIP_TOL
     U = np.full(len(M), np.inf)
@@ -2214,10 +2305,9 @@ def _form_strip(M, Nrm, fan, S, chains, radial, arc, timelines, radii, sim_on):
     }
     if sim_on:
         tau = first_formed_times(timelines, radii, M, Nrm, side, thr)
-        gdir = strip_groups(tau, arc)
-        sdir = 1 if sigR[-1] >= sigR[0] else -1
+        dsc = 0.5 * (np.r_[arc[1:], arc[-1]] - np.r_[arc[0], arc[:-1]])
         sim = {'ok': True, 'kind': 'strip', 'strip': strip, 'sigR': sigR, 'W0': W0, 'side': side, 'tau': tau,
-               'gdir': gdir, 'sdir': sdir, 'thr': thr, 'Vtot': strip['Vtot'], 'ri': ri}
+               'dsc': dsc, 'thr': thr, 'Vtot': strip['Vtot'], 'ri': ri}
         sim['final'] = strip_state(fin, sim, U, formed)
         fin['sim'] = sim
     return {'ch': ch, 'final': fin, 'pf_chains': chains}
@@ -2508,9 +2598,9 @@ def sim_state(fin, sim, F, formed):
 def sim_summary(sim, st):
     """Hacim dengesi ve uç uzaması (malzeme yönünde)."""
     if sim.get('kind') == 'strip':
-        Vw = st['Vwall']; Vr = sum(g.get('Vrem', 0.0) for g in st['groups']); Vs = st['Vstay']
-        el = {('+' if g['dir'] > 0 else '−'): g['elong'] for g in st['groups']}
-        return {'Vtot': sim['Vtot'], 'Vwall': Vw, 'Vrem': Vr + Vs, 'err': (Vw + Vr + Vs - sim['Vtot']) / sim['Vtot'] * 100,
+        Vw, Vp = st['Vwall'], st['Vpieces']
+        el = st.get('elong', {})
+        return {'Vtot': sim['Vtot'], 'Vwall': Vw, 'Vrem': Vp, 'err': (Vw + Vp - sim['Vtot']) / sim['Vtot'] * 100,
                 'elong': max(el.values()) if el else 0.0, 'elong_groups': el, 'axis': 'sac', 'exhausted': st['exhausted']}
     k, d = sim['k'], sim['dir']
     ext = (lambda P: float(P[:, k].max() if d > 0 else P[:, k].min()))
@@ -2529,8 +2619,8 @@ SIM_COLOR = '#3d6fb6'
 def draw_sim_product(ax, st, label='Ürün (simülasyon sonu)'):
     first = True
     polys = [st.get('wall'), st.get('bridge'), st.get('rem')]
-    if 'groups' in st:
-        polys = [st.get('stay')] + [P for g in st['groups'] for P in (g['wall'], g.get('bridge'), g.get('rem'))]
+    if 'polys' in st:
+        polys = st['polys']
     for poly in polys:
         if poly is None:
             continue
@@ -2657,7 +2747,7 @@ def thickness_profile(form, step_mm=1.0):
         if sm.get('ok') and sm.get('final') is not None:
             q = sim_summary(sm, sm['final'])
             if q.get('elong_groups') is not None:
-                el = ", ".join(f"{'ileri (+)' if k == '+' else 'geri (−)'} pas: {v:.2f} mm" for k, v in q['elong_groups'].items())
+                el = ", ".join(f"{k}: {v:.2f} mm" for k, v in q['elong_groups'].items())
                 el = f"**uç uzaması (sac boyunca): {el or '—'}**"
             else:
                 el = f"**uç uzaması ({q['axis']} yönünde): {q['elong']:.2f} mm**"
@@ -3079,11 +3169,11 @@ if(HASPF){ Ta=new Float64Array(EV.T); SD=new Int8Array(EV.sd); if(SHEAR) TI=new 
 var SM=(EV&&EV.sim)?EV.sim:null, SIMD=!!SM, SW0=null, SDS=null, SDSS=null, SIMP=null, SIMEND=0;
 var STS=(SIMD&&SM.kind==='strip'), SPA=null, SPB=null, SSIG=null, SV=null, STAU=null, SGD=null, SSR=null;
 if(STS){ SPA=[]; SPB=[]; for(var q8=0;q8<SM.pax.length;q8++){ SPA.push([SM.pax[q8],SM.pay[q8]]); SPB.push([SM.pbx[q8],SM.pby[q8]]); }
-  SSIG=SM.sig; SV=SM.V; STAU=new Float64Array(SM.tau); SGD=new Int8Array(SM.gdir); SSR=new Float64Array(SM.sigR); }
+  SSIG=SM.sig; SV=SM.V; STAU=new Float64Array(SM.tau); SSR=new Float64Array(SM.sigR); }
 if(SIMD && !STS){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.ds); SIMP=[];
   for(var q9=0;q9<SM.poly.length;q9+=2) SIMP.push([SM.poly[q9],SM.poly[q9+1]]);
   SIMEND=SIMP.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
-if(STS){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.ds); }
+if(STS){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.dsc); }
 function okv(i,v,L){
   if(!isFinite(v)) return false;
   if(SIMD){ if(v!==0 && ((v>0)!==(SDS[i]>0))) return false; return Math.abs(v)<=(SM.kind==='strip'?SM.thr:SM.tmax)+1e-9; }
@@ -3135,43 +3225,65 @@ function stSec(sg){ return [[lerp1(sg,SSIG,SM.pax),lerp1(sg,SSIG,SM.pay)],[lerp1
 function stPoly(s0,s1){ var lo=Math.min(s0,s1), hi=Math.max(s0,s1); if(hi-lo<1e-9) return null;
   var a0=stSec(lo), a1=stSec(hi), A=[a0[0]], B=[a0[1]];
   for(var j=0;j<SSIG.length;j++){ if(SSIG[j]>lo && SSIG[j]<hi){ A.push(SPA[j]); B.push(SPB[j]); } }
-  A.push(a1[0]); B.push(a1[1]); return A.concat(B.reverse()); }
+  A.push(a1[0]); B.push(a1[1]); var P=A.concat(B.reverse()); P.push(A[0]); return P; }
+function moldSigned(p){ var best=Infinity, k=0; for(var i=0;i<NM;i++){ var dx=p[0]-Mx[i], dy=p[1]-My[i], d2=dx*dx+dy*dy; if(d2<best){best=d2;k=i;} }
+  return (p[0]-Mx[k])*Nx[k]*SDS[k]+(p[1]-My[k])*Ny[k]*SDS[k]; }
+function attachPiece(P,src,tgt){ if(!P) return {P:null,tg:tgt}; var ri=SM.ri, tg=[tgt[0],tgt[1]], st=Math.max(Math.floor(P.length/160),1), sub=[];
+  for(var j=0;j<P.length;j+=st) sub.push(P[j]);
+  for(var it=0;it<4;it++){ var pen=-Infinity; for(var q=0;q<sub.length;q++){ var v=-moldSigned(remapV(sub[q],src,tg)); if(v>pen) pen=v; }
+    if(pen<=0.01) break; tg[ri]+=(pen+0.02)*(tg[ri]>=0?1:-1); }
+  return {P:P.map(function(p){return remapV(p,src,tg);}), tg:tg}; }
 function stripState(SS){
-  var out={groups:[], Vwall:0, Vrem:0, exh:false}, starts={}, Vt=SM.Vtot, ri=SM.ri, sig=SSIG, V=SV, SIGEND=sig[sig.length-1];
+  var Vt=SM.Vtot, ri=SM.ri, sig=SSIG, V=SV, SIGEND=sig[sig.length-1], ARC=SM.arc;
   var U=new Float64Array(NM), F=new Uint8Array(NM);
   for(var i=0;i<NM;i++){ var u=Infinity; for(var c=0;c<NC;c++){ var v=SS[c][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); }
     U[i]=u; F[i]=(STAU[i]>=0 && STAU[i]<=t+1e-9 && isFinite(u))?1:0; }
-  [1,-1].forEach(function(d){
-    var tr=-1, fr=-1; for(var i=0;i<NM;i++){ if(F[i] && SGD[i]===d){ if(tr<0) tr=i; fr=i; } }
-    if(tr<0) return; if(d<0){ var tmp=tr; tr=fr; fr=tmp; }
-    var W=[], idx=[], CUM=[], cum=0;
-    for(var k=tr; d>0?k<=fr:k>=fr; k+=d){ var w=F[k]?Math.min(U[k],SW0[k]):SW0[k]; if(!(w>0)) w=0;
+  var runs=[], a=-1, last=-1;
+  for(var i1=0;i1<NM;i1++){ if(!F[i1]) continue; if(a<0){a=i1;} else if(ARC[i1]-ARC[last]>6.0){ runs.push([a,last]); a=i1; } last=i1; }
+  if(a>=0) runs.push([a,last]);
+  var out={polys:[], walls:[], pieces:[], Vwall:0, exh:false, elong:{}};
+  if(!runs.length){ out.pieces=[stPoly(0,SIGEND)]; out.polys=out.pieces.slice(); return out; }
+  var info=[];
+  runs.forEach(function(r){
+    var A_=r[0], B_=r[1], W=[], dV=[], tmin=Infinity;
+    for(var k=A_;k<=B_;k++){ var w=F[k]?Math.min(U[k],SW0[k]):SW0[k]; if(!(w>0)) w=0;
       var rm=(ri===0)?(Mx[k]+Nx[k]*SDS[k]*w/2):(My[k]+Ny[k]*SDS[k]*w/2);
-      var dsr=(d>0)?SDSS[k]:SDSS[Math.min(k+1,NM-1)];
-      cum+=2*Math.PI*Math.abs(rm)*w*dsr; W.push(w); idx.push(k); CUM.push(cum); }
-    var s0=SSR[tr], m=d*SM.sdir, V0=lerp1(s0,sig,V), avail=(m>0)?(Vt-V0):V0, exh=false;
-    if(cum>avail){ var kc=0; while(kc<CUM.length && CUM[kc]<avail) kc++; kc=Math.max(kc,1); W=W.slice(0,kc+1); idx=idx.slice(0,kc+1); cum=avail; exh=true; }
-    var Pout=idx.map(function(k,q){ return [Mx[k]+Nx[k]*SDS[k]*W[q], My[k]+Ny[k]*SDS[k]*W[q]]; });
-    var wall=Pout.concat(idx.slice().reverse().map(function(k){return [Mx[k],My[k]];}));
-    var sc=lerp1(V0+m*cum,V,sig), g={dir:d, wall:wall, Vwall:cum, exh:exh, s0:s0, sc:sc};
-    var Lw=0; for(var q=1;q<idx.length;q++) Lw+=Math.hypot(Mx[idx[q]]-Mx[idx[q-1]],My[idx[q]]-My[idx[q-1]]);
-    g.elong=Lw-Math.abs(sc-s0);
-    if(!exh){ var ke=idx[idx.length-1], sec=stSec(sc), nx=Nx[ke]*SDS[ke], ny=Ny[ke]*SDS[ke];
-      var inner=(sec[0][0]*nx+sec[0][1]*ny<=sec[1][0]*nx+sec[1][1]*ny)?sec[0]:sec[1], outer=(inner===sec[0])?sec[1]:sec[0], tgt=[Mx[ke],My[ke]];
-      var rem=stPoly(sc, m>0?SIGEND:0); g.rem=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null;
-      g.bridge=[tgt,Pout[Pout.length-1],remapV(outer,inner,tgt)]; }
-    out.groups.push(g); out.Vwall+=cum; out.exh=out.exh||exh; starts[m]=s0; });
-  var lo=(starts[-1]!==undefined)?starts[-1]:0, hi=(starts[1]!==undefined)?starts[1]:SIGEND;
-  if(starts[-1]!==undefined && starts[1]!==undefined && lo>hi){ lo=hi=0.5*(lo+hi); }
-  out.stay=stPoly(lo,hi); return out; }
+      W.push(w); dV.push(2*Math.PI*Math.abs(rm)*w*SDSS[k]); if(F[k] && STAU[k]<tmin) tmin=STAU[k]; }
+    var ties=[]; for(var k2=A_;k2<=B_;k2++){ if(F[k2] && STAU[k2]<=tmin+1e-6) ties.push(k2); }
+    var n=ties[Math.floor(ties.length/2)], sn=SSR[n], Vn=lerp1(sn,sig,V), VL=0, VR=0;
+    for(var k3=A_;k3<=B_;k3++){ if(k3<n) VL+=dV[k3-A_]; else VR+=dV[k3-A_]; }
+    var lo=A_, hi=B_, exL=false, exR=false;
+    if(VL>Vn){ var cl=0, kk=0; for(var k4=n-1;k4>=A_;k4--){ cl+=dV[k4-A_]; if(cl>=Vn) break; kk++; } lo=Math.max(A_,n-1-kk); VL=Vn; exL=true; }
+    if(VR>Vt-Vn){ var cr=0, kr=0; for(var k5=n;k5<=B_;k5++){ cr+=dV[k5-A_]; if(cr>=Vt-Vn) break; kr++; } hi=Math.min(B_,n+kr); VR=Vt-Vn; exR=true; }
+    var Pout=[], Mk=[]; for(var k6=lo;k6<=hi;k6++){ var w6=W[k6-A_]; Pout.push([Mx[k6]+Nx[k6]*SDS[k6]*w6, My[k6]+Ny[k6]*SDS[k6]*w6]); Mk.push([Mx[k6],My[k6]]); }
+    var wall=Pout.concat(Mk.reverse()); wall.push(Pout[0]);
+    var sa=lerp1(Vn-VL,V,sig), sb=lerp1(Vn+VR,V,sig);
+    info.push({lo:lo,hi:hi,n:n,sa:sa,sb:sb,sn:sn,Pout:Pout,exL:exL,exR:exR,eL:(ARC[n]-ARC[lo])-(sn-sa),eR:(ARC[hi]-ARC[n])-(sb-sn)});
+    out.walls.push(wall); out.Vwall+=VL+VR; out.exh=out.exh||exL||exR; });
+  var secIO=function(sg,k){ var sc=stSec(sg), nx=Nx[k]*SDS[k], ny=Ny[k]*SDS[k];
+    return (sc[0][0]*nx+sc[0][1]*ny<=sc[1][0]*nx+sc[1][1]*ny)?[sc[0],sc[1]]:[sc[1],sc[0]]; };
+  var bridge=function(k,Pk,inner,outer){ return [[Mx[k],My[k]],Pk,outer,inner,[Mx[k],My[k]]]; };
+  var br=[], pcs=[], f0=info[0], fl=info[info.length-1];
+  if(!f0.exL && f0.sa>1e-6){ var io=secIO(f0.sa,f0.lo), r0=attachPiece(stPoly(0,f0.sa),io[0],[Mx[f0.lo],My[f0.lo]]);
+    if(r0.P){ pcs.push(r0.P); br.push(bridge(f0.lo,f0.Pout[0],remapV(io[0],io[0],r0.tg),remapV(io[1],io[0],r0.tg))); } }
+  for(var q=0;q<info.length-1;q++){ var f1=info[q], f2=info[q+1];
+    if(f2.sa-f1.sb>1e-6){ var pm=stPoly(f1.sb,f2.sa); if(pm){ pcs.push(pm); var i1_=secIO(f1.sb,f1.hi), i2_=secIO(f2.sa,f2.lo);
+      br.push(bridge(f1.hi,f1.Pout[f1.Pout.length-1],i1_[0],i1_[1])); br.push(bridge(f2.lo,f2.Pout[0],i2_[0],i2_[1])); } } }
+  if(!fl.exR && SIGEND-fl.sb>1e-6){ var io2=secIO(fl.sb,fl.hi), r1=attachPiece(stPoly(fl.sb,SIGEND),io2[0],[Mx[fl.hi],My[fl.hi]]);
+    if(r1.P){ pcs.push(r1.P); br.push(bridge(fl.hi,fl.Pout[fl.Pout.length-1],remapV(io2[0],io2[0],r1.tg),remapV(io2[1],io2[0],r1.tg))); } }
+  out.pieces=pcs; out.polys=out.walls.concat(br).concat(pcs);
+  var ax=1-ri, an=(ax===0)?'X':'Y', up=((ax===0?Mx[NM-1]:My[NM-1])>=(ax===0?Mx[0]:My[0]));
+  out.elong[an+(up?'−':'+')+' ucu']=f0.eL; out.elong[an+(up?'+':'−')+' ucu']=fl.eR;
+  return out; }
 function drawStrip(X,Y,st){
   var fillP=function(P){ if(!P||P.length<3) return; ctx.beginPath(); P.forEach(function(p,q){ if(q) ctx.lineTo(X(p[0]),Y(p[1])); else ctx.moveTo(X(p[0]),Y(p[1])); }); ctx.closePath();
     ctx.fillStyle='rgba(61,111,182,0.62)'; ctx.fill(); ctx.strokeStyle='#16325c'; ctx.lineWidth=1.1; ctx.stroke(); };
-  fillP(st.stay); st.groups.forEach(function(g){ fillP(g.wall); if(g.bridge) fillP(g.bridge); if(g.rem) fillP(g.rem); });
+  st.polys.forEach(fillP);
   var box=document.getElementById('simstat'); box.style.display='block';
   var h='<b>Simülasyon — sac (hacim sabit)</b><br>Ön form hacmi: '+Math.round(SM.Vtot).toLocaleString('tr-TR')+' mm³<br>Kalıba sıvanan: %'+(st.Vwall/SM.Vtot*100).toFixed(1);
-  if(!st.groups.length) h+='<br>Makara henüz saca girmedi.';
-  st.groups.forEach(function(g){ h+='<br>'+(g.dir>0?'İleri':'Geri')+' pas uç uzaması: <b>'+g.elong.toFixed(2)+' mm</b>'+(g.exh?' <span style="color:#c0392b">(malzeme bitti)</span>':''); });
+  var ks=Object.keys(st.elong); if(!ks.length) h+='<br>Makara henüz saca girmedi.';
+  ks.forEach(function(k){ h+='<br>'+k+' uzaması: <b>'+st.elong[k].toFixed(2)+' mm</b>'; });
+  if(st.exh) h+='<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti (bir uçta).</span>';
   box.innerHTML=h; }
 function drawSim(X,Y,st){
   var fillP=function(P){ if(!P||P.length<3) return; ctx.beginPath(); P.forEach(function(p,q){ if(q) ctx.lineTo(X(p[0]),Y(p[1])); else ctx.moveTo(X(p[0]),Y(p[1])); }); ctx.closePath();
@@ -3396,13 +3508,13 @@ def _same_pt(a, b):
 _CODE_G = {'line': 1, 'fillet': 6}
 
 
-def build_block_table(segs, timeline, total_time):
+def build_block_table(segs, timeline, total_time, start=None):
     """CNC ekranı için blok tablosu. Her satır:
     [t0, t1, satır, kod, sx, sy, ex, ey, cx, cy, r, a0, a1, F]
     kod: 0=G0 1=G1 2=G2 3=G3 4=G4 5=WAIT 6=köşe geçişi. Koordinatlar programlanan (kompanzasyonsuz)."""
     r4 = lambda v: round(float(v), 4)
     entries = list(timeline)
-    blocks, ei, t_prev, last = [], 0, 0.0, None
+    blocks, ei, t_prev, last = [], 0, 0.0, (tuple(start) if start is not None else None)
     for seg in segs:
         if seg['type'] == 'wait':
             t0 = t_prev
@@ -3444,7 +3556,8 @@ def player_cnc_data(cfg, channels_segments, timelines, total_time, start_points=
         dia = ch.get('dia_mode') == 'diameter'
         ax = ch.get('dia_axis', 'X')
         out.append({'L': (ch['code'] or '').strip().split('\n'),
-                    'B': build_block_table(channels_segments[i], timelines[i], total_time),
+                    'B': build_block_table(channels_segments[i], timelines[i], total_time,
+                                           start_points[i] if start_points else (ch['x0'], ch['y0'])),
                     'fx': 2 if (dia and 'X' in ax) else 1, 'fy': 2 if (dia and 'Y' in ax) else 1,
                     'yo': round(float(ch.get('y_offset', 0.0)), 4),
                     'p0': [round(float(v), 4) for v in (start_points[i] if start_points else (ch['x0'], ch['y0']))]})
@@ -3462,7 +3575,7 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
         if len(C) > max_samples:                                    # çok uzun programlarda seyrelt
             idx = np.linspace(0, len(C) - 1, max_samples).round().astype(int)
             C, T = C[idx], T[idx]
-        S.append({'c': r4(C), 't': [round(float(v), 4) for v in T]})
+        S.append({'c': r4(C), 't': [float(v) for v in T]})
     out = {'M': r4(M), 'N': [round(float(v), 6) for v in Nrm.ravel()], 'S': S,
            'lim': [float(limits[i] if limits[i] > 0 else radii[i]) for i in range(N_CH)],
            'col': CHANNEL_ENV_COLORS[:N_CH], 'show': bool(show)}
@@ -3486,13 +3599,13 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
         if sm and sm.get('ok') and sm.get('kind') == 'strip':
             r5 = lambda a: [round(float(v), 5) for v in np.asarray(a, float).ravel()]
             stp = sm['strip']
-            out['sim'] = {'kind': 'strip', 'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']], 'ds': r5(fin['ds']),
-                          'ri': sm['ri'], 'sdir': int(sm['sdir']), 'thr': float(sm['thr']), 'Vtot': float(stp['Vtot']),
-                          'tau': [round(float(v), 5) if np.isfinite(v) else -1.0 for v in sm['tau']],
-                          'gdir': [int(v) for v in sm['gdir']], 'sigR': r5(sm['sigR']),
-                          'sig': r5(stp['sig']), 'V': [float(v) for v in stp['V']],
-                          'pax': r5(stp['pA'][:, 0]), 'pay': r5(stp['pA'][:, 1]),
-                          'pbx': r5(stp['pB'][:, 0]), 'pby': r5(stp['pB'][:, 1])}
+            out['sim'] = {'kind': 'strip', 'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']],
+                          'dsc': [float(v) for v in sm['dsc']], 'arc': [float(v) for v in fin['profile']['arc']],
+                          'ri': sm['ri'], 'thr': float(sm['thr']), 'Vtot': float(stp['Vtot']),
+                          'tau': [float(v) if np.isfinite(v) else -1.0 for v in sm['tau']], 'sigR': [float(v) for v in sm['sigR']],
+                          'sig': [float(v) for v in stp['sig']], 'V': [float(v) for v in stp['V']],
+                          'pax': [float(v) for v in stp['pA'][:, 0]], 'pay': [float(v) for v in stp['pA'][:, 1]],
+                          'pbx': [float(v) for v in stp['pB'][:, 0]], 'pby': [float(v) for v in stp['pB'][:, 1]]}
         elif sm and sm.get('ok'):
             r5 = lambda a: [round(float(v), 5) for v in np.asarray(a, float).ravel()]
             out['sim'] = {'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']], 'ds': r5(fin['ds']),
@@ -3533,7 +3646,7 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
             c['hx'].append(None if head is None or np.isnan(head[0]) else r3(head[0]))
             c['hy'].append(None if head is None or np.isnan(head[0]) else r3(head[1]))
         chans.append(c)
-    return {'T': r3(total_time), 'n': n, 'dt': dt, 'b': [r3(xmin), r3(xmax), r3(ymin), r3(ymax)],
+    return {'T': float(total_time), 'n': n, 'dt': dt, 'b': [r3(xmin), r3(xmax), r3(ymin), r3(ymax)],
             'mold': [[r3(p[0]), r3(p[1])] for p in mold_points], 'r': [r3(r) for r in radii],
             'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans,
             'env': env, 'cnc': cnc, 'act': [bool(channel_active(s)) for s in channels_segments]}
@@ -3670,7 +3783,7 @@ def run_all(*vals):
             if _sm.get('ok'):
                 q = sim_summary(_sm, _sm['final'])
                 if q.get('elong_groups') is not None:
-                    el = ", ".join(f"{'ileri' if k == '+' else 'geri'} pas uzaması {v:.2f} mm" for k, v in q['elong_groups'].items())
+                    el = ", ".join(f"{k} uzaması {v:.2f} mm" for k, v in q['elong_groups'].items())
                 else:
                     el = f"uç uzaması {q['elong']:.2f} mm ({q['axis']} yönünde)"
                 status += (f"\nSimülasyon: hacim sabit (fark %{q['err']:.2f}), {el or 'şekillenme yok'}"
