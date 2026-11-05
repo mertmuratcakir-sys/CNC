@@ -668,8 +668,8 @@ DIA_AXIS_CHOICES = [('X ekseni', 'X'), ('Y ekseni', 'Y'), ('X ve Y', 'XY')]
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
 N_CFG = MOLD_START + 5 + 1 + 1      # 31: kalıp(5) + çizilen yol modu + G0 hızı
-N_OPT = 12                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
-                                    # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen
+N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
+                                    # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
 
 def _num(v, default=0.0):
@@ -720,7 +720,8 @@ def opts_from_values(v):
             'pf_dx': _num(v[7], 0.0), 'pf_dy': _num(v[8], 0.0),
             'pf_layers': list(v[9]) if isinstance(v[9], (list, tuple)) else [],
             'pf_model': v[10] if v[10] in ('shear', 'flow') else 'shear',
-            'pf_radial': v[11] if v[11] in ('auto', 'X', 'Y') else 'auto'}
+            'pf_radial': v[11] if v[11] in ('auto', 'X', 'Y') else 'auto',
+            'pf_sim': bool(v[12]) if v[12] is not None else False}
 
 
 # -------------------------------------------------------------
@@ -1017,7 +1018,15 @@ def plot_comparison_fig(channels_segments, start_points, radii, mold_points, xna
     if form and form.get('pf_chains'):
         draw_preform_outline(ax, form['pf_chains'])
     if form and form.get('final'):
-        draw_final_form(ax, form['final'])
+        _sm = form['final'].get('sim')
+        if _sm and _sm.get('ok') and _sm.get('final') is not None:
+            draw_sim_product(ax, _sm['final'])
+            for _lbl, _col, _chunks in form['final'].get('lines', []):
+                for _k, P in enumerate(_chunks):
+                    ax.plot(P[:, 0], P[:, 1], color=_col, linewidth=1.4, linestyle=(0, (4, 2)),
+                            label=(_lbl if _k == 0 else ''), zorder=5)
+        else:
+            draw_final_form(ax, form['final'])
 
     for i in range(N_CH):
         drawn = set()
@@ -1255,6 +1264,7 @@ DXF_LAYER_CHOICES = [
     ('G0 hareketleri (temas yolu)', 'g0'),
     ('Ön form (DXF)', 'preform'),
     ('Son form yüzeyi (ön form ile)', 'final'),
+    ('Ürün (simülasyon sonu, hacim sabit)', 'product'),
 ]
 DXF_DEFAULT_LAYERS = ['mold', 'contour', 'envelope', 'circles', 'preform', 'final']
 _DXF_ACI = {'contour': [5, 30, 4], 'envelope': [3, 6, 1], 'center': [8, 8, 8], 'circles': [8, 8, 8], 'g0': [9, 9, 9]}
@@ -1389,6 +1399,16 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
             w.layer('IDEAL_FORM', 6)
             for P in chunks:
                 w.polyline('IDEAL_FORM', P)
+    _sm = (envelopes or {}).get('final', {}) or {}
+    _sm = _sm.get('sim') if isinstance(_sm, dict) else None
+    if 'product' in layers:
+        if _sm and _sm.get('ok') and _sm.get('final') is not None:
+            w.layer('URUN', 4)
+            for P in (_sm['final'].get('wall'), _sm['final'].get('bridge'), _sm['final'].get('rem')):
+                if P is not None:
+                    w.polyline('URUN', P)
+        else:
+            summary.append('URUN: simülasyon modu kapalı / çalışmadı, atlandı')
     if ('preform' in layers or 'final' in layers) and not (envelopes and envelopes.get('pf_chains')):
         summary.append('ON_FORM/SON_FORM: ön form yüklenmediği için atlandı')
     for name in w.layers:
@@ -1785,7 +1805,7 @@ PF_MODEL_CHOICES = [
     ('Kalıp üzerinde (flow forming): kalınlık = kalıptan ön form dış yüzeyine', 'flow'),
 ]
 PF_RADIAL_CHOICES = [
-    ('Otomatik (çap ayarından; yoksa X)', 'auto'),
+    ('Otomatik (çap ayarından; yoksa Y)', 'auto'),
     ('Radyal eksen X (dönme ekseni Y yönünde)', 'X'),
     ('Radyal eksen Y (dönme ekseni X yönünde)', 'Y'),
 ]
@@ -1799,7 +1819,7 @@ def resolve_radial(choice, cfg):
         if d.get('dia_mode') == 'diameter':
             ax = d.get('dia_axis', 'X')
             return ('Y' if ax == 'Y' else 'X'), 'çap ayarından'
-    return 'X', 'varsayılan'
+    return 'Y', 'varsayılan (parça yarıçapı Y)'
 
 
 def preform_axial_thickness(M, chains, rad_idx, chunk=256):
@@ -1863,8 +1883,23 @@ def compute_form(timelines, radii, mold_points, limit, preform=None):
     seg = np.r_[0.0, np.hypot(*(M[1:] - M[:-1]).T)]
     arc = np.cumsum(seg)
     if pf.get('model', 'shear') == 'shear':
-        return _form_shear(M, Nrm, fan, S, chains, pf.get('radial', 'X'), arc)
-    return _form_flow(M, Nrm, fan, S, chains, arc)
+        out = _form_shear(M, Nrm, fan, S, chains, pf.get('radial', 'Y'), arc)
+    else:
+        out = _form_flow(M, Nrm, fan, S, chains, arc)
+        out['final']['radial'] = pf.get('radial', 'Y')
+    fin = out['final']
+    fin['ds'] = np.r_[0.0, np.diff(arc)]
+    if pf.get('sim'):
+        sim = sim_setup(fin, chains)
+        fin['sim'] = sim
+        if sim.get('ok'):
+            sim['W0'] = sim_w0(fin, sim)
+            side_t, _sb = _tool_side(S, len(M))
+            sim['side'] = np.where(fin['side'] != 0, fin['side'], side_t).astype(int)
+            Fs, fs = sim_formed(S, sim['side'], sim['tmax'])
+            sim['F'], sim['formed'] = Fs, fs
+            sim['final'] = sim_state(fin, sim, Fs, fs)
+    return out
 
 
 def _form_shear(M, Nrm, fan, S, chains, radial, arc):
@@ -1910,7 +1945,7 @@ def _form_shear(M, Nrm, fan, S, chains, radial, arc):
                     'T': np.where(has, Ti, np.nan), 'F': F, 'formed': formed, 'main': ~fan,
                     'alpha': np.degrees(np.arcsin(np.clip(sin_a, 0, 1)))},
         'M': M, 'N': Nrm, 'side': side, 'T': np.where(has, t0, np.nan), 'Ti': np.where(has, Ti, np.nan),
-        'radial': radial,
+        'radial': radial, 'F': F, 'formed': formed, 'W0': np.where(has, np.nan_to_num(Ti), 0.0),
     }
     return {'ch': ch, 'final': final, 'pf_chains': chains}
 
@@ -1951,8 +1986,229 @@ def _form_flow(M, Nrm, fan, S, chains, arc):
         'profile': {'arc': arc, 'x': M[:, 0], 'y': M[:, 1], 'T0': T, 'T': T, 'F': F,
                     'formed': formed, 'main': ~fan, 'alpha': None},
         'M': M, 'N': Nrm, 'side': side, 'T': T, 'Ti': None,
+        'F': np.where(formed, F, np.nan), 'formed': formed, 'W0': np.where(has, np.nan_to_num(T), 0.0),
     }
     return {'ch': ch, 'final': final, 'pf_chains': chains}
+
+
+# -------------------------------------------------------------
+# DİNAMİK FORM SİMÜLASYONU (hacim sabit)
+#  Ön form, sabitlenen uçtan serbest uca sıralı bir "hacim bütçesi"dir (malzeme koordinatı):
+#    shear forming : malzeme yarıçapını korur  -> koordinat = yarıçap  (kesit: eksene paralel doğru)
+#    flow forming  : malzeme eksen boyunca dizili -> koordinat = eksenel konum (kesit: radyal doğru)
+#  Her an: kalıp başından makaranın ulaştığı en uzak noktaya kadar malzeme kalıba sıvanır
+#  (kalınlık = makara geçtiyse takım boşluğu, geçmediyse doğal kalınlık). Bu duvarın hacmi
+#  ön formun başından tüketilir; kalan ön form şeklini koruyarak duvarın ucuna taşınır.
+#  İnceltmeden artan hacim böylece kalan malzemeyi ileri iter = uçta uzama. Hacim: 2π·r·kalınlık·uzunluk.
+# -------------------------------------------------------------
+def _largest_closed(chains):
+    best, ba = None, 0.0
+    for A, cl in chains:
+        if not cl:
+            continue
+        x, y = A[:, 0], A[:, 1]
+        ar = abs(0.5 * np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]))
+        if ar > ba:
+            best, ba = A, ar
+    return best
+
+
+def _section(poly, k, c):
+    """Kapalı poligonun 'koordinat k = c' doğrusu ile kesişimleri (diğer koordinat, sıralı)."""
+    A, B = poly[:-1], poly[1:]
+    a, b = A[:, k], B[:, k]
+    m = ((a <= c) & (b > c)) | ((b <= c) & (a > c))
+    if not m.any():
+        return np.zeros(0)
+    o = 1 - k
+    t = (c - a[m]) / (b[m] - a[m])
+    return np.sort(A[m, o] + t * (B[m, o] - A[m, o]))
+
+
+def clip_halfplane(poly, k, c, d):
+    """Sutherland–Hodgman: d·(p[k] − c) ≥ 0 olan kısmı bırakır. Kapalı poligon döndürür (veya None)."""
+    P = poly[:-1] if np.allclose(poly[0], poly[-1]) else poly
+    out = []
+    n = len(P)
+    for i in range(n):
+        cur, prev = P[i], P[i - 1]
+        cin, pin = d * (cur[k] - c) >= 0, d * (prev[k] - c) >= 0
+        if cin != pin:
+            t = (c - prev[k]) / (cur[k] - prev[k])
+            out.append(prev + t * (cur - prev))
+        if cin:
+            out.append(cur)
+    if len(out) < 3:
+        return None
+    out.append(out[0])
+    return np.asarray(out)
+
+
+def poly_volume(poly, ri):
+    """Eksenel simetrik hacim (Pappus): 2π · alan · ağırlık merkezinin yarıçapı."""
+    if poly is None or len(poly) < 4:
+        return 0.0
+    x, y = poly[:, 0], poly[:, 1]
+    cr = x[:-1] * y[1:] - x[1:] * y[:-1]
+    A = 0.5 * cr.sum()
+    if abs(A) < 1e-12:
+        return 0.0
+    cx = ((x[:-1] + x[1:]) * cr).sum() / (6 * A)
+    cy = ((y[:-1] + y[1:]) * cr).sum() / (6 * A)
+    return float(2 * np.pi * abs(A) * abs(cy if ri == 1 else cx))
+
+
+def sim_setup(fin, chains, n=1200):
+    """Malzeme tablosu: koordinat c -> kümülatif hacim V(c) ve kesitin iki ucu."""
+    poly = _largest_closed(chains)
+    if poly is None:
+        return {'ok': False, 'why': 'Simülasyon için ön form kapalı kontur olmalı.'}
+    ri = 0 if fin.get('radial', 'Y') == 'X' else 1
+    shear = fin.get('mode') == 'shear'
+    k = ri if shear else 1 - ri
+    M = fin['M']
+    if shear:
+        dsgn = 1 if abs(M[-1, ri]) >= abs(M[0, ri]) else -1
+    else:
+        dsgn = 1 if M[-1, k] >= M[0, k] else -1
+    lo, hi = float(poly[:, k].min()), float(poly[:, k].max())
+    cs = np.linspace(lo, hi, n) if dsgn > 0 else np.linspace(hi, lo, n)
+    dens = np.zeros(n)
+    Ls = np.zeros(n)
+    elo = np.full((n, 2), np.nan)
+    ehi = np.full((n, 2), np.nan)
+    for j, c in enumerate(cs):
+        z = _section(poly, k, c)
+        if len(z) < 2:
+            continue
+        zz = z[:len(z) // 2 * 2].reshape(-1, 2)
+        Ls[j] = float((zz[:, 1] - zz[:, 0]).sum())
+        if k == ri:                                  # eksene paralel kesit: halka uzunluğu
+            dens[j] = 2 * np.pi * abs(c) * float((zz[:, 1] - zz[:, 0]).sum())
+        else:                                        # radyal kesit: halka alanı
+            dens[j] = float(np.pi * np.abs(zz[:, 1] ** 2 - zz[:, 0] ** 2).sum())
+        p1 = np.zeros(2); p2 = np.zeros(2)
+        p1[k] = c; p1[1 - k] = z[0]; p2[k] = c; p2[1 - k] = z[-1]
+        elo[j], ehi[j] = p1, p2
+    V = np.r_[0.0, np.cumsum(0.5 * (dens[1:] + dens[:-1]) * np.abs(np.diff(cs)))]
+    if V[-1] <= 0:
+        return {'ok': False, 'why': 'Ön form hacmi hesaplanamadı (radyal eksen / koordinatlar?).'}
+    for E in (elo, ehi):                             # boş kesitleri en yakın geçerli değerle doldur
+        ok = np.isfinite(E[:, 0])
+        if ok.any():
+            idx = np.where(ok, np.arange(n), -1)
+            idx = np.maximum.accumulate(idx)
+            first = int(np.argmax(ok))
+            idx[idx < 0] = first
+            E[:] = E[idx]
+    Lv = Ls[Ls > 0]
+    return {'ok': True, 'poly': poly, 'ri': ri, 'k': k, 'dir': dsgn, 'c': cs, 'V': V,
+            'lo': elo, 'hi': ehi, 'Vtot': float(V[-1]), 'Vpoly': poly_volume(poly, ri),
+            'tmax': float(Lv.max()), 'lmed': float(np.median(Lv)), 'shear': shear}
+
+
+def sim_w0(fin, sim):
+    """Makaranın geçmediği ama duvarın içinde kalan ışınlarda doğal (inceltilmemiş) kalınlık."""
+    T = np.asarray(fin['T'], float)
+    if sim['shear']:
+        axis = np.array([0.0, 1.0]) if sim['ri'] == 0 else np.array([1.0, 0.0])
+        sin_a = np.abs(fin['N'] @ axis)
+        return np.where(np.isfinite(T), T, sim['lmed']) * sin_a
+    return np.where(np.isfinite(T), T, sim['lmed'])
+
+
+def sim_formed(S, side, tmax):
+    """Simülasyonda şekillendirme: malzeme kalıba gelerek uzadığı için ön formun ilk konumuna bakılmaz;
+    makara kalıba ön form kalınlığından (tmax) daha yakın geçtiyse o nokta şekillenir."""
+    U = np.full(len(side), np.inf)
+    for s in S:
+        same = np.isfinite(s) & ((s == 0) | (np.sign(s) == side))
+        U = np.minimum(U, np.where(same & (np.abs(s) <= tmax + 1e-9), np.abs(s), np.inf))
+    formed = np.isfinite(U)
+    return np.where(formed, U, np.nan), formed
+
+
+def remap_volume(P, ri, src, tgt):
+    """Hacmi koruyarak taşı: eksenel koordinat kaydırılır, yarıçap r'² = r² + (r_hedef² − r_kaynak²)
+    ile yeniden yerleştirilir (d(r²) korunur -> 2π·r·dA hacmi aynen korunur)."""
+    P = np.asarray(P, float).copy()
+    ax = 1 - ri
+    P[..., ax] += tgt[ax] - src[ax]
+    d = tgt[ri] ** 2 - src[ri] ** 2
+    r = P[..., ri]
+    P[..., ri] = np.sign(np.where(r == 0, 1.0, r)) * np.sqrt(np.maximum(r * r + d, 0.0))
+    return P
+
+
+def _interp_pt(Vq, V, P):
+    return np.array([np.interp(Vq, V, P[:, 0]), np.interp(Vq, V, P[:, 1])])
+
+
+def sim_state(fin, sim, F, formed):
+    """Verilen anda (F: makara boşluğu, formed: makara geçti mi) ürün şekli ve hacim dengesi."""
+    M, N = fin['M'], fin['N']
+    sd = np.asarray(sim.get('side', fin['side']), float)
+    ds, W0, ri = fin['ds'], sim.get('W0', fin['W0']), sim['ri']
+    out = {'wall': None, 'rem': sim['poly'], 'bridge': None, 'T': np.zeros(2), 'Vwall': 0.0,
+           'Vrem': sim['Vtot'], 'exhausted': False, 'front': -1}
+    if not formed.any():
+        return out
+    front = int(np.max(np.where(formed)[0]))
+    w = np.where(formed[:front + 1], F[:front + 1], W0[:front + 1])
+    w = np.clip(np.nan_to_num(w), 0.0, None)
+    Mf, Nf, sf = M[:front + 1], N[:front + 1], sd[:front + 1]
+    rmid = np.abs((Mf + Nf * (sf * w / 2)[:, None])[:, ri])
+    cum = np.cumsum(2 * np.pi * rmid * w * ds[:front + 1])
+    Vt = sim['Vtot']
+    if cum[-1] > Vt:                                 # malzeme yetmedi: duvar burada biter
+        kc = int(np.searchsorted(cum, Vt))
+        front, out['exhausted'] = max(kc, 1), True
+        w, Mf, Nf, sf, cum = w[:front + 1], Mf[:front + 1], Nf[:front + 1], sf[:front + 1], cum[:front + 1]
+    Vc = float(min(cum[-1], Vt))
+    Pout = Mf + Nf * (sf * w)[:, None]
+    out.update({'wall': np.vstack([Pout, Mf[::-1], Pout[:1]]), 'Vwall': Vc, 'Vrem': Vt - Vc, 'front': front})
+    if out['exhausted']:
+        out['rem'] = None
+        return out
+    c = float(np.interp(Vc, sim['V'], sim['c']))
+    plo, phi = _interp_pt(Vc, sim['V'], sim['lo']), _interp_pt(Vc, sim['V'], sim['hi'])
+    nrm = Nf[-1] * sf[-1]
+    inner, outer = (plo, phi) if np.dot(plo, nrm) <= np.dot(phi, nrm) else (phi, plo)
+    tgt = Mf[-1]
+    rem = clip_halfplane(sim['poly'], sim['k'], c, sim['dir'])
+    out['T'] = tgt - inner
+    out['src'], out['tgt'] = inner, tgt
+    out['rem'] = None if rem is None else remap_volume(rem, ri, inner, tgt)
+    out['bridge'] = np.array([tgt, Pout[-1], remap_volume(outer, ri, inner, tgt), tgt])
+    out['c'] = c
+    return out
+
+
+def sim_summary(sim, st):
+    """Hacim dengesi ve uç uzaması (malzeme yönünde)."""
+    k, d = sim['k'], sim['dir']
+    ext = (lambda P: float(P[:, k].max() if d > 0 else P[:, k].min()))
+    end_old = ext(sim['poly'])
+    ref = st.get('rem') if st.get('rem') is not None else st.get('wall')
+    elong = d * (ext(ref) - end_old) if ref is not None else 0.0
+    Vrem = poly_volume(st['rem'], sim['ri']) if st.get('rem') is not None else 0.0
+    return {'Vtot': sim['Vtot'], 'Vwall': st['Vwall'], 'Vrem': Vrem,
+            'err': (st['Vwall'] + Vrem - sim['Vtot']) / sim['Vtot'] * 100, 'elong': elong,
+            'axis': 'X' if k == 0 else 'Y', 'exhausted': st.get('exhausted', False)}
+
+
+SIM_COLOR = '#3d6fb6'
+
+
+def draw_sim_product(ax, st, label='Ürün (simülasyon sonu)'):
+    first = True
+    for poly in (st.get('wall'), st.get('bridge'), st.get('rem')):
+        if poly is None:
+            continue
+        ax.fill(poly[:, 0], poly[:, 1], color=SIM_COLOR, alpha=0.55, linewidth=0, zorder=3,
+                label=(label if first else ''))
+        ax.plot(poly[:, 0], poly[:, 1], color='#16325c', linewidth=1.0, zorder=4)
+        first = False
 
 
 # ---------- çizim yardımcıları ----------
@@ -2066,6 +2322,16 @@ def thickness_profile(form, step_mm=1.0):
         else:
             lines.append("**Takım ön forma hiç girmedi** — form oluşmadı.")
         cols = ['Kalıp boyunca (mm)', 'X', 'Y', 'Ön form (mm)', 'Son (mm)', 'İnceltme (%)']
+    sm = fin.get('sim')
+    if sm is not None:
+        if sm.get('ok') and sm.get('final') is not None:
+            q = sim_summary(sm, sm['final'])
+            lines.append(f"**Simülasyon (hacim sabit):** ön form {q['Vtot'] / 1000:.2f} cm³ = kalıba sıvanan "
+                         f"{q['Vwall'] / 1000:.2f} + kalan {q['Vrem'] / 1000:.2f} cm³ (fark %{q['err']:.2f}); "
+                         f"**uç uzaması ({q['axis']} yönünde): {q['elong']:.2f} mm**"
+                         + (" — **malzeme bitti**" if q['exhausted'] else ""))
+        else:
+            lines.append(f"**Simülasyon çalışmadı:** {sm.get('why', '')}")
     idx = np.where(m)[0]
     keep, last = [], -1e18
     for j in idx:
@@ -2245,7 +2511,7 @@ def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, prefor
                      'xname': opts['xname'], 'yname': opts['yname'],
                      'show_env': opts['show_env'], 'env_limit': opts['env_limit']},
             'preform': {'use': opts['pf_use'], 'dx': opts['pf_dx'], 'dy': opts['pf_dy'],
-                        'model': opts['pf_model'], 'radial': opts['pf_radial'],
+                        'model': opts['pf_model'], 'radial': opts['pf_radial'], 'sim': opts['pf_sim'],
                         'selected': opts['pf_layers'],
                         'name': (preform or {}).get('name'),
                         'layers': {k: [[[round(x, 4), round(y, 4)] for x, y in pl] for pl in v]
@@ -2291,7 +2557,7 @@ def json_dict_to_updates(data, gr_update):
         ups.append(gr_update(choices=preform_layer_choices(st), value=sel))
     else:
         ups.append(gr_update())
-    for key in ('model', 'radial'):
+    for key in ('model', 'radial', 'sim'):
         ups.append(pick(pf, key))
     if pf.get('layers'):
         ups.append(st)                                  # gr.State: değer doğrudan verilir
@@ -2365,6 +2631,7 @@ input[type=range]{vertical-align:middle}
   <table id="dt"><thead><tr><th>Kanal</th><th>Anlık</th><th>Min</th><th>Maks</th></tr></thead><tbody id="dtb"></tbody></table>
   <button id="measb" class="main">📏 Ölçümü Başlat</button>
   <div id="mstat">Ölçüm yapılmadı. “Ölçümü Başlat” ile başlat, “Ölçümü Bitir” ile sabitle.</div>
+  <div id="simstat" style="display:none;margin-top:12px;padding-top:8px;border-top:1px solid #ddd;font-size:12px;line-height:1.5"></div>
  </div>
 </div>
 <div id="cncrow"></div>
@@ -2461,8 +2728,14 @@ function envAt(ch){ var j=upperBound(EV.S[ch].t,t+1e-9), c=Math.floor(j/CP), ca=
 // ön form (varsa): ışın başına lokal malzeme kalınlığı (T) ve malzemenin olduğu taraf (SD)
 var HASPF=!!(EV&&EV.T), SHEAR=!!(EV&&EV.mode==='shear'), Ta=null, SD=null, TI=null;
 if(HASPF){ Ta=new Float64Array(EV.T); SD=new Int8Array(EV.sd); if(SHEAR) TI=new Float64Array(EV.Ti); }
+// dinamik form simülasyonu (hacim sabit)
+var SM=(EV&&EV.sim)?EV.sim:null, SIMD=!!SM, SW0=null, SDS=null, SDSS=null, SIMP=null, SIMEND=0;
+if(SIMD){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.ds); SIMP=[];
+  for(var q9=0;q9<SM.poly.length;q9+=2) SIMP.push([SM.poly[q9],SM.poly[q9+1]]);
+  SIMEND=SIMP.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
 function okv(i,v,L){
   if(!isFinite(v)) return false;
+  if(SIMD){ if(v!==0 && ((v>0)!==(SDS[i]>0))) return false; return Math.abs(v)<=SM.tmax+1e-9; }
   if(HASPF){ var T=Ta[i]; if(!(T>0)) return false; if(v!==0 && ((v>0)!==(SD[i]>0))) return false;
     return SHEAR ? Math.abs(v)<=T+1e-9 : Math.abs(v)<T-1e-6; }
   return Math.abs(v)<=L;
@@ -2474,11 +2747,67 @@ function runs(ok,px,py,brk){ var out=[], cur=[];
   if(cur.length>1) out.push(cur); return out; }
 function polyPath(run,fx,fy,X,Y,back){ for(var q=0;q<run.length;q++){var i=run[q]; if(q) ctx.lineTo(X(fx(i)),Y(fy(i))); else ctx.moveTo(X(fx(i)),Y(fy(i)));}
   if(back){ for(var q2=run.length-1;q2>=0;q2--){var i2=run[q2]; ctx.lineTo(X(back[0](i2)),Y(back[1](i2)));} ctx.closePath(); } }
+function simInterp(Vq,A){ var V=SM.V, n=V.length;
+  if(Vq<=V[0]) return A[0]; if(Vq>=V[n-1]) return A[n-1];
+  var j=upperBound(V,Vq), i0=j-1, f=(V[j]>V[i0])?(Vq-V[i0])/(V[j]-V[i0]):0; return A[i0]+(A[j]-A[i0])*f; }
+function remapV(p,src,tgt){ var ri=SM.ri, ax=1-ri, o=[p[0],p[1]]; o[ax]+=tgt[ax]-src[ax];
+  var d=tgt[ri]*tgt[ri]-src[ri]*src[ri], r=o[ri], sg=(r<0)?-1:1; o[ri]=sg*Math.sqrt(Math.max(r*r+d,0)); return o; }
+function clipHalf(P,k,c,d){ var out=[], n=P.length; if(n>1&&P[0][0]===P[n-1][0]&&P[0][1]===P[n-1][1]) n--;
+  for(var i=0;i<n;i++){ var cur=P[i], prev=P[(i-1+n)%n], cin=d*(cur[k]-c)>=0, pin=d*(prev[k]-c)>=0;
+    if(cin!==pin){ var tt=(c-prev[k])/(cur[k]-prev[k]); out.push([prev[0]+tt*(cur[0]-prev[0]), prev[1]+tt*(cur[1]-prev[1])]); }
+    if(cin) out.push(cur); }
+  return out.length>=3?out:null; }
+function simState(SS){
+  var front=-1, U=new Float64Array(NM);
+  for(var i=0;i<NM;i++){ var u=Infinity; for(var c=0;c<NC;c++){ var v=SS[c][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } U[i]=u; if(isFinite(u)) front=i; }
+  if(front<0) return {front:-1, Vc:0};
+  var Vt=SM.Vtot, ri=SM.ri, end=front, exh=false, W=[], CUM=[], cum=0;
+  for(var i2=0;i2<=front;i2++){ var w=isFinite(U[i2])?U[i2]:SW0[i2]; if(!(w>0)) w=0;
+    var rm=(ri===0)?(Mx[i2]+Nx[i2]*SDS[i2]*w/2):(My[i2]+Ny[i2]*SDS[i2]*w/2);
+    cum+=2*Math.PI*Math.abs(rm)*w*SDSS[i2]; W.push(w); CUM.push(cum); }
+  if(cum>Vt){ var kc=0; while(kc<CUM.length && CUM[kc]<Vt) kc++;      // Python: searchsorted(cum, Vt)
+    end=Math.max(kc,1); exh=true; W=W.slice(0,end+1); cum=Vt; }
+  var st={front:end, W:W, exh:exh, Vc:cum};
+  if(exh) return st;
+  var cc=simInterp(cum,SM.c), lo=[simInterp(cum,SM.lox),simInterp(cum,SM.loy)], hi=[simInterp(cum,SM.hix),simInterp(cum,SM.hiy)];
+  var nx=Nx[end]*SDS[end], ny=Ny[end]*SDS[end];
+  var inner=(lo[0]*nx+lo[1]*ny<=hi[0]*nx+hi[1]*ny)?lo:hi, outer=(inner===lo)?hi:lo, tgt=[Mx[end],My[end]];
+  var rem=clipHalf(SIMP,SM.k,cc,SM.dir);
+  st.rem=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null;
+  var wo=W[end]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],remapV(outer,inner,tgt)];
+  st.T=[tgt[0]-inner[0],tgt[1]-inner[1]]; st.c=cc;
+  return st; }
+function drawSim(X,Y,st){
+  var fillP=function(P){ if(!P||P.length<3) return; ctx.beginPath(); P.forEach(function(p,q){ if(q) ctx.lineTo(X(p[0]),Y(p[1])); else ctx.moveTo(X(p[0]),Y(p[1])); }); ctx.closePath();
+    ctx.fillStyle='rgba(61,111,182,0.62)'; ctx.fill(); ctx.strokeStyle='#16325c'; ctx.lineWidth=1.1; ctx.stroke(); };
+  var box=document.getElementById('simstat'); box.style.display='block';
+  if(st.front<0){ fillP(SIMP); box.innerHTML='<b>Simülasyon</b><br>Makara henüz malzemeye girmedi.<br>Ön form hacmi: '+(SM.Vtot/1000).toFixed(2)+' cm³'; return; }
+  var wall=[]; for(var i=0;i<=st.front;i++){ var w=st.W[i]; wall.push([Mx[i]+Nx[i]*SDS[i]*w, My[i]+Ny[i]*SDS[i]*w]); }
+  for(var i3=st.front;i3>=0;i3--) wall.push([Mx[i3],My[i3]]);
+  fillP(wall); if(st.bridge) fillP(st.bridge); if(st.rem) fillP(st.rem);
+  var endNew;
+  if(st.rem){ endNew=st.rem.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
+  else { endNew=wall.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
+  var el=SM.dir*(endNew-SIMEND), kn=(SM.k===0)?'X':'Y';
+  box.innerHTML='<b>Simülasyon (hacim sabit)</b><br>Kalıba sıvanan: %'+(st.Vc/SM.Vtot*100).toFixed(1)+' &nbsp;('+(st.Vc/1000).toFixed(2)+' / '+(SM.Vtot/1000).toFixed(2)+' cm³)'+
+    '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+
+    (st.T?'<br>Kalan malzeme kayması: ΔX '+st.T[0].toFixed(2)+' / ΔY '+st.T[1].toFixed(2)+' mm':'')+
+    (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
   var SS=[]; for(var c0=0;c0<NC;c0++) SS.push(envAt(c0));
   var F=null, BRK=Math.max(2,0.5*(EV.medT||EV.lim[0]));
-  if(HASPF){
+  if(SIMD){
+    ctx.strokeStyle='#9a9a9a'; ctx.lineWidth=1.0; ctx.setLineDash([8,3,2,3]);
+    (EV.pf||[]).forEach(function(pl){ ctx.beginPath(); for(var q=0;q<pl.length;q+=2){ if(q) ctx.lineTo(X(pl[q]),Y(pl[q+1])); else ctx.moveTo(X(pl[q]),Y(pl[q+1])); } ctx.stroke(); });
+    ctx.setLineDash([]);
+    drawSim(X,Y,simState(SS));
+    if(SHEAR){ ctx.strokeStyle='#6a3d9a'; ctx.lineWidth=1.4; ctx.setLineDash([4,2]);
+      var ixs=function(i){return Mx[i]+Nx[i]*SDS[i]*TI[i];}, iys=function(i){return My[i]+Ny[i]*SDS[i]*TI[i];};
+      runs(function(i){return Ta[i]>0 && TI[i]>1e-6;},ixs,iys,BRK).forEach(function(r){ctx.beginPath(); polyPath(r,ixs,iys,X,Y,null); ctx.stroke();});
+      ctx.setLineDash([]); }
+  }
+  if(HASPF && !SIMD){
     F=new Float64Array(NM);
     for(var i=0;i<NM;i++){ var T=Ta[i]; if(!(T>0)){F[i]=NaN;continue;} var u=SHEAR?Infinity:T;
       for(var c1=0;c1<NC;c1++){ var v=SS[c1][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } F[i]=isFinite(u)?u:NaN; }
@@ -2516,7 +2845,7 @@ function drawEnv(X,Y){
       if(!HASPF){ ctx.beginPath(); polyPath(r,ex,ey,X,Y,[function(i){return Mx[i];},function(i){return My[i];}]); ctx.fillStyle=hex2rgba(col,0.32); ctx.fill(); }
       ctx.beginPath(); polyPath(r,ex,ey,X,Y,null); ctx.setLineDash([6,3]); ctx.strokeStyle=col; ctx.lineWidth=1.8; ctx.stroke(); ctx.setLineDash([]); });
   })(ch); }
-  if(HASPF){ ctx.strokeStyle='#1f3a5f'; ctx.lineWidth=2.2;
+  if(HASPF && !SIMD){ ctx.strokeStyle='#1f3a5f'; ctx.lineWidth=2.2;
     runs(function(i){return Ta[i]>0 && isFinite(F[i]);},function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},BRK)
       .forEach(function(r){ ctx.beginPath(); polyPath(r,function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},X,Y,null); ctx.stroke(); }); }
 }
@@ -2629,7 +2958,10 @@ function draw(){
   leg('#000','Kalıp (sabit)',lgy+8);
   for(var qq=0;qq<D.col.length;qq++) leg(D.col[qq],'Kanal '+(qq+1)+' — kontur',lgy+28+qq*20);
   if(EV&&envC.checked){ for(var qe=0;qe<NC;qe++){ ctx.setLineDash([6,3]); leg(EV.col[qe],'Kanal '+(qe+1)+' — radüs izi',lgy+28+(D.col.length+qe)*20); ctx.setLineDash([]); }
-    if(HASPF){ var yb=lgy+28+(D.col.length+NC)*20; ctx.setLineDash([8,3,2,3]); leg('#7f7f7f','Ön form (DXF)',yb); ctx.setLineDash([]);
+    if(HASPF && SIMD){ var ys=lgy+28+(D.col.length+NC)*20; ctx.setLineDash([8,3,2,3]); leg('#9a9a9a','Ön form (ilk hali)',ys); ctx.setLineDash([]);
+      ctx.fillStyle='rgba(61,111,182,0.75)'; ctx.fillRect(lgx,ys+16,22,8); ctx.fillStyle='#222'; ctx.fillText('Ürün (simülasyon)',lgx+28,ys+24);
+      if(SHEAR){ ctx.setLineDash([4,2]); leg('#6a3d9a','İdeal (t₀·sin α)',ys+40); ctx.setLineDash([]); } }
+    else if(HASPF){ var yb=lgy+28+(D.col.length+NC)*20; ctx.setLineDash([8,3,2,3]); leg('#7f7f7f','Ön form (DXF)',yb); ctx.setLineDash([]);
       leg('#1f3a5f',SHEAR?'Gerçek son yüzey':'Son form yüzeyi',yb+20);
       var box=function(c,txt,y){ ctx.fillStyle=c; ctx.fillRect(lgx,y,22,8); ctx.fillStyle='#222'; ctx.fillText(txt,lgx+28,y+8); };
       box('rgba(47,127,216,0.55)','Et (kalıp–yüzey)',yb+36);
@@ -2750,6 +3082,14 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
         out['lim'] = [tmax] * N_CH                          # takım örneklerini elemek için üst sınır
         out['medT'] = float(np.median(T[has])) if has.any() else 1.0
         out['pf'] = [[round(float(v), 4) for v in np.asarray(A).ravel()] for A, _cl in form['pf_chains']]
+        sm = fin.get('sim')
+        if sm and sm.get('ok'):
+            r5 = lambda a: [round(float(v), 5) for v in np.asarray(a, float).ravel()]
+            out['sim'] = {'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']], 'ds': r5(fin['ds']),
+                          'ri': sm['ri'], 'k': sm['k'], 'dir': sm['dir'], 'tmax': sm['tmax'], 'Vtot': sm['Vtot'],
+                          'c': r5(sm['c']), 'V': [float(v) for v in sm['V']],
+                          'lox': r5(sm['lo'][:, 0]), 'loy': r5(sm['lo'][:, 1]),
+                          'hix': r5(sm['hi'][:, 0]), 'hiy': r5(sm['hi'][:, 1]), 'poly': r5(sm['poly'])}
     return out
 
 
@@ -2827,7 +3167,8 @@ def _preform(opts, cfg=None):
     if not chains:
         return None
     radial, why = resolve_radial(opts.get('pf_radial', 'auto'), cfg or {})
-    return {'chains': chains, 'model': opts.get('pf_model', 'shear'), 'radial': radial, 'radial_why': why}
+    return {'chains': chains, 'model': opts.get('pf_model', 'shear'), 'radial': radial, 'radial_why': why,
+            'sim': bool(opts.get('pf_sim'))}
 
 
 def _pf_note(opts, cfg, form):
@@ -2906,6 +3247,14 @@ def run_all(*vals):
         status = (note + "\n" if note else "") + \
                  (f"Simülasyon hazır. Toplam süre: {total_time:.2f} sn — animasyon kare sayısı: {n_frames}")
         status += _pf_note(opts, cfg, form)
+        _sm = ((form or {}).get('final') or {}).get('sim') if form else None
+        if _sm is not None:
+            if _sm.get('ok'):
+                q = sim_summary(_sm, _sm['final'])
+                status += (f"\nSimülasyon: hacim sabit (fark %{q['err']:.2f}), uç uzaması {q['elong']:.2f} mm "
+                           f"({q['axis']} yönünde)" + (" — malzeme bitti." if q['exhausted'] else ". Hızlı Oynatıcıda adım adım izle."))
+            else:
+                status += "\nSimülasyon çalışmadı: " + _sm.get('why', '')
         return (frame0,
                 gr.update(minimum=0, maximum=n_frames, value=0),
                 gr.update(value=playback_interval(fps, speed), active=False),
@@ -3173,6 +3522,9 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                 pf_radial = gr.Dropdown(PF_RADIAL_CHOICES, value='auto', label="Radyal eksen (shear forming için)",
                                         info="Malzeme aynı yarıçapta kalarak kalıba sıvanır; sin α kalıp yüzeyinin "
                                              "dönme ekseniyle açısından hesaplanır.")
+                pf_sim = gr.Checkbox(value=False, label="Simülasyon modu: ön form adım adım şekillensin (hacim sabit)",
+                                     info="Makaranın geçtiği yer kalıba sıvanıp takım boşluğu kalınlığına iner; artan hacim "
+                                          "kalan malzemeyi ileri iterek uçta uzama olarak görünür. Hızlı Oynatıcıda canlı izlenir.")
                 with gr.Row():
                     pf_use = gr.Checkbox(value=True, label="Ön formu kullan")
                     pf_dx = gr.Number(value=0.0, label="Ön form kaydırma X (mm)")
@@ -3281,7 +3633,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
 
     # ---------------- OLAYLAR ----------------
     opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit,
-                 pf_use, pf_dx, pf_dy, pf_layers, pf_model, pf_radial]         # sıra: opts_from_values
+                 pf_use, pf_dx, pf_dy, pf_layers, pf_model, pf_radial, pf_sim] # sıra: opts_from_values
     all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps + [pf_state]
 
     run_btn.click(
@@ -3295,7 +3647,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
         _c.release(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
     for _c in (x_name, y_name, env_limit, pf_dx, pf_dy):
         _c.submit(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
-    for _c in (show_env, pf_use, pf_layers, pf_model, pf_radial):
+    for _c in (show_env, pf_use, pf_layers, pf_model, pf_radial, pf_sim):
         _c.input(redraw_plots, inputs=all_inputs, outputs=redraw_outputs)
 
     # ön form DXF
