@@ -2163,6 +2163,7 @@ def compute_form(timelines, radii, mold_points, limit, preform=None):
             sim['side'] = np.where(fin['side'] != 0, fin['side'], side_t).astype(int)
             sim['lim'] = sim_limit(M, Nrm, chains, sim) if model == 'flow' else np.full(len(M), sim['tmax'])
             sim['tR'] = sim_reach_times(M, arc, timelines, radii) if model == 'flow' else None
+            sim['Rb'] = float(np.clip(sim['lmed'], 3.0, 60.0))   # kuyruğun en küçük bükülme yarıçapı
             Fs, fs = sim_formed(S, sim['side'], sim['lim'], sim['tR'])
             sim['F'], sim['formed'] = Fs, fs
             sim['final'] = sim_state(fin, sim, Fs, fs)
@@ -2822,6 +2823,97 @@ def _interp_pt(Vq, V, P):
     return np.array([np.interp(Vq, V, P[:, 0]), np.interp(Vq, V, P[:, 1])])
 
 
+BEND_STEP = 0.5        # bükülme ekseni adımı (mm)
+
+
+def _nearest_ray(q, M):
+    d2 = (q[0] - M[:, 0]) ** 2 + (q[1] - M[:, 1]) ** 2
+    return int(np.argmin(d2))
+
+
+def _mold_pen(q, M, N, sd):
+    """Noktanın kalıba işaretli mesafesi ve en yakın ışın; kalıbın iki ucunun ötesindeki noktalar serbest (+inf)."""
+    k = _nearest_ray(q, M)
+    if k == len(M) - 1 and np.dot(q - M[-1], M[-1] - M[-2]) > 0:
+        return np.inf, k
+    if k == 0 and np.dot(q - M[0], M[0] - M[1]) > 0:
+        return np.inf, k
+    return float(np.dot(q - M[k], N[k] * sd[k])), k
+
+
+def _mold_pen_all(P, M, N, sd):
+    sg = _mold_signed(P, M, N, sd)
+    tE, tS = M[-1] - M[-2], M[0] - M[1]
+    beyond = (((P - M[-1]) @ tE) > 0) & (np.hypot(*(P - M[-1]).T) <= np.hypot(*(P - M[0]).T))
+    beyond |= (((P - M[0]) @ tS) > 0) & (np.hypot(*(P - M[0]).T) < np.hypot(*(P - M[-1]).T))
+    return np.where(beyond, np.inf, sg)
+
+
+def _bend_tail(sim, c, use_lo, src, outer, tgt, M, N, sd, ri, Vtarget, remP, outP):
+    """Duvarın ucuna taşınan kalan ön form (kuyruk) kalıba giriyorsa: kalıba değdiği yerden dışa doğru bükülür.
+    Omurga = kuyruğun İÇ yüzeyi (kesit tablosundaki iç noktalar): kendi şekliyle ilerler; kalıba değen
+    kesit kalıp yüzeyine oturur ve o andan itibaren kesitler biriken bükülme açısı kadar döner (kalıcı bükülme,
+    kalıp geri çekilince geri yaylanmaz). Kesit kalınlığı yarıçap değişimine göre (2π·r·t) düzeltilir,
+    toplam hacim tam korunur. Kalıba girmeyen kuyruğa dokunulmaz. Döndürür: (kuyruk poligonu, köprü dış noktası)"""
+    if remP is None or len(remP) < 4:
+        return remP, outP
+    if float(_mold_pen_all(remP, M, N, sd).min()) >= -0.01:
+        return remP, outP
+    cs, d = sim['c'], sim['dir']
+    m = d * cs > d * c
+    if int(m.sum()) < 2:
+        return remP, outP
+    Ls, Hs = sim['lo'][m], sim['hi'][m]
+    Is, Os = (Ls, Hs) if use_lo else (Hs, Ls)
+    I = remap_volume(np.vstack([src, Is]), ri, src, tgt)
+    O = remap_volume(np.vstack([outer, Os]), ri, src, tgt)
+    n = len(I)
+    In = I.copy()
+    th = np.zeros(n)
+    t = 0.0
+    Rb = float(sim.get('Rb', 20.0))
+    for j in range(1, n):
+        sg = I[j] - I[j - 1]
+        L = float(np.hypot(*sg))
+        if L < 1e-12:
+            In[j], th[j] = In[j - 1], t
+            continue
+        ct, st = np.cos(t), np.sin(t)
+        rs = np.array([ct * sg[0] - st * sg[1], st * sg[0] + ct * sg[1]])
+        cand = In[j - 1] + rs
+        pen, k = _mold_pen(cand, M, N, sd)
+        if pen < 0:                                   # kalıba değdi: dön (en fazla L/Rb), kalan girişi dışa it
+            proj = cand - pen * (N[k] * sd[k])
+            dd = proj - In[j - 1]
+            need = float(np.arctan2(rs[0] * dd[1] - rs[1] * dd[0], rs[0] * dd[0] + rs[1] * dd[1]))
+            lim = L / Rb
+            use = min(max(need, -lim), lim)
+            t += use
+            cu, su = np.cos(use), np.sin(use)
+            cand = In[j - 1] + np.array([cu * rs[0] - su * rs[1], su * rs[0] + cu * rs[1]])
+            pen2, k2 = _mold_pen(cand, M, N, sd)
+            if pen2 < 0:
+                cand = cand - pen2 * (N[k2] * sd[k2])
+        In[j], th[j] = cand, t
+    W = O - I
+    Wr = np.c_[np.cos(th) * W[:, 0] - np.sin(th) * W[:, 1], np.sin(th) * W[:, 0] + np.cos(th) * W[:, 1]]
+    Wr *= (np.abs(I[:, ri]) / np.maximum(np.abs(In[:, ri]), 1e-6))[:, None]
+
+    def build(fv):
+        On = In + Wr * fv
+        return np.vstack([In, On[::-1], In[:1]]), On
+
+    fa, fb = 1.0, 1.02
+    va, vb = poly_volume(build(fa)[0], ri) - Vtarget, poly_volume(build(fb)[0], ri) - Vtarget
+    for _ in range(6):                                # hacmi tam koru (kalınlık çarpanı)
+        if abs(vb) < 1e-9 * max(Vtarget, 1.0) or vb == va:
+            break
+        fa, fb, va = fb, fb - vb * (fb - fa) / (vb - va), vb
+        vb = poly_volume(build(fb)[0], ri) - Vtarget
+    poly, On = build(fb)
+    return poly, On[:1]
+
+
 def _sim_vat(sim, c):
     """Malzeme koordinatı c'ye kadar (sabit uçtan) biriken ön form hacmi."""
     cs, d = sim['c'], sim['dir']
@@ -2872,8 +2964,14 @@ def sim_state(fin, sim, F, formed):
     rem = clip_halfplane(sim['poly'], k, c, sim['dir'])
     out['T'] = tgt - inner
     out['src'], out['tgt'] = inner, tgt
-    out['rem'] = None if rem is None else remap_volume(rem, ri, inner, tgt)
-    out['bridge'] = np.array([tgt, Pout[-1], remap_volume(outer, ri, inner, tgt), tgt])
+    remP = None if rem is None else remap_volume(rem, ri, inner, tgt)
+    outP = remap_volume(outer, ri, inner, tgt)[None, :]
+    if remP is not None:
+        remP, outP = _bend_tail(sim, c, inner is plo, inner, outer, tgt, M, N, sd, ri,
+                                sim['Vtot'] - V0 - Vc, remP, outP)
+        out['bent'] = remP is not None and outP is not None and not np.allclose(outP[0], remap_volume(outer, ri, inner, tgt))
+    out['rem'] = remP
+    out['bridge'] = np.array([tgt, Pout[-1], outP[0], tgt])
     out['c'] = c
     return out
 
@@ -3488,6 +3586,45 @@ function simVat(c){ var cs=SM.c, V=SM.V, d=SM.dir, n=cs.length, q=d*c;
   if(q<=d*cs[0]) return V[0]; if(q>=d*cs[n-1]) return V[n-1];
   var lo=0, hi=n-1; while(hi-lo>1){ var m=(lo+hi)>>1; if(d*cs[m]<=q) lo=m; else hi=m; }
   var x0=d*cs[lo], x1=d*cs[hi], f=(x1>x0)?(q-x0)/(x1-x0):0; return V[lo]+(V[hi]-V[lo])*f; }
+function nearRay(p){ var best=Infinity, k=0; for(var i=0;i<NM;i++){ var dx=p[0]-Mx[i], dy=p[1]-My[i], d2=dx*dx+dy*dy; if(d2<best){best=d2;k=i;} } return k; }
+function moldPen(p){ var k=nearRay(p), L=NM-1;     // Python _mold_pen: kalıp uçlarının ötesi serbest
+  if(k===L && (p[0]-Mx[L])*(Mx[L]-Mx[L-1])+(p[1]-My[L])*(My[L]-My[L-1])>0) return [Infinity,k];
+  if(k===0 && (p[0]-Mx[0])*(Mx[0]-Mx[1])+(p[1]-My[0])*(My[0]-My[1])>0) return [Infinity,k];
+  return [(p[0]-Mx[k])*Nx[k]*SDS[k]+(p[1]-My[k])*Ny[k]*SDS[k], k]; }
+function moldPenMin(P){ var L=NM-1, mn=Infinity;   // Python _mold_pen_all(...).min()
+  for(var q=0;q<P.length;q++){ var p=P[q], sg=moldSigned(p);
+    var dE=Math.hypot(p[0]-Mx[L],p[1]-My[L]), dS=Math.hypot(p[0]-Mx[0],p[1]-My[0]);
+    var bE=((p[0]-Mx[L])*(Mx[L]-Mx[L-1])+(p[1]-My[L])*(My[L]-My[L-1])>0) && dE<=dS;
+    var bS=((p[0]-Mx[0])*(Mx[0]-Mx[1])+(p[1]-My[0])*(My[0]-My[1])>0) && dS<dE;
+    if(!(bE||bS) && sg<mn) mn=sg; }
+  return mn; }
+function polyVol(P){ var ri=SM.ri, A=0, cx=0, cy=0, n=P.length;   // Python poly_volume (kapalı poligon)
+  for(var i=0;i<n-1;i++){ var cr=P[i][0]*P[i+1][1]-P[i+1][0]*P[i][1]; A+=cr; cx+=(P[i][0]+P[i+1][0])*cr; cy+=(P[i][1]+P[i+1][1])*cr; }
+  A*=0.5; if(Math.abs(A)<1e-12) return 0; cx/=(6*A); cy/=(6*A); return 2*Math.PI*Math.abs(A)*Math.abs(ri===1?cy:cx); }
+function bendTail(cc, useLo, src, outer, tgt, Vtarget, remP, outP){   // Python _bend_tail
+  if(!remP || remP.length<3) return [remP,outP];
+  if(moldPenMin(remP)>=-0.01) return [remP,outP];
+  var cs=SM.c, d=SM.dir, Is=[], Os=[];
+  for(var j=0;j<cs.length;j++) if(d*cs[j]>d*cc){ var lo=[SM.lox[j],SM.loy[j]], hi=[SM.hix[j],SM.hiy[j]]; if(useLo){Is.push(lo);Os.push(hi);} else {Is.push(hi);Os.push(lo);} }
+  if(Is.length<2) return [remP,outP];
+  var I=[src].concat(Is).map(function(p){return remapV(p,src,tgt);}), O=[outer].concat(Os).map(function(p){return remapV(p,src,tgt);});
+  var n=I.length, In=[I[0].slice()], th=[0], t=0, Rb=SM.Rb||20;
+  for(var j2=1;j2<n;j2++){ var sx=I[j2][0]-I[j2-1][0], sy=I[j2][1]-I[j2-1][1], L=Math.hypot(sx,sy), pv=In[j2-1];
+    if(L<1e-12){ In.push(pv.slice()); th.push(t); continue; }
+    var ct=Math.cos(t), st=Math.sin(t), rs=[ct*sx-st*sy, st*sx+ct*sy], cand=[pv[0]+rs[0],pv[1]+rs[1]], pk=moldPen(cand);
+    if(pk[0]<0){ var k=pk[1], nx=Nx[k]*SDS[k], ny=Ny[k]*SDS[k], pr=[cand[0]-pk[0]*nx,cand[1]-pk[0]*ny], dx=pr[0]-pv[0], dy=pr[1]-pv[1];
+      var need=Math.atan2(rs[0]*dy-rs[1]*dx, rs[0]*dx+rs[1]*dy), lim=L/Rb, use=Math.min(Math.max(need,-lim),lim);
+      t+=use; var cu=Math.cos(use), su=Math.sin(use); cand=[pv[0]+cu*rs[0]-su*rs[1], pv[1]+su*rs[0]+cu*rs[1]];
+      var p2=moldPen(cand); if(p2[0]<0){ var k2=p2[1]; cand=[cand[0]-p2[0]*Nx[k2]*SDS[k2], cand[1]-p2[0]*Ny[k2]*SDS[k2]]; } }
+    In.push(cand); th.push(t); }
+  var Wr=[], ri=SM.ri;
+  for(var q=0;q<n;q++){ var wx=O[q][0]-I[q][0], wy=O[q][1]-I[q][1], c0=Math.cos(th[q]), s0=Math.sin(th[q]), sc=Math.abs(I[q][ri])/Math.max(Math.abs(In[q][ri]),1e-6);
+    Wr.push([(c0*wx-s0*wy)*sc,(s0*wx+c0*wy)*sc]); }
+  var build=function(fv){ var On=[], P=[]; for(var q=0;q<n;q++) On.push([In[q][0]+Wr[q][0]*fv, In[q][1]+Wr[q][1]*fv]);
+    for(var a=0;a<n;a++) P.push(In[a]); for(var b=n-1;b>=0;b--) P.push(On[b]); P.push(In[0]); return [P,On]; };
+  var fa=1.0, fb=1.02, va=polyVol(build(fa)[0])-Vtarget, vb=polyVol(build(fb)[0])-Vtarget;
+  for(var it=0;it<6;it++){ if(Math.abs(vb)<1e-9*Math.max(Vtarget,1)||vb===va) break; var fn=fb-vb*(fb-fa)/(vb-va); fa=fb; va=vb; fb=fn; vb=polyVol(build(fb)[0])-Vtarget; }
+  var r=build(fb); return [r[0],[r[1][0]]]; }
 function simState(SS){
   var front=-1, a0=-1, U=new Float64Array(NM);
   for(var i=0;i<NM;i++){ var u=Infinity; for(var c=0;c<NC;c++){ var v=SS[c][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } U[i]=u; if(isFinite(u)){ front=i; if(a0<0) a0=i; } }
@@ -3505,8 +3642,10 @@ function simState(SS){
   var nx=Nx[end]*SDS[end], ny=Ny[end]*SDS[end];
   var inner=(lo[0]*nx+lo[1]*ny<=hi[0]*nx+hi[1]*ny)?lo:hi, outer=(inner===lo)?hi:lo, tgt=[Mx[end],My[end]];
   var rem=clipHalf(SIMP,SM.k,cc,SM.dir);
-  st.rem=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null;
-  var wo=W[end-a0]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],remapV(outer,inner,tgt)];
+  var remP=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null, outP=[remapV(outer,inner,tgt)];
+  if(remP){ var bt=bendTail(cc, inner===lo, inner, outer, tgt, SM.Vtot-V0-cum, remP, outP); st.bent=(bt[0]!==remP); remP=bt[0]; outP=bt[1]; }
+  st.rem=remP;
+  var wo=W[end-a0]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],outP[0]];
   st.T=[tgt[0]-inner[0],tgt[1]-inner[1]]; st.c=cc;
   return st; }
 function lerp1(xq,X,Yv){ var n=X.length; if(xq<=X[0]) return Yv[0]; if(xq>=X[n-1]) return Yv[n-1];
@@ -3588,11 +3727,12 @@ function drawSim(X,Y,st){
   if(st.rem){ endNew=st.rem.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
   else { endNew=wall.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
   var el=SM.dir*(endNew-SIMEND), kn=(SM.k===0)?'X':'Y', fm=function(v){return Math.round(v).toLocaleString('tr-TR');};
-  window.__SIM={el:el, Vc:st.Vc, V0:st.V0, start:st.start, front:st.front, exh:st.exh};
+  window.__SIM={el:el, Vc:st.Vc, V0:st.V0, start:st.start, front:st.front, exh:st.exh, rem:st.rem||null};
   box.innerHTML='<b>Simülasyon (hacim sabit)</b><br>Ön form hacmi: '+fm(SM.Vtot)+' mm³'+
     '<br>Yerinde kalan (makara değmedi): '+fm(st.V0)+' mm³'+
     '<br>Kalıba sıvanan duvar: '+fm(st.Vc)+' mm³ (%'+(st.Vc/SM.Vtot*100).toFixed(1)+')'+
     '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+
+    (st.bent?'<br><span style="color:#b9770e">Kalan ön form kalıba değdi — dışa doğru büküldü.</span>':'')+
     (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
@@ -3904,7 +4044,7 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
         elif sm and sm.get('ok'):
             r5 = lambda a: [round(float(v), 5) for v in np.asarray(a, float).ravel()]
             out['sim'] = {'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']], 'ds': r5(fin['ds']),
-                          'ri': sm['ri'], 'k': sm['k'], 'dir': sm['dir'], 'tmax': sm['tmax'], 'Vtot': sm['Vtot'],
+                          'ri': sm['ri'], 'k': sm['k'], 'dir': sm['dir'], 'tmax': sm['tmax'], 'Vtot': sm['Vtot'], 'Rb': float(sm.get('Rb', 20.0)),
                           'lim': r5(sm['lim']) if sm.get('lim') is not None else None,
                           'tR': ([float(v) if np.isfinite(v) else -1.0 for v in sm['tR']]
                                  if sm.get('tR') is not None else None),
