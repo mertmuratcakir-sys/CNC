@@ -853,7 +853,7 @@ def _form_extra(form):
     sm = (form.get('final') or {}).get('sim')
     if sm and sm.get('ok') and sm.get('final') is not None:
         f = sm['final']
-        polys = f['polys'] if 'polys' in f else [f.get('wall'), f.get('rem')]
+        polys = f['polys'] if 'polys' in f else [f.get('fixed'), f.get('wall'), f.get('rem')]
         out += [P for P in polys if P is not None]
     return out
 
@@ -1437,7 +1437,7 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
         if _sm and _sm.get('ok') and _sm.get('final') is not None:
             w.layer('URUN', 4)
             _f = _sm['final']
-            _ps = _f['polys'] if 'polys' in _f else [_f.get('wall'), _f.get('bridge'), _f.get('rem')]
+            _ps = _f['polys'] if 'polys' in _f else [_f.get('fixed'), _f.get('wall'), _f.get('bridge'), _f.get('rem')]
             for P in _ps:
                 if P is not None:
                     w.polyline('URUN', P)
@@ -1723,14 +1723,14 @@ def preform_layer_choices(state):
     return [(f"{k} ({len(v)} çizgi)", k) for k, v in state['layers'].items()]
 
 
-def preform_chains(state, selected, dx=0.0, dy=0.0, tol=0.01):
+def _join_chains(state, selected, dx=0.0, dy=0.0, tol=0.01):
     """Seçili katmanlardaki çizgileri uç uca birleştirir.
     Döndürür: [(noktalar (k,2), kapalı_mı), ...]"""
     if not state or not state.get('layers'):
         return []
     sel = set(selected) if selected else set(state['layers'])
-    pls = [np.asarray(pl, float) + (dx, dy) for k, v in state['layers'].items() if k in sel for pl in v]
-    pls = [p for p in pls if len(p) >= 2]
+    pls = [np.asarray(pl, float).reshape(-1, 2) + (dx, dy) for k, v in state['layers'].items() if k in sel
+           for pl in v if len(pl) >= 2]
     used = [False] * len(pls)
     chains = []
     for s0 in range(len(pls)):
@@ -1763,6 +1763,220 @@ def preform_chains(state, selected, dx=0.0, dy=0.0, tol=0.01):
             A[-1] = A[0]
         chains.append((A, bool(closed)))
     return chains
+
+
+# -------------------------------------------------------------
+# KONTUR ONARIMI (açık / boşluklu / üst üste binmiş çizgiler, CMM taramaları)
+#  1) Çizgiler birbirini kestiği ve üst üste bindiği yerlerden bölünür
+#  2) Çok yakın uçlar tek düğümde birleştirilir, tekrar eden parçalar silinir (çakışmalar)
+#  3) Açık uçlar en yakın açık uca bağlanır (boşluk ≤ tolerans; tolerans otomatik büyütülür)
+#  4) Sarkan uçlar budanır, düzlemsel ağın DIŞ SINIRI ön form konturu olarak alınır
+#  (iç bölme çizgileri, çift tarama pasları dış sınırı değiştirmez)
+# -------------------------------------------------------------
+REPAIR_SNAP = 0.02                           # bu mesafedeki noktalar aynı nokta sayılır (mm)
+REPAIR_GAPS = (0.05, 0.2, 0.5, 1.0, 2.0)     # denenecek boşluk kapatma toleransları (mm)
+_REPAIR_CACHE = {}
+
+
+def _uf_find(par, i):
+    while par[i] != i:
+        par[i] = par[par[i]]
+        i = par[i]
+    return i
+
+
+def _snap_nodes(Q, tol):
+    """Noktaları tol içinde kümele. Döndürür: (her nokta için düğüm no, düğüm koordinatları)"""
+    n = len(Q)
+    par = list(range(n))
+    cell = {}
+    key = np.floor(Q / tol).astype(np.int64)
+    for i in range(n):
+        kx, ky = int(key[i, 0]), int(key[i, 1])
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in cell.get((kx + dx, ky + dy), ()):
+                    if (Q[i, 0] - Q[j, 0]) ** 2 + (Q[i, 1] - Q[j, 1]) ** 2 <= tol * tol:
+                        a, b = _uf_find(par, i), _uf_find(par, j)
+                        if a != b:
+                            par[a] = b
+        cell.setdefault((kx, ky), []).append(i)
+    roots = np.array([_uf_find(par, i) for i in range(n)])
+    uniq, inv = np.unique(roots, return_inverse=True)
+    nodes = np.zeros((len(uniq), 2))
+    np.add.at(nodes, inv, Q)
+    nodes /= np.bincount(inv)[:, None]
+    return inv, nodes
+
+
+def _node_segments(P0, P1, tol, chunk=400):
+    """Her parçayı diğerleriyle kesişim noktalarından ve üzerine düşen uçlardan böler."""
+    m = len(P0)
+    D = P1 - P0
+    L2 = np.maximum((D ** 2).sum(1), 1e-18)
+    lo, hi = np.minimum(P0, P1) - tol, np.maximum(P0, P1) + tol
+    cuts = [[0.0, 1.0] for _ in range(m)]
+    for a in range(0, m, chunk):
+        b = min(a + chunk, m)
+        ov = ((lo[a:b, None, 0] <= hi[None, :, 0]) & (hi[a:b, None, 0] >= lo[None, :, 0]) &
+              (lo[a:b, None, 1] <= hi[None, :, 1]) & (hi[a:b, None, 1] >= lo[None, :, 1]))
+        ov[np.arange(b - a), np.arange(a, b)] = False
+        I, J = np.nonzero(ov)
+        if not len(I):
+            continue
+        I = I + a
+        p, r, q, sv = P0[I], D[I], P0[J], D[J]
+        den = r[:, 0] * sv[:, 1] - r[:, 1] * sv[:, 0]
+        w = q - p
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = (w[:, 0] * sv[:, 1] - w[:, 1] * sv[:, 0]) / den
+            u = (w[:, 0] * r[:, 1] - w[:, 1] * r[:, 0]) / den
+        ok = (np.abs(den) > 1e-12) & (t > 1e-9) & (t < 1 - 1e-9) & (u >= -1e-9) & (u <= 1 + 1e-9)
+        for i, tt in zip(I[ok], t[ok]):
+            cuts[i].append(float(tt))
+        for E in (P0[J], P1[J]):                     # diğer parçanın ucu bu parçanın üzerinde mi (T / çakışma)
+            tt = ((E - p) * r).sum(1) / L2[I]
+            dd = np.hypot(*(p + r * np.clip(tt, 0, 1)[:, None] - E).T)
+            ok2 = (tt > 1e-9) & (tt < 1 - 1e-9) & (dd <= tol)
+            for i, t2 in zip(I[ok2], tt[ok2]):
+                cuts[i].append(float(t2))
+    A, B = [], []
+    for i in range(m):
+        ts = np.unique(np.round(cuts[i], 12))
+        pts = P0[i] + np.outer(ts, D[i])
+        A.append(pts[:-1]); B.append(pts[1:])
+    return np.vstack(A), np.vstack(B)
+
+
+def _outer_boundary(nodes, edges):
+    """Düzlemsel ağ: sarkan uçları buda, yüzleri dolaş, en büyük bileşenin dış sınırını döndür."""
+    E = set()
+    for u, v in edges:
+        if u != v:
+            E.add((min(u, v), max(u, v)))
+    adj = collections.defaultdict(set)
+    for u, v in E:
+        adj[u].add(v); adj[v].add(u)
+    stack = [k for k, nb in adj.items() if len(nb) == 1]
+    while stack:                                      # sarkan uçları buda
+        k = stack.pop()
+        for j in list(adj.get(k, ())):
+            adj[j].discard(k)
+            if len(adj[j]) == 1:
+                stack.append(j)
+        adj.pop(k, None)
+    adj = {k: v for k, v in adj.items() if v}
+    if not adj:
+        return None
+    order = {}
+    for k, nb in adj.items():
+        nb = list(nb)
+        ang = [np.arctan2(nodes[j, 1] - nodes[k, 1], nodes[j, 0] - nodes[k, 0]) for j in nb]
+        order[k] = [nb[q] for q in np.argsort(ang)]
+    pos = {(k, j): q for k, lst in order.items() for q, j in enumerate(lst)}
+    seen, best, best_a = set(), None, 0.0
+    for k, lst in order.items():
+        for j in lst:
+            if (k, j) in seen:
+                continue
+            cyc, h = [], (k, j)
+            while h not in seen and len(cyc) <= 4 * len(pos):
+                seen.add(h)
+                u, v = h
+                cyc.append(u)
+                lv = order[v]
+                h = (v, lv[(pos[(v, u)] - 1) % len(lv)])  # ikizinden saat yönünde bir sonraki
+            C = nodes[cyc]
+            a = 0.5 * float(np.sum(C[:, 0] * np.roll(C[:, 1], -1) - np.roll(C[:, 0], -1) * C[:, 1]))
+            if a < best_a:                            # dış yüz: saat yönünde (negatif alan)
+                best, best_a = cyc, a
+    if best is None:
+        return None
+    C = nodes[best[::-1]]
+    return np.vstack([C, C[:1]])
+
+
+def repair_contour(chains):
+    """Açık / boşluklu / üst üste binmiş çizgilerden tek bir kapalı kontur üretir.
+    Döndürür: (zincirler, not). Onarım gerekmezse zincirler aynen döner, not boş olur."""
+    if not chains:
+        return chains, ''
+    big = _largest_closed(chains)
+    plen = lambda A: float(np.hypot(*np.diff(A, axis=0).T).sum())
+    if big is not None:
+        per = plen(big)
+        open_len = sum(plen(A) for A, cl in chains if not cl)
+        other = [A for A, cl in chains if cl and A is not big]
+        ab = abs(poly_area(big))
+        if open_len < 0.01 * per and all(abs(poly_area(A)) < 0.01 * ab for A in other):
+            return chains, ''                         # temiz kontur: dokunma
+    P0 = np.vstack([A[:-1] for A, _ in chains if len(A) >= 2])
+    P1 = np.vstack([A[1:] for A, _ in chains if len(A) >= 2])
+    keep = np.hypot(*(P1 - P0).T) > 1e-9
+    P0, P1 = P0[keep], P1[keep]
+    if len(P0) < 3:
+        return chains, ''
+    A, B = _node_segments(P0, P1, REPAIR_SNAP)
+    inv, nodes = _snap_nodes(np.vstack([A, B]), REPAIR_SNAP)
+    m = len(A)
+    base = [(int(inv[i]), int(inv[m + i])) for i in range(m)]
+    deg = collections.Counter()
+    for u, v in set((min(a, b), max(a, b)) for a, b in base if a != b):
+        deg[u] += 1; deg[v] += 1
+    ends = np.array([k for k, d in deg.items() if d == 1], int)
+    results = []
+    for gap in REPAIR_GAPS:
+        extra = []
+        if len(ends) > 1:                             # açık uçları karşılıklı en yakın açık uca bağla
+            Q = nodes[ends]
+            d = np.hypot(Q[:, None, 0] - Q[None, :, 0], Q[:, None, 1] - Q[None, :, 1])
+            np.fill_diagonal(d, np.inf)
+            nn = np.argmin(d, axis=1)
+            for i, j in enumerate(nn):
+                if i < j and nn[j] == i and d[i, j] <= gap:
+                    extra.append((int(ends[i]), int(ends[j])))
+        poly = _outer_boundary(nodes, base + extra)
+        results.append((gap, poly, abs(poly_area(poly)) if poly is not None else 0.0, len(extra)))
+    amax = max(r[2] for r in results)
+    if amax <= 0:
+        return chains, ("UYARI: Ön form çizgilerinden kapalı kontur oluşturulamadı "
+                        f"(en büyük boşluk {REPAIR_GAPS[-1]:.1f} mm'den fazla olabilir).")
+    gap, poly, area, nj = next(r for r in results if r[2] >= 0.995 * amax)
+    n_in = sum(1 for _ in chains)
+    note = (f"Kontur onarıldı: {n_in} ayrı çizgi zinciri → tek kapalı kontur"
+            + (f", {nj} boşluk kapatıldı (≤ {gap:g} mm)" if nj else "")
+            + f", üst üste binen / tekrar eden parçalar ayıklandı. Kesit alanı {area:,.1f} mm².")
+    return [(poly, True)], note
+
+
+def poly_area(P):
+    if P is None or len(P) < 3:
+        return 0.0
+    x, y = P[:, 0], P[:, 1]
+    return 0.5 * float(np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]) + x[-1] * y[0] - x[0] * y[-1])
+
+
+def preform_chains(state, selected, dx=0.0, dy=0.0, tol=0.01, with_note=False):
+    """Seçili katmanlardaki çizgileri uç uca birleştirir; gerekirse konturu onarır
+    (boşluk, çakışma, açık uç). Döndürür: [(noktalar (k,2), kapalı_mı), ...] (with_note: + not)"""
+    try:
+        key = (json.dumps(state.get('layers') if state else None, sort_keys=True),
+               tuple(sorted(selected)) if selected else None, float(dx), float(dy), tol)
+    except Exception:
+        key = None
+    if key is not None and key in _REPAIR_CACHE:
+        ch, note = _REPAIR_CACHE[key]
+    else:
+        ch = _join_chains(state, selected, dx, dy, tol)
+        try:
+            ch, note = repair_contour(ch)
+        except Exception as e:                       # onarım başarısızsa ham zincirlerle devam
+            note = f"UYARI: Kontur onarımı yapılamadı ({e}); çizgiler olduğu gibi kullanıldı."
+        if key is not None:
+            if len(_REPAIR_CACHE) > 16:
+                _REPAIR_CACHE.clear()
+            _REPAIR_CACHE[key] = (ch, note)
+    return (ch, note) if with_note else ch
 
 
 def preform_thickness(M, Nrm, chains, gap_tol=PF_GAP_TOL, chunk=192):
@@ -1851,6 +2065,23 @@ def resolve_radial(choice, cfg):
     return 'Y', 'varsayılan (parça yarıçapı Y)'
 
 
+def radial_guard(chains, radial):
+    """Parça dönme ekseninin (radyal koordinat = 0) iki tarafına geçen ön form fiziksel olamaz.
+    Seçilen eksende ön form 0'ı kesiyor, diğerinde kesmiyorsa diğer eksene geçilir.
+    Döndürür: (radyal_eksen, uyarı_metni)"""
+    pts = [A for A, _cl in chains if len(A)]
+    if not pts:
+        return radial, ''
+    P = np.vstack(pts)
+    cross = lambda k: float(P[:, k].min()) < -0.5 and float(P[:, k].max()) > 0.5
+    k = 0 if radial == 'X' else 1
+    if cross(k) and not cross(1 - k):
+        other = 'Y' if radial == 'X' else 'X'
+        return other, (f"UYARI: Ön form {radial}=0 çizgisinin iki tarafına geçiyor; {radial} parça yarıçapı olamaz. "
+                       f"Parça yarıçapı ekseni otomatik olarak {other} alındı (ayarı '{other}' veya 'Otomatik' yap).")
+    return radial, ''
+
+
 def preform_axial_thickness(M, chains, rad_idx, chunk=256):
     """Shear forming için: her kalıp ışınının radyal koordinatında, dönme eksenine paralel
     doğrunun ön form (kapalı kontur) içinden geçen toplam uzunluğu = eksenel ön form kalınlığı t₀.
@@ -1930,7 +2161,9 @@ def compute_form(timelines, radii, mold_points, limit, preform=None):
             sim['W0'] = sim_w0(fin, sim)
             side_t, _sb = _tool_side(S, len(M))
             sim['side'] = np.where(fin['side'] != 0, fin['side'], side_t).astype(int)
-            Fs, fs = sim_formed(S, sim['side'], sim['tmax'])
+            sim['lim'] = sim_limit(M, Nrm, chains, sim) if model == 'flow' else np.full(len(M), sim['tmax'])
+            sim['tR'] = sim_reach_times(M, arc, timelines, radii) if model == 'flow' else None
+            Fs, fs = sim_formed(S, sim['side'], sim['lim'], sim['tR'])
             sim['F'], sim['formed'] = Fs, fs
             sim['final'] = sim_state(fin, sim, Fs, fs)
     return out
@@ -2528,13 +2761,47 @@ def sim_w0(fin, sim):
     return np.where(np.isfinite(T), T, sim['lmed'])
 
 
-def sim_formed(S, side, tmax):
+SIM_TOL = 1.0     # flow simülasyonu: makara boşluğu ≤ (ön formun kalıptan dış yüzeyine mesafesi + bu pay) ise şekillenir
+
+
+def sim_limit(M, Nrm, chains, sim):
+    """Flow simülasyonu için ışın başına 'makara malzemeye değiyor' sınırı: ön formun kalıptan
+    (aradaki boşluk dahil) dış yüzeyine mesafesi. Ön formun hiç kesmediği ışınlarda: ortanca × 1,25.
+    Böylece makaranın önündeki ışınlar, makara uzaktan geçerken şekillenmiş sayılmaz."""
+    Tpg, Tmg = preform_thickness(M, Nrm, chains, gap_tol=1e9)
+    Tout = np.where(np.asarray(sim['side']) < 0, Tmg, Tpg)
+    fo = np.isfinite(Tout)
+    thr_nan = 1.25 * float(np.median(Tout[fo])) if fo.any() else sim['tmax']
+    return np.minimum(np.where(fo, Tout + SIM_TOL, thr_nan), sim['tmax'])
+
+
+def sim_reach_times(M, arc, timelines, radii, chunk=2000):
+    """Işın başına makaranın o noktanın hizasına ilk geldiği an: takım merkezinin kalıptaki izdüşümü
+    (en yakın kalıp noktası) ile ışın arasındaki yay mesafesi ≤ takım yarıçapı. Makaranın önündeki
+    ışınlar (makara henüz gelmeden, ön yüzüyle uzaktan değdiği yerler) böylece erken şekillenmez."""
+    tR = np.full(len(M), np.inf)
+    for i in range(N_CH):
+        C, TT = tool_samples(timelines[i], radii[i])
+        if len(C) == 0:
+            continue
+        for a in range(0, len(C), chunk):
+            Cc, Tc = C[a:a + chunk], TT[a:a + chunk]
+            d2 = ((Cc[:, None, :] - M[None, :, :]) ** 2).sum(-1)
+            af = arc[np.argmin(d2, axis=1)]
+            near = np.abs(arc[:, None] - af[None, :]) <= radii[i] + 1e-9
+            tR = np.minimum(tR, np.where(near, Tc[None, :], np.inf).min(axis=1))
+    return tR
+
+
+def sim_formed(S, side, tmax, tR=None, tnow=np.inf):
     """Simülasyonda şekillendirme: malzeme kalıba gelerek uzadığı için ön formun ilk konumuna bakılmaz;
     makara kalıba ön form kalınlığından (tmax) daha yakın geçtiyse o nokta şekillenir."""
     U = np.full(len(side), np.inf)
     for s in S:
         same = np.isfinite(s) & ((s == 0) | (np.sign(s) == side))
         U = np.minimum(U, np.where(same & (np.abs(s) <= tmax + 1e-9), np.abs(s), np.inf))
+    if tR is not None:
+        U = np.where(tR <= tnow + 1e-9, U, np.inf)
     formed = np.isfinite(U)
     return np.where(formed, U, np.nan), formed
 
@@ -2555,38 +2822,54 @@ def _interp_pt(Vq, V, P):
     return np.array([np.interp(Vq, V, P[:, 0]), np.interp(Vq, V, P[:, 1])])
 
 
+def _sim_vat(sim, c):
+    """Malzeme koordinatı c'ye kadar (sabit uçtan) biriken ön form hacmi."""
+    cs, d = sim['c'], sim['dir']
+    return float(np.interp(d * c, d * cs, sim['V']))
+
+
 def sim_state(fin, sim, F, formed):
-    """Verilen anda (F: makara boşluğu, formed: makara geçti mi) ürün şekli ve hacim dengesi."""
+    """Verilen anda (F: makara boşluğu, formed: makara geçti mi) ürün şekli ve hacim dengesi.
+    Duvar, makaranın ilk sıvadığı ışından (kalıp yönünde en baştaki şekillenmiş ışın) başlar;
+    o kesitin öncesindeki ön form (göbek, flanş...) olduğu gibi yerinde kalır. Duvarın hacmi
+    bu kesitten itibaren ön formdan tüketilir, kalan kısım duvarın ucuna taşınır (uzama)."""
     M, N = fin['M'], fin['N']
     sd = np.asarray(sim.get('side', fin['side']), float)
     ds, W0, ri = fin['ds'], sim.get('W0', fin['W0']), sim['ri']
-    out = {'wall': None, 'rem': sim['poly'], 'bridge': None, 'T': np.zeros(2), 'Vwall': 0.0,
-           'Vrem': sim['Vtot'], 'exhausted': False, 'front': -1}
+    out = {'wall': None, 'rem': sim['poly'], 'bridge': None, 'fixed': None, 'T': np.zeros(2), 'Vwall': 0.0,
+           'Vrem': sim['Vtot'], 'Vfix': 0.0, 'exhausted': False, 'front': -1, 'start': 0}
     if not formed.any():
         return out
-    front = int(np.max(np.where(formed)[0]))
-    w = np.where(formed[:front + 1], F[:front + 1], W0[:front + 1])
+    fi = np.where(formed)[0]
+    a, front = int(fi[0]), int(fi[-1])
+    k = sim['k']
+    ca = float(M[a, k])
+    V0 = _sim_vat(sim, ca)
+    Vt = sim['Vtot'] - V0                            # duvar için kullanılabilir hacim
+    fixed = clip_halfplane(sim['poly'], k, ca, -sim['dir']) if V0 > 0 else None
+    w = np.where(formed[a:front + 1], F[a:front + 1], W0[a:front + 1])
     w = np.clip(np.nan_to_num(w), 0.0, None)
-    Mf, Nf, sf = M[:front + 1], N[:front + 1], sd[:front + 1]
+    Mf, Nf, sf = M[a:front + 1], N[a:front + 1], sd[a:front + 1]
     rmid = np.abs((Mf + Nf * (sf * w / 2)[:, None])[:, ri])
-    cum = np.cumsum(2 * np.pi * rmid * w * ds[:front + 1])
-    Vt = sim['Vtot']
+    cum = np.cumsum(2 * np.pi * rmid * w * ds[a:front + 1])
+    out.update({'fixed': fixed, 'Vfix': V0, 'start': a})
     if cum[-1] > Vt:                                 # malzeme yetmedi: duvar burada biter
         kc = int(np.searchsorted(cum, Vt))
-        front, out['exhausted'] = max(kc, 1), True
-        w, Mf, Nf, sf, cum = w[:front + 1], Mf[:front + 1], Nf[:front + 1], sf[:front + 1], cum[:front + 1]
+        m = max(kc, 1)
+        front, out['exhausted'] = a + m, True
+        w, Mf, Nf, sf, cum = w[:m + 1], Mf[:m + 1], Nf[:m + 1], sf[:m + 1], cum[:m + 1]
     Vc = float(min(cum[-1], Vt))
     Pout = Mf + Nf * (sf * w)[:, None]
     out.update({'wall': np.vstack([Pout, Mf[::-1], Pout[:1]]), 'Vwall': Vc, 'Vrem': Vt - Vc, 'front': front})
     if out['exhausted']:
         out['rem'] = None
         return out
-    c = float(np.interp(Vc, sim['V'], sim['c']))
-    plo, phi = _interp_pt(Vc, sim['V'], sim['lo']), _interp_pt(Vc, sim['V'], sim['hi'])
+    c = float(np.interp(V0 + Vc, sim['V'], sim['c']))
+    plo, phi = _interp_pt(V0 + Vc, sim['V'], sim['lo']), _interp_pt(V0 + Vc, sim['V'], sim['hi'])
     nrm = Nf[-1] * sf[-1]
     inner, outer = (plo, phi) if np.dot(plo, nrm) <= np.dot(phi, nrm) else (phi, plo)
     tgt = Mf[-1]
-    rem = clip_halfplane(sim['poly'], sim['k'], c, sim['dir'])
+    rem = clip_halfplane(sim['poly'], k, c, sim['dir'])
     out['T'] = tgt - inner
     out['src'], out['tgt'] = inner, tgt
     out['rem'] = None if rem is None else remap_volume(rem, ri, inner, tgt)
@@ -2608,8 +2891,9 @@ def sim_summary(sim, st):
     ref = st.get('rem') if st.get('rem') is not None else st.get('wall')
     elong = d * (ext(ref) - end_old) if ref is not None else 0.0
     Vrem = poly_volume(st['rem'], sim['ri']) if st.get('rem') is not None else 0.0
-    return {'Vtot': sim['Vtot'], 'Vwall': st['Vwall'], 'Vrem': Vrem,
-            'err': (st['Vwall'] + Vrem - sim['Vtot']) / sim['Vtot'] * 100, 'elong': elong,
+    Vfix = poly_volume(st['fixed'], sim['ri']) if st.get('fixed') is not None else 0.0
+    return {'Vtot': sim['Vtot'], 'Vwall': st['Vwall'], 'Vrem': Vrem, 'Vfix': Vfix,
+            'err': (st['Vwall'] + Vrem + Vfix - sim['Vtot']) / sim['Vtot'] * 100, 'elong': elong,
             'axis': 'X' if k == 0 else 'Y', 'exhausted': st.get('exhausted', False)}
 
 
@@ -2618,7 +2902,7 @@ SIM_COLOR = '#3d6fb6'
 
 def draw_sim_product(ax, st, label='Ürün (simülasyon sonu)'):
     first = True
-    polys = [st.get('wall'), st.get('bridge'), st.get('rem')]
+    polys = [st.get('fixed'), st.get('wall'), st.get('bridge'), st.get('rem')]
     if 'polys' in st:
         polys = st['polys']
     for poly in polys:
@@ -3176,7 +3460,8 @@ if(SIMD && !STS){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=ne
 if(STS){ SW0=new Float64Array(SM.W0); SDS=new Int8Array(SM.sd); SDSS=new Float64Array(SM.dsc); }
 function okv(i,v,L){
   if(!isFinite(v)) return false;
-  if(SIMD){ if(v!==0 && ((v>0)!==(SDS[i]>0))) return false; return Math.abs(v)<=(SM.kind==='strip'?SM.thr:SM.tmax)+1e-9; }
+  if(SIMD){ if(v!==0 && ((v>0)!==(SDS[i]>0))) return false; if(SM.tR && !(SM.tR[i]>=0 && SM.tR[i]<=t+1e-9)) return false;
+    return Math.abs(v)<=(SM.kind==='strip'?SM.thr:(SM.lim?SM.lim[i]:SM.tmax))+1e-9; }
   if(STRIP){ if(v!==0 && ((v>0)!==(SD[i]>0))) return false; return Math.abs(v)<=EV.thr+1e-9; }
   if(HASPF){ var T=Ta[i]; if(!(T>0)) return false; if(v!==0 && ((v>0)!==(SD[i]>0))) return false;
     return SHEAR ? Math.abs(v)<=T+1e-9 : Math.abs(v)<T-1e-6; }
@@ -3199,24 +3484,29 @@ function clipHalf(P,k,c,d){ var out=[], n=P.length; if(n>1&&P[0][0]===P[n-1][0]&
     if(cin!==pin){ var tt=(c-prev[k])/(cur[k]-prev[k]); out.push([prev[0]+tt*(cur[0]-prev[0]), prev[1]+tt*(cur[1]-prev[1])]); }
     if(cin) out.push(cur); }
   return out.length>=3?out:null; }
+function simVat(c){ var cs=SM.c, V=SM.V, d=SM.dir, n=cs.length, q=d*c;
+  if(q<=d*cs[0]) return V[0]; if(q>=d*cs[n-1]) return V[n-1];
+  var lo=0, hi=n-1; while(hi-lo>1){ var m=(lo+hi)>>1; if(d*cs[m]<=q) lo=m; else hi=m; }
+  var x0=d*cs[lo], x1=d*cs[hi], f=(x1>x0)?(q-x0)/(x1-x0):0; return V[lo]+(V[hi]-V[lo])*f; }
 function simState(SS){
-  var front=-1, U=new Float64Array(NM);
-  for(var i=0;i<NM;i++){ var u=Infinity; for(var c=0;c<NC;c++){ var v=SS[c][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } U[i]=u; if(isFinite(u)) front=i; }
+  var front=-1, a0=-1, U=new Float64Array(NM);
+  for(var i=0;i<NM;i++){ var u=Infinity; for(var c=0;c<NC;c++){ var v=SS[c][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } U[i]=u; if(isFinite(u)){ front=i; if(a0<0) a0=i; } }
   if(front<0) return {front:-1, Vc:0};
-  var Vt=SM.Vtot, ri=SM.ri, end=front, exh=false, W=[], CUM=[], cum=0;
-  for(var i2=0;i2<=front;i2++){ var w=isFinite(U[i2])?U[i2]:SW0[i2]; if(!(w>0)) w=0;
+  var ri=SM.ri, k=SM.k, ca=(k===0)?Mx[a0]:My[a0], V0=simVat(ca), Vt=SM.Vtot-V0, end=front, exh=false, W=[], CUM=[], cum=0;
+  var fixed=(V0>0)?clipHalf(SIMP,k,ca,-SM.dir):null;
+  for(var i2=a0;i2<=front;i2++){ var w=isFinite(U[i2])?U[i2]:SW0[i2]; if(!(w>0)) w=0;
     var rm=(ri===0)?(Mx[i2]+Nx[i2]*SDS[i2]*w/2):(My[i2]+Ny[i2]*SDS[i2]*w/2);
     cum+=2*Math.PI*Math.abs(rm)*w*SDSS[i2]; W.push(w); CUM.push(cum); }
   if(cum>Vt){ var kc=0; while(kc<CUM.length && CUM[kc]<Vt) kc++;      // Python: searchsorted(cum, Vt)
-    end=Math.max(kc,1); exh=true; W=W.slice(0,end+1); cum=Vt; }
-  var st={front:end, W:W, exh:exh, Vc:cum};
+    var m=Math.max(kc,1); end=a0+m; exh=true; W=W.slice(0,m+1); cum=Vt; }
+  var st={front:end, start:a0, W:W, exh:exh, Vc:cum, V0:V0, fixed:fixed};
   if(exh) return st;
-  var cc=simInterp(cum,SM.c), lo=[simInterp(cum,SM.lox),simInterp(cum,SM.loy)], hi=[simInterp(cum,SM.hix),simInterp(cum,SM.hiy)];
+  var Vq=V0+cum, cc=simInterp(Vq,SM.c), lo=[simInterp(Vq,SM.lox),simInterp(Vq,SM.loy)], hi=[simInterp(Vq,SM.hix),simInterp(Vq,SM.hiy)];
   var nx=Nx[end]*SDS[end], ny=Ny[end]*SDS[end];
   var inner=(lo[0]*nx+lo[1]*ny<=hi[0]*nx+hi[1]*ny)?lo:hi, outer=(inner===lo)?hi:lo, tgt=[Mx[end],My[end]];
   var rem=clipHalf(SIMP,SM.k,cc,SM.dir);
   st.rem=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null;
-  var wo=W[end]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],remapV(outer,inner,tgt)];
+  var wo=W[end-a0]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],remapV(outer,inner,tgt)];
   st.T=[tgt[0]-inner[0],tgt[1]-inner[1]]; st.c=cc;
   return st; }
 function lerp1(xq,X,Yv){ var n=X.length; if(xq<=X[0]) return Yv[0]; if(xq>=X[n-1]) return Yv[n-1];
@@ -3289,17 +3579,20 @@ function drawSim(X,Y,st){
   var fillP=function(P){ if(!P||P.length<3) return; ctx.beginPath(); P.forEach(function(p,q){ if(q) ctx.lineTo(X(p[0]),Y(p[1])); else ctx.moveTo(X(p[0]),Y(p[1])); }); ctx.closePath();
     ctx.fillStyle='rgba(61,111,182,0.62)'; ctx.fill(); ctx.strokeStyle='#16325c'; ctx.lineWidth=1.1; ctx.stroke(); };
   var box=document.getElementById('simstat'); box.style.display='block';
-  if(st.front<0){ fillP(SIMP); box.innerHTML='<b>Simülasyon</b><br>Makara henüz malzemeye girmedi.<br>Ön form hacmi: '+(SM.Vtot/1000).toFixed(2)+' cm³'; return; }
-  var wall=[]; for(var i=0;i<=st.front;i++){ var w=st.W[i]; wall.push([Mx[i]+Nx[i]*SDS[i]*w, My[i]+Ny[i]*SDS[i]*w]); }
-  for(var i3=st.front;i3>=0;i3--) wall.push([Mx[i3],My[i3]]);
+  if(st.front<0){ fillP(SIMP); box.innerHTML='<b>Simülasyon</b><br>Makara henüz malzemeye girmedi.<br>Ön form hacmi: '+Math.round(SM.Vtot).toLocaleString('tr-TR')+' mm³'; return; }
+  if(st.fixed) fillP(st.fixed);
+  var wall=[]; for(var i=st.start;i<=st.front;i++){ var w=st.W[i-st.start]; wall.push([Mx[i]+Nx[i]*SDS[i]*w, My[i]+Ny[i]*SDS[i]*w]); }
+  for(var i3=st.front;i3>=st.start;i3--) wall.push([Mx[i3],My[i3]]);
   fillP(wall); if(st.bridge) fillP(st.bridge); if(st.rem) fillP(st.rem);
   var endNew;
   if(st.rem){ endNew=st.rem.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
   else { endNew=wall.reduce(function(a,p){return SM.dir>0?Math.max(a,p[SM.k]):Math.min(a,p[SM.k]);}, SM.dir>0?-Infinity:Infinity); }
-  var el=SM.dir*(endNew-SIMEND), kn=(SM.k===0)?'X':'Y';
-  box.innerHTML='<b>Simülasyon (hacim sabit)</b><br>Kalıba sıvanan: %'+(st.Vc/SM.Vtot*100).toFixed(1)+' &nbsp;('+(st.Vc/1000).toFixed(2)+' / '+(SM.Vtot/1000).toFixed(2)+' cm³)'+
+  var el=SM.dir*(endNew-SIMEND), kn=(SM.k===0)?'X':'Y', fm=function(v){return Math.round(v).toLocaleString('tr-TR');};
+  window.__SIM={el:el, Vc:st.Vc, V0:st.V0, start:st.start, front:st.front, exh:st.exh};
+  box.innerHTML='<b>Simülasyon (hacim sabit)</b><br>Ön form hacmi: '+fm(SM.Vtot)+' mm³'+
+    '<br>Yerinde kalan (makara değmedi): '+fm(st.V0)+' mm³'+
+    '<br>Kalıba sıvanan duvar: '+fm(st.Vc)+' mm³ (%'+(st.Vc/SM.Vtot*100).toFixed(1)+')'+
     '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+
-    (st.T?'<br>Kalan malzeme kayması: ΔX '+st.T[0].toFixed(2)+' / ΔY '+st.T[1].toFixed(2)+' mm':'')+
     (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
@@ -3592,7 +3885,9 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
         out['T'] = [round(float(v), 4) if h else -1.0 for v, h in zip(T, has)]
         out['sd'] = [int(v) for v in fin['side']]
         tmax = float(np.max(T[has])) if has.any() else 1.0
-        out['lim'] = [max(tmax, float(fin.get('thr') or 0.0))] * N_CH   # takım örneklerini elemek için üst sınır
+        _sm0 = fin.get('sim') or {}
+        _sl = float(np.max(_sm0['lim'])) if _sm0.get('ok') and _sm0.get('lim') is not None else 0.0
+        out['lim'] = [max(tmax, float(fin.get('thr') or 0.0), _sl)] * N_CH   # takım örneklerini elemek için üst sınır
         out['medT'] = float(np.median(T[has])) if has.any() else 1.0
         out['pf'] = [[round(float(v), 4) for v in np.asarray(A).ravel()] for A, _cl in form['pf_chains']]
         sm = fin.get('sim')
@@ -3610,6 +3905,9 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
             r5 = lambda a: [round(float(v), 5) for v in np.asarray(a, float).ravel()]
             out['sim'] = {'W0': r5(sm['W0']), 'sd': [int(v) for v in sm['side']], 'ds': r5(fin['ds']),
                           'ri': sm['ri'], 'k': sm['k'], 'dir': sm['dir'], 'tmax': sm['tmax'], 'Vtot': sm['Vtot'],
+                          'lim': r5(sm['lim']) if sm.get('lim') is not None else None,
+                          'tR': ([float(v) if np.isfinite(v) else -1.0 for v in sm['tR']]
+                                 if sm.get('tR') is not None else None),
                           'c': r5(sm['c']), 'V': [float(v) for v in sm['V']],
                           'lox': r5(sm['lo'][:, 0]), 'loy': r5(sm['lo'][:, 1]),
                           'hix': r5(sm['hi'][:, 0]), 'hiy': r5(sm['hi'][:, 1]), 'poly': r5(sm['poly'])}
@@ -3686,12 +3984,16 @@ def _preform(opts, cfg=None):
     st = opts.get('pf_state')
     if not opts.get('pf_use') or not st or not st.get('layers'):
         return None
-    chains = preform_chains(st, opts.get('pf_layers'), opts.get('pf_dx', 0.0), opts.get('pf_dy', 0.0))
+    chains, rnote = preform_chains(st, opts.get('pf_layers'), opts.get('pf_dx', 0.0), opts.get('pf_dy', 0.0),
+                                   with_note=True)
     if not chains:
         return None
     radial, why = resolve_radial(opts.get('pf_radial', 'auto'), cfg or {})
+    radial, warn = radial_guard(chains, radial)
+    if warn:
+        why = 'otomatik düzeltildi'
     return {'chains': chains, 'model': opts.get('pf_model', 'strip'), 'radial': radial, 'radial_why': why,
-            'sim': bool(opts.get('pf_sim'))}
+            'radial_warn': warn, 'repair_note': rnote, 'sim': bool(opts.get('pf_sim'))}
 
 
 def _pf_note(opts, cfg, form):
@@ -3700,6 +4002,15 @@ def _pf_note(opts, cfg, form):
     if not (form and form.get('final')):
         return "\nÖn form seçili ama kullanılabilir çizgi bulunamadı (katman seçimini kontrol et)."
     fin = form['final']
+    _pp = _preform(opts, cfg) or {}
+    _pw = "".join("\n" + x for x in (_pp.get('repair_note', ''), _pp.get('radial_warn', '')) if x)
+    return _pw + _pf_note_body(opts, cfg, form, fin)
+
+
+THICK_HINT_MM = 10.0     # sac modelinde bu kalınlığın üstü: kalın (döküm / dövme) ön form uyarısı
+
+
+def _pf_note_body(opts, cfg, form, fin):
     if fin.get('mode') == 'strip':
         pf = _preform(opts, cfg)
         if not any(cl for _A, cl in form['pf_chains']):
@@ -3707,7 +4018,10 @@ def _pf_note(opts, cfg, form):
         stp = fin.get('strip') or {}
         return (f"\nÖn form: sac modeli (sıvama + inceltme), parça yarıçapı {pf['radial']} ekseni. "
                 f"Sac kalınlığı DXF'ten: {np.min(stp.get('t', [np.nan])):.2f} – {np.max(stp.get('t', [np.nan])):.2f} mm "
-                f"(ortanca {stp.get('tmed', float('nan')):.2f}). Hacim {stp.get('Vtot', 0):,.0f} mm³.")
+                f"(ortanca {stp.get('tmed', float('nan')):.2f}). Hacim {stp.get('Vtot', 0):,.0f} mm³."
+                + (f"\nUYARI: Ön form kalın (en kalın yer {np.max(stp.get('t', [0])):.1f} mm) — sac modeli ince sac içindir. "
+                   "Döküm / dövme gibi kalın ön formlarda 'Kalıp üzerinde (flow forming)' modelini seç."
+                   if np.max(stp.get('t', [0])) > THICK_HINT_MM else ""))
     if fin.get('mode') == 'shear':
         pf = _preform(opts, cfg)
         closed = any(cl for _A, cl in form['pf_chains'])
@@ -3822,6 +4136,14 @@ def upload_preform(file_obj):
     try:
         path = file_obj if isinstance(file_obj, str) else getattr(file_obj, 'name', None) or file_obj['name']
         st, msg = load_preform_file(path)
+        try:
+            _ch, _rn = preform_chains(st, None, with_note=True)
+            if _rn:
+                msg += "\n" + _rn
+            elif any(cl for _A, cl in _ch):
+                msg += "\nKontur temiz: kapalı kontur bulundu, onarım gerekmedi."
+        except Exception:
+            pass
         return st, gr.update(choices=preform_layer_choices(st), value=list(st['layers'])), \
             msg + "\nKatman seçimini kontrol et, sonra 'Çalıştır'a bas."
     except Exception as e:
