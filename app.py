@@ -549,6 +549,8 @@ def _densify(points, max_step):
 
 def _tool_contact_points(centers, mold, tool_radius, chunk=256):
     C = np.asarray(centers, float)
+    if getattr(tool_radius, 'shape', None) is not None:     # DXF makara profili
+        return tool_contact_pts(C, np.asarray(mold, float), tool_radius)
     A = mold[:-1]
     AB = mold[1:] - A
     L2 = np.maximum((AB ** 2).sum(1), 1e-18)
@@ -795,25 +797,181 @@ def build_channels_cfg(cfg):
         if n:
             notes.append(n)
         cmds = parse_gcode(code)
-        segs = simulate_channel(cmds, x0, y0, ch['tr'], ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
-        segs = apply_corner_compensation(segs, ch['tr'])
+        tr = ToolR(ch['tr'], ch.get('shape'))           # yarıçap (kompanzasyon) + varsa DXF makara profili
+        segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
+        segs = apply_corner_compensation(segs, float(tr))
         if use_geo:
-            segs = apply_geometric_contact(segs, mold_points, ch['tr'], (x0, y0))
+            segs = apply_geometric_contact(segs, mold_points, tr, (x0, y0))
             gaps = [s['gap_min'] for s in segs if 'gap_min' in s]
             if gaps and min(gaps) < -0.05:
                 notes.append(f"Uyarı: Kanal {ci + 1} takım dairesi kalıba giriyor "
                              f"(en küçük boşluk = {min(gaps):.2f}). Takım yarıçapını / yolu / G41-G42 yönünü kontrol et.")
         channels_segments.append(segs)
         start_points.append((x0, y0))
-        radii.append(ch['tr'])
+        radii.append(tr)
     return channels_segments, start_points, radii, mold_points, "\n".join(notes)
 
 
 # ===== Hücre 14 =====
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Polygon as MplPolygon
 from PIL import Image
+
+# -------------------------------------------------------------
+# TAKIM (MAKARA) ŞEKLİ: yarıçap + isteğe bağlı DXF profili
+#  ToolR bir float'tır (G41/G42 kompanzasyonu ve örnekleme bu yarıçapı kullanır, CNC'deki gibi);
+#  .shape varsa (merkeze göre kapalı poligon, DXF'teki 0,0 = makara merkezi) radüs izi, temas noktası,
+#  takım–kalıp mesafesi ve çizimler bu gerçek profil ile yapılır.
+# -------------------------------------------------------------
+class ToolR(float):
+    def __new__(cls, r, shape=None):
+        o = float.__new__(cls, float(r))
+        o.shape = None if shape is None or len(shape) < 3 else _close_poly(np.asarray(shape, float))
+        return o
+
+    def __reduce__(self):
+        return (ToolR, (float(self), self.shape))
+
+
+def _close_poly(P):
+    P = np.asarray(P, float)
+    if np.hypot(*(P[0] - P[-1])) > 1e-9:
+        P = np.vstack([P, P[:1]])
+    return P
+
+
+def tool_shape(r):
+    return getattr(r, 'shape', None)
+
+
+def tool_reach(r):
+    """Takım merkezinden profilin en uzak noktasına mesafe (daire için yarıçap)."""
+    S = tool_shape(r)
+    return float(np.max(np.hypot(S[:, 0], S[:, 1]))) if S is not None else float(r)
+
+
+def tool_outline(r, n=120):
+    """Merkeze göre takım anahattı (kapalı)."""
+    S = tool_shape(r)
+    if S is not None:
+        return S
+    a = np.linspace(0, 2 * np.pi, n + 1)
+    return np.c_[float(r) * np.cos(a), float(r) * np.sin(a)]
+
+
+def _poly_ray_s(O, Nr, A, D):
+    """Işın başlangıçları O (R,K,2) (poligon merkezine göre), yönleri Nr (R,2), kenarlar A,D (E,2).
+    Daire sürümüyle aynı anlam: başlangıç poligon içindeyse 0, değilse ışın doğrultusundaki (iki yön)
+    en yakın kesişim (işaretli), hiç yoksa inf."""
+    nx, ny = Nr[:, None, None, 0], Nr[:, None, None, 1]
+    ax, ay = A[None, None, :, 0] - O[..., 0][..., None], A[None, None, :, 1] - O[..., 1][..., None]
+    dx, dy = D[None, None, :, 0], D[None, None, :, 1]
+    den = nx * dy - ny * dx
+    with np.errstate(divide='ignore', invalid='ignore'):
+        sv = (ax * dy - ay * dx) / den
+        tv = (ax * ny - ay * nx) / den
+    ok = (np.abs(den) > 1e-12) & (tv >= 0) & (tv < 1)
+    inside = (np.sum(ok & (sv > 0), axis=-1) % 2) == 1
+    sa = np.where(ok, sv, np.inf)
+    k = np.argmin(np.abs(sa), axis=-1)
+    best = np.take_along_axis(sa, k[..., None], axis=-1)[..., 0]
+    return np.where(inside, 0.0, best)
+
+
+def tool_ray_matrix(M, Nrm, C, tool_r):
+    """(R,K) işaretli mesafe matrisi: her ışının her takım konumuna ilk girişi (daire ya da DXF profili)."""
+    S = tool_shape(tool_r)
+    if S is None:
+        r2 = float(tool_r) ** 2
+        dx = M[:, None, 0] - C[None, :, 0]
+        dy = M[:, None, 1] - C[None, :, 1]
+        b = Nrm[:, None, 0] * dx + Nrm[:, None, 1] * dy
+        cterm = dx * dx + dy * dy - r2
+        disc = b * b - cterm
+        with np.errstate(invalid='ignore'):
+            sq = np.sqrt(np.maximum(disc, 0.0))
+        s = np.where(cterm <= 0, 0.0, -b + np.sign(b) * sq)
+        return np.where((cterm > 0) & (disc < 0), np.inf, s)
+    O = M[:, None, :] - C[None, :, :]
+    return _poly_ray_s(O, Nrm, S[:-1], S[1:] - S[:-1])
+
+
+def tool_contact_pts(C, mold, tool_r):
+    """DXF profilli takım için: her merkezde profilin kalıba en yakın noktası ve (boşluk + yarıçap).
+    Daire sürümüyle uyumlu: dönen d - yarıçap = boşluk (kalıba girerse negatif)."""
+    S = tool_shape(tool_r)
+    V = S[:-1]
+    A = mold[:-1]; AB = mold[1:] - A
+    L2 = np.maximum((AB ** 2).sum(1), 1e-18)
+    E0, ED = S[:-1], S[1:] - S[:-1]
+    EL2 = np.maximum((ED ** 2).sum(1), 1e-18)
+    out = np.empty_like(C); gap = np.empty(len(C))
+    R = tool_reach(tool_r)
+    for j, c in enumerate(C):
+        dc = np.hypot(mold[:, 0] - c[0], mold[:, 1] - c[1])
+        segd = np.minimum(dc[:-1], dc[1:])
+        # en yakın kalıp parçalarına sınırla (en yakın mesafe en fazla merkez mesafesi + erişim kadar)
+        lim = float(np.min(np.hypot(*(np.clip(((c - A) * AB).sum(1) / L2, 0, 1)[:, None] * AB + A - c).T))) + R
+        keep = segd <= lim + np.hypot(*AB.T)
+        Ak, ABk, L2k = A[keep], AB[keep], L2[keep]
+        P = V + c
+        t = np.clip(((P[:, None, :] - Ak[None]) * ABk[None]).sum(2) / L2k[None], 0, 1)
+        Q = Ak[None] + t[..., None] * ABk[None]
+        d2 = ((Q - P[:, None, :]) ** 2).sum(2)
+        iv, ik = np.unravel_index(np.argmin(d2), d2.shape)
+        best, bp = float(np.sqrt(d2[iv, ik])), P[iv]
+        mk = np.unique(np.r_[np.where(keep)[0], np.where(keep)[0] + 1])
+        Mk = mold[mk]
+        Rel = Mk - c
+        u = np.clip(((Rel[:, None, :] - E0[None]) * ED[None]).sum(2) / EL2[None], 0, 1)
+        Pe = E0[None] + u[..., None] * ED[None]
+        d2e = ((Pe - Rel[:, None, :]) ** 2).sum(2)
+        im, ie = np.unravel_index(np.argmin(d2e), d2e.shape)
+        if np.sqrt(d2e[im, ie]) < best:
+            best, bp = float(np.sqrt(d2e[im, ie])), Pe[im, ie] + c
+        # kalıp noktası profilin içindeyse: girmiş (negatif boşluk)
+        inside = _pts_in_poly(Rel, S)
+        if inside.any():
+            dins = np.sqrt(d2e.min(1))[inside]
+            best = -float(dins.max())
+        out[j], gap[j] = bp, best
+    return out, gap + float(tool_r)
+
+
+def _pts_in_poly(P, S):
+    x, y = P[:, 0][:, None], P[:, 1][:, None]
+    x0, y0, x1, y1 = S[:-1, 0][None], S[:-1, 1][None], S[1:, 0][None], S[1:, 1][None]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cr = ((y0 > y) != (y1 > y)) & (x < (x1 - x0) * (y - y0) / (y1 - y0) + x0)
+    return (cr.sum(1) % 2) == 1
+
+
+def simplify_poly(P, tol=0.005, max_pts=160):
+    """Douglas-Peucker sadeleştirme (kapalı poligon); çok noktalı DXF/CMM profillerini hafifletir."""
+    P = _close_poly(P)
+    def dp(Q, eps):
+        if len(Q) < 3:
+            return Q
+        a, b = Q[0], Q[-1]
+        ab = b - a; L = np.hypot(*ab)
+        if L < 1e-12:
+            d = np.hypot(*(Q - a).T)
+        else:
+            d = np.abs(ab[0] * (Q[:, 1] - a[1]) - ab[1] * (Q[:, 0] - a[0])) / L
+        i = int(np.argmax(d))
+        if d[i] <= eps:
+            return np.vstack([a, b])
+        return np.vstack([dp(Q[:i + 1], eps)[:-1], dp(Q[i:], eps)])
+    far = int(np.argmax(np.hypot(*(P - P[0]).T)))
+    eps = tol
+    while True:
+        R1, R2 = dp(P[:far + 1], eps), dp(P[far:], eps)
+        out = np.vstack([R1[:-1], R2])
+        if len(out) <= max_pts or eps > 1.0:
+            return out
+        eps *= 1.6
+
 
 
 def _is_g0(seg):
@@ -839,7 +997,7 @@ def _plot_limits(mold_points, start_points, radii, margin_mult, segs=None, extra
                 if s.get('type') == 'move' and not _is_g0(s) and s.get('orig_points'):
                     P = np.asarray(s['orig_points'], float)
                     all_x.extend(P[:, 0]); all_y.extend(P[:, 1])
-    ra = [r for r, a in zip(radii, act) if a] or [0.0]
+    ra = [tool_reach(r) for r, a in zip(radii, act) if a] or [0.0]
     margin = max(5.0, max(ra) * margin_mult * 0.5)
     return (min(all_x) - margin, max(all_x) + margin), (min(all_y) - margin, max(all_y) + margin)
 
@@ -944,30 +1102,39 @@ def tool_samples(timeline, tool_r):
     return np.asarray(C, float), np.asarray(T, float)
 
 
-def radius_envelope(M, Nrm, C, tool_r, chunk=384):
-    """Her kalıp noktası için en yakın takım dairesi kesişimini bulur.
+def radius_envelope(M, Nrm, C, tool_r, chunk=384, maxs=150.0):
+    """Her kalıp noktası için en yakın takım kesişimini bulur (daire ya da DXF profili).
     Döndürür: s (N,) işaretli mesafe (+ normal yönü, - ters yönü; inf = hiç kesmedi).
-    Takım dairesi kalıp noktasını içine alıyorsa s = 0."""
+    Takım kalıp noktasını içine alıyorsa s = 0. DXF profilinde merkeze (erişim + maxs)'tan uzak
+    ışınlar hesaplanmaz (inf)."""
     N_m = len(M)
     best = np.full(N_m, np.inf)
     if N_m == 0 or len(C) == 0:
         return best
-    r2 = float(tool_r) ** 2
-    for a in range(0, len(C), chunk):
-        Cc = C[a:a + chunk]
-        dx = M[:, None, 0] - Cc[None, :, 0]                   # (N_m, k)
-        dy = M[:, None, 1] - Cc[None, :, 1]
-        b = Nrm[:, None, 0] * dx + Nrm[:, None, 1] * dy
-        cterm = dx * dx + dy * dy - r2
-        disc = b * b - cterm
-        with np.errstate(invalid='ignore'):
-            sq = np.sqrt(np.maximum(disc, 0.0))
-        s = np.where(cterm <= 0, 0.0, -b + np.sign(b) * sq)    # ışının daireye GİRDİĞİ (yakın) kök
-        s = np.where((cterm > 0) & (disc < 0), np.inf, s)
-        k = np.argmin(np.abs(s), axis=1)
-        cand = s[np.arange(N_m), k]
-        better = np.abs(cand) < np.abs(best)
-        best[better] = cand[better]
+    S = tool_shape(tool_r)
+    if S is None:
+        for a in range(0, len(C), chunk):
+            s = tool_ray_matrix(M, Nrm, C[a:a + chunk], tool_r)
+            k = np.argmin(np.abs(s), axis=1)
+            cand = s[np.arange(N_m), k]
+            better = np.abs(cand) < np.abs(best)
+            best[better] = cand[better]
+        return best
+    reach = tool_reach(tool_r) + maxs
+    ck = max(1, int(60000 // max(len(S), 1) // 64))
+    for a in range(0, len(C), ck):
+        Cc = C[a:a + ck]
+        lo, hi = Cc.min(0) - reach, Cc.max(0) + reach
+        rid = np.where((M[:, 0] >= lo[0]) & (M[:, 0] <= hi[0]) & (M[:, 1] >= lo[1]) & (M[:, 1] <= hi[1]))[0]
+        if not len(rid):
+            continue
+        for b0 in range(0, len(rid), 256):
+            r = rid[b0:b0 + 256]
+            s = tool_ray_matrix(M[r], Nrm[r], Cc, tool_r)
+            k = np.argmin(np.abs(s), axis=1)
+            cand = s[np.arange(len(r)), k]
+            better = np.abs(cand) < np.abs(best[r])
+            best[r[better]] = cand[better]
     return best
 
 
@@ -1418,7 +1585,11 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
             w.layer(name, _DXF_ACI['circles'][i])
             for t in circ_start + circ_step * np.arange(n):
                 t_c = max(0.0, min(float(t), total_time))
-                w.circle(name, get_position(timelines[i], t_c, 'points'), radii[i])
+                _c = np.asarray(get_position(timelines[i], t_c, 'points'), float)
+                if tool_shape(radii[i]) is not None:
+                    w.polyline(name, tool_shape(radii[i]) + _c)
+                else:
+                    w.circle(name, _c, radii[i])
     if envelopes and envelopes.get('pf_chains') and 'preform' in layers:
         w.layer('ON_FORM', 8)
         for A, cl in envelopes['pf_chains']:
@@ -1477,8 +1648,12 @@ def _dxf_pairs(text):
     return out
 
 
-def _arc_pts(cx, cy, r, a0, a1, tol=0.02):
+DXF_ARC_TOL = [0.02]      # yay kiriş toleransı (mm); makara / kalıp DXF okunurken geçici olarak inceltilir
+
+
+def _arc_pts(cx, cy, r, a0, a1, tol=None):
     """a0'dan a1'e (radyan, işaretli tarama) yay noktaları."""
+    tol = DXF_ARC_TOL[0] if tol is None else tol
     if r <= 0:
         return []
     sweep = a1 - a0
@@ -1489,7 +1664,7 @@ def _arc_pts(cx, cy, r, a0, a1, tol=0.02):
     return list(zip(cx + r * np.cos(a), cy + r * np.sin(a)))
 
 
-def _bulge_pts(p1, p2, b, tol=0.02):
+def _bulge_pts(p1, p2, b, tol=None):
     if abs(b) < 1e-9:
         return [p1, p2]
     x1, y1 = p1; x2, y2 = p2
@@ -2291,20 +2466,23 @@ def first_formed_times(timelines, radii, M, N, side, thr):
         C, T = tool_samples(timelines[i], radii[i])
         if len(C) == 0:
             continue
-        r2 = float(radii[i]) ** 2
-        for a_ in range(0, len(C), 256):
-            Cc, Tc = C[a_:a_ + 256], T[a_:a_ + 256]
-            dx = M[:, None, 0] - Cc[None, :, 0]; dy = M[:, None, 1] - Cc[None, :, 1]
-            b = N[:, None, 0] * dx + N[:, None, 1] * dy
-            ct = dx * dx + dy * dy - r2
-            disc = b * b - ct
-            with np.errstate(invalid='ignore'):
-                sq = np.sqrt(np.maximum(disc, 0))
-            s_ = np.where(ct <= 0, 0.0, -b + np.sign(b) * sq)
-            okm = ((ct <= 0) | (disc >= 0)) & ((s_ == 0) | (np.sign(s_) == side[:, None])) & (np.abs(s_) <= thr)
+        poly = tool_shape(radii[i]) is not None
+        step = 256 if not poly else 12
+        reach = tool_reach(radii[i]) + thr
+        for a_ in range(0, len(C), step):
+            Cc, Tc = C[a_:a_ + step], T[a_:a_ + step]
+            if poly:                                  # yalnız takıma yakın ışınlar
+                lo, hi = Cc.min(0) - reach, Cc.max(0) + reach
+                rid = np.where((M[:, 0] >= lo[0]) & (M[:, 0] <= hi[0]) & (M[:, 1] >= lo[1]) & (M[:, 1] <= hi[1]))[0]
+                if not len(rid):
+                    continue
+            else:
+                rid = np.arange(len(M))
+            s_ = tool_ray_matrix(M[rid], N[rid], Cc, radii[i])
+            okm = np.isfinite(s_) & ((s_ == 0) | (np.sign(s_) == side[rid, None])) & (np.abs(s_) <= thr)
             anyk = okm.any(1)
             first = np.where(anyk, Tc[np.argmax(okm, axis=1)], np.inf)
-            tau = np.minimum(tau, first)
+            tau[rid] = np.minimum(tau[rid], first)
     return tau
 
 
@@ -3155,6 +3333,570 @@ def thickness_profile(form, step_mm=1.0):
 
 
 # ===== Hücre 18 =====
+# =============================================================
+# MAKARA PROFİLİ (DXF), KALIP DXF → G-KODU, TAKIM AŞINMASI
+# =============================================================
+import matplotlib.colors as mcolors
+from matplotlib.collections import LineCollection
+
+WEAR_CMAP = mcolors.LinearSegmentedColormap.from_list(      # tek tonlu sıra: açık → koyu turuncu
+    'wear_orange', ['#fdf1ea', '#f6b896', '#eb6834', '#b8441a', '#6e2408'])
+INK, INK2, GRID = '#222222', '#666666', '#e6e6e6'
+
+
+# -------------------------------------------------------------
+# 1) MAKARA PROFİLİ: DXF'teki 0,0 = makara merkezi (CNC'nin kontrol ettiği nokta)
+# -------------------------------------------------------------
+def _load_fine(path, tol=0.002):
+    """DXF'i ince yay bölmesiyle oku (makara / kalıp hassasiyeti)."""
+    old = DXF_ARC_TOL[0]
+    DXF_ARC_TOL[0] = tol
+    try:
+        return load_preform_file(path)
+    finally:
+        DXF_ARC_TOL[0] = old
+
+
+def load_tool_dxf(path, tr=None):
+    """Makara kesit profilini DXF'ten okur (kapalı kontur; açık/boşluklu çizgiler onarılır).
+    Döndürür: ({'name', 'shape'}, mesaj)"""
+    st, _msg = _load_fine(path)
+    ch, rnote = preform_chains(st, None, with_note=True)
+    P = _largest_closed(ch)
+    if P is None:
+        raise ValueError("Makara DXF'inde kapalı bir kontur bulunamadı. Makara kesitini kapalı kontur "
+                         "(polyline / çizgi + yay) olarak çiz; 0,0 makara merkezi olmalı.")
+    P = simplify_poly(P, 0.003, 240)
+    if poly_area(P) < 0:
+        P = P[::-1]
+    name = os.path.basename(path)
+    lines = [f"Makara profili yüklendi: {name} — {len(P) - 1} kenar."]
+    if rnote:
+        lines.append(rnote)
+    inside = bool(_pts_in_poly(np.zeros((1, 2)), P)[0])
+    reach = float(np.max(np.hypot(P[:, 0], P[:, 1])))
+    lines.append(f"Profil sınırları X {P[:, 0].min():.2f}…{P[:, 0].max():.2f}, Y {P[:, 1].min():.2f}…{P[:, 1].max():.2f} mm; "
+                 f"merkezden en uzak nokta {reach:.2f} mm.")
+    if not inside:
+        lines.append("UYARI: 0,0 noktası profilin dışında. DXF'te makara merkezini 0,0'a taşıdığından emin ol.")
+    if tr:
+        lines.append(f"G41/G42 kompanzasyonu girilen takım yarıçapıyla ({float(tr):g} mm) yapılır (CNC'deki gibi); "
+                     "radüs izi, temas noktası, mesafe ölçümü ve çizimler bu profille yapılır.")
+    return {'name': name, 'shape': [[round(float(x), 5), round(float(y), 5)] for x, y in P]}, "\n".join(lines)
+
+
+def tool_preview_html(entry, tr, color='#0072B2'):
+    """Yüklenen makara profilinin küçük önizlemesi (0,0 merkez, kesikli: kompanzasyon yarıçapı)."""
+    if not entry:
+        return ""
+    P = np.asarray(entry['shape'], float)
+    fig = Figure(figsize=(3.6, 3.2), dpi=100)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    ax.fill(P[:, 0], P[:, 1], color=color, alpha=0.18, linewidth=0)
+    ax.plot(P[:, 0], P[:, 1], color=color, linewidth=1.6)
+    if tr:
+        a = np.linspace(0, 2 * np.pi, 181)
+        ax.plot(float(tr) * np.cos(a), float(tr) * np.sin(a), color=INK2, linewidth=1.0, linestyle=(0, (4, 3)))
+    ax.plot([0], [0], '+', color=INK, markersize=9, markeredgewidth=1.5)
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.grid(True, color=GRID, linewidth=0.8)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    ax.set_title(f"{entry.get('name', 'makara')}  (+ = 0,0 merkez, kesikli = R{float(tr):g})", fontsize=8, color=INK)
+    ax.tick_params(labelsize=7, colors=INK2)
+    fig.tight_layout()
+    return fig_to_svg_card(fig)
+
+
+def apply_tool_shapes(cfg, tool_state):
+    """Arayüzdeki makara profillerini (kanal no → {'shape'}) konfigürasyona işler."""
+    ts = tool_state if isinstance(tool_state, dict) else {}
+    for i, ch in enumerate(cfg['channels']):
+        e = ts.get(str(i)) or ts.get(i)
+        ch['shape'] = np.asarray(e['shape'], float) if e and e.get('shape') else None
+    return cfg
+
+
+# -------------------------------------------------------------
+# 2) KALIP DXF → G-KODU (doğru + yay uydurma; JSON ile saklanabilir)
+# -------------------------------------------------------------
+MOLD_FIT_TOL = 0.002        # G-kodu uydurma toleransı (mm)
+
+
+def _fmt4(v):
+    s = f"{v:.4f}".rstrip('0').rstrip('.')
+    return '0' if s in ('', '-0') else s
+
+
+def _circle3(a, b, c):
+    d = 2 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]))
+    if abs(d) < 1e-12:
+        return None
+    ux = ((a @ a) * (b[1] - c[1]) + (b @ b) * (c[1] - a[1]) + (c @ c) * (a[1] - b[1])) / d
+    uy = ((a @ a) * (c[0] - b[0]) + (b @ b) * (a[0] - c[0]) + (c @ c) * (b[0] - a[0])) / d
+    return np.array([ux, uy])
+
+
+def _fits_line(P, i, j, tol):
+    a, b = P[i], P[j]
+    ab = b - a
+    L = float(np.hypot(*ab))
+    if L < 1e-12:
+        return False
+    Q = P[i:j + 1]
+    d = np.abs(ab[0] * (Q[:, 1] - a[1]) - ab[1] * (Q[:, 0] - a[0])) / L
+    t = ((Q - a) @ ab) / (L * L)
+    return bool(d.max() <= tol and t.min() >= -1e-9 and t.max() <= 1 + 1e-9 and np.all(np.diff(t) > -1e-9))
+
+
+def _fits_arc(P, i, j, tol):
+    """i..j noktaları tek bir yaya (< 180°, tek yönlü) tolerans içinde oturuyor mu? (merkez, yarıçap, saat yönü)"""
+    if j - i < 2:
+        return None
+    m = (i + j) // 2
+    c = _circle3(P[i], P[m], P[j])
+    if c is None:
+        return None
+    Q = P[i:j + 1]
+    r = float(np.hypot(*(P[i] - c)))
+    if r > 1e5 or abs(np.hypot(Q[:, 0] - c[0], Q[:, 1] - c[1]) - r).max() > tol:
+        return None
+    ang = np.unwrap(np.arctan2(Q[:, 1] - c[1], Q[:, 0] - c[0]))
+    da = np.diff(ang)
+    if not (np.all(da > 1e-9) or np.all(da < -1e-9)):
+        return None
+    if abs(ang[-1] - ang[0]) >= np.pi * 0.995:
+        return None
+    return c, r, bool(da[0] < 0)
+
+
+def _grow(n, i, j0, test):
+    """test(i, j) doğru kaldıkça j'yi j0'dan büyüt (üstel adım + ikili arama). Döndürür: en büyük geçerli j ya da None."""
+    if j0 >= n or not test(i, j0):
+        return None
+    good, step = j0, 1
+    while good < n - 1:
+        j = min(good + step, n - 1)
+        if test(i, j):
+            good, step = j, step * 2
+            continue
+        lo, hi = good, j
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if test(i, mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+    return good
+
+
+def polyline_to_gcode(P, tol=MOLD_FIT_TOL):
+    """Nokta dizisini G1 / G2 / G3 (R) satırlarına çevirir. Döndürür: (satırlar, (x0, y0))"""
+    P = np.asarray(P, float)
+    keep = np.r_[True, np.hypot(*np.diff(P, axis=0).T) > 1e-9]
+    P = P[keep]
+    out, i, n = [], 0, len(P)
+    while i < n - 1:
+        jl = _grow(n, i, i + 1, lambda a, b: _fits_line(P, a, b, tol)) or i + 1
+        ja = _grow(n, i, i + 2, lambda a, b: _fits_arc(P, a, b, tol) is not None)
+        if ja is not None and ja >= i + 3 and ja > jl:
+            c, r, cw = _fits_arc(P, i, ja, tol)
+            e = P[ja]
+            out.append(f"{'G2' if cw else 'G3'} X{_fmt4(e[0])} Y{_fmt4(e[1])} R{_fmt4(r)}")
+            i = ja
+        else:
+            # doğru, ardından gelen teğet yayın ilk noktalarını yutmasın: yay jl-1'den başlayabiliyorsa geri çekil
+            while jl - 1 > i:
+                jb = _grow(n, jl - 1, jl + 1, lambda a, b: _fits_arc(P, a, b, tol) is not None)
+                if jb is not None and jb >= jl + 2:
+                    jl -= 1
+                else:
+                    break
+            e = P[jl]
+            out.append(f"G1 X{_fmt4(e[0])} Y{_fmt4(e[1])}")
+            i = jl
+    return out, (float(P[0, 0]), float(P[0, 1]))
+
+
+def _split_face(P, ri, face):
+    """Kapalı konturdan kalıp yüzeyini seç: eksen yönünde iki uç noktası arasındaki iki yoldan
+    yarıçapı büyük olan (dış) ya da küçük olan (iç)."""
+    Q = P[:-1] if np.hypot(*(P[0] - P[-1])) < 1e-9 else P
+    ai = 1 - ri
+    i0, i1 = int(np.argmin(Q[:, ai])), int(np.argmax(Q[:, ai]))
+    n = len(Q)
+    path_a = [Q[(i0 + k) % n] for k in range((i1 - i0) % n + 1)]
+    path_b = [Q[(i0 - k) % n] for k in range((i0 - i1) % n + 1)]
+
+    def mean_r(path):
+        A = np.asarray(path)
+        L = np.hypot(*np.diff(A, axis=0).T)
+        mid = np.abs((A[:-1, ri] + A[1:, ri]) / 2)
+        return float((mid * L).sum() / max(L.sum(), 1e-12))
+
+    pa, pb = np.asarray(path_a), np.asarray(path_b)
+    big, small = (pa, pb) if mean_r(path_a) >= mean_r(path_b) else (pb, pa)
+    return big if face == 'outer' else small
+
+
+MOLD_FACE_CHOICES = [('Dış yüz (yarıçapı büyük taraf)', 'outer'), ('İç yüz (yarıçapı küçük taraf)', 'inner'),
+                     ('Tüm kontur (olduğu gibi)', 'all')]
+
+
+def dxf_to_mold(path, face='outer', radial='X', reverse=False, tol=MOLD_FIT_TOL):
+    """Kalıp DXF'ini kalıp G-koduna çevirir. Açık çizgi ise olduğu gibi; kapalı konturdan seçilen yüz alınır.
+    Varsayılan yön: eksen koordinatı büyük uçtan küçüğe (ters çevrilebilir).
+    Döndürür: ({'x0','y0','code','dia_mode','dia_axis','source'}, mesaj)"""
+    st, _m = _load_fine(path)
+    ch = _join_chains(st, None)
+    if not ch:
+        raise ValueError("Kalıp DXF'inde çizgi bulunamadı.")
+    plen = lambda A: float(np.hypot(*np.diff(A, axis=0).T).sum())
+    ch = sorted(ch, key=lambda c: -plen(c[0]))
+    P, closed = ch[0]
+    ri = 0 if radial == 'X' else 1
+    notes = []
+    if len(ch) > 1:
+        notes.append(f"DXF'te {len(ch)} ayrı çizgi zinciri var; en uzunu ({plen(P):.1f} mm) kalıp olarak alındı.")
+    if closed and face != 'all':
+        P = _split_face(P, ri, face)
+        notes.append(f"Kapalı kontur: {'dış' if face == 'outer' else 'iç'} yüz alındı (parça yarıçapı ekseni {radial}).")
+    ai = 1 - ri
+    if not closed or face != 'all':
+        if P[0, ai] < P[-1, ai]:
+            P = P[::-1]
+    if reverse:
+        P = P[::-1]
+    lines, (x0, y0) = polyline_to_gcode(P, tol)
+    code = "\n".join(lines)
+    # gidiş-dönüş kontrolü: G-kodundan yeniden üretilen yol, DXF'e ne kadar yakın?
+    try:
+        pts = np.asarray(get_mold_points_cfg({'x0': x0, 'y0': y0, 'code': code, 'dia_mode': 'radius', 'dia_axis': 'X'}), float)
+        dev = _poly_dev(pts, P)
+        notes.append(f"Doğrulama: G-kodundan çizilen kalıp DXF'ten en fazla {dev:.3f} mm sapıyor (iki tarafın yay bölme hatası dahil).")
+    except Exception as e:
+        notes.append(f"Doğrulama yapılamadı: {e}")
+    n2 = sum(1 for ln in lines if ln.startswith(('G2', 'G3')))
+    msg = (f"Kalıp DXF'i G-koduna çevrildi: {os.path.basename(path)} → {len(lines)} satır "
+           f"({len(lines) - n2} G1, {n2} G2/G3), başlangıç X{_fmt4(x0)} Y{_fmt4(y0)}.\n" + "\n".join(notes) +
+           "\nKalıp alanları dolduruldu. Saklamak için 'Kalıbı JSON olarak indir' (yalnız kalıp) ya da "
+           "'Ayarları JSON Olarak Kaydet' (tüm ayarlar).")
+    return {'x0': round(x0, 4), 'y0': round(y0, 4), 'code': code, 'dia_mode': 'radius', 'dia_axis': 'X',
+            'source': os.path.basename(path)}, msg
+
+
+def _poly_dev(A, B):
+    """A noktalarının B çoklu çizgisine en büyük uzaklığı (ve tersi)."""
+    def one(P, Q):
+        a, ab = Q[:-1], Q[1:] - Q[:-1]
+        L2 = np.maximum((ab ** 2).sum(1), 1e-18)
+        best = 0.0
+        for k in range(0, len(P), 512):
+            X = P[k:k + 512]
+            t = np.clip(((X[:, None, :] - a[None]) * ab[None]).sum(2) / L2[None], 0, 1)
+            d = np.hypot(*(a[None] + t[..., None] * ab[None] - X[:, None, :]).transpose(2, 0, 1)).min(1)
+            best = max(best, float(d.max()))
+        return best
+    return max(one(A, B), one(B, A))
+
+
+# -------------------------------------------------------------
+# 3) TAKIM AŞINMASI (yaklaşık model)
+#  Makara profilinin her noktası için, her takım adımında:
+#     dW = K · h^a · (v / v_ref)^b · Δs
+#  h  : o profil noktasının gelen malzeme yüzeyinin ne kadar altında olduğu = süpürdüğü kalınlık (mm)
+#  v  : ilerleme hızı F (mm/dk),  Δs : adımda alınan yol (mm)
+#  Gelen yüzey: ön form kalınlığı (varsa) ile önceki pasların / diğer kanalların bıraktığı yüzeyin küçüğü.
+#  Aynı pasın hemen arkasındaki izi (takımın kendisi) sayılmaz: makara önündeki malzemeyle temas eder.
+#  Yalnız ön yüz (normali ilerleme yönüne ve kalıba bakan profil noktaları) temas yayıdır.
+# -------------------------------------------------------------
+WEAR_NB = 240
+
+
+def _wear_samples(timeline, tool_r):
+    """Takım merkezi örnekleri + zaman + satır no + ilerleme hızı + adım yolu (G0 hariç)."""
+    step = max(0.15, float(tool_r) / 30.0)
+    C, T, LN, V, DS, U = [], [], [], [], [], []
+    for (t0, t1, seg) in timeline:
+        if seg['type'] != 'move' or _is_g0(seg):
+            continue
+        pts = np.asarray(seg['points'], float)
+        if len(pts) < 2:
+            continue
+        n_seg = len(pts) - 1
+        L_tot = float(np.hypot(*np.diff(pts, axis=0).T).sum())
+        v = L_tot / max(t1 - t0, 1e-9) * 60.0
+        for i in range(n_seg):
+            a, b = pts[i], pts[i + 1]
+            L = float(np.hypot(*(b - a)))
+            if L < 1e-12:
+                continue
+            m = max(int(np.ceil(L / step)), 1)
+            for j in range(m):
+                u = (j + 0.5) / m
+                C.append(a + (b - a) * u)
+                T.append(t0 + (t1 - t0) * (i + u) / n_seg)
+                LN.append(seg.get('line', -1)); V.append(v); DS.append(L / m); U.append((b - a) / L)
+    if not C:
+        return None
+    return {'C': np.asarray(C), 'T': np.asarray(T), 'line': np.asarray(LN), 'v': np.asarray(V),
+            'ds': np.asarray(DS), 'arc': np.cumsum(DS), 'u': np.asarray(U)}
+
+
+def _boundary(tool_r, n=WEAR_NB):
+    """Profili eşit aralıklı n noktaya böl; dış normaller (saat yönü tersine konturda)."""
+    O = tool_outline(tool_r, 720)
+    if poly_area(O) < 0:
+        O = O[::-1]
+    L = np.r_[0, np.cumsum(np.hypot(*np.diff(O, axis=0).T))]
+    s = (np.arange(n) + 0.5) * L[-1] / n
+    B = np.c_[np.interp(s, L, O[:, 0]), np.interp(s, L, O[:, 1])]
+    k = np.clip(np.searchsorted(L, s) - 1, 0, len(O) - 2)
+    tg = O[k + 1] - O[k]
+    tg /= np.maximum(np.hypot(tg[:, 0], tg[:, 1]), 1e-12)[:, None]
+    nb = np.c_[tg[:, 1], -tg[:, 0]]
+    return B, nb, s
+
+
+def _pair_table(M, N, smp, tool_r, sd, smax):
+    """Kanal örneklerinin ışınlara giriş mesafeleri (malzeme tarafında, |s| ≤ smax) → ışın başına
+    örnek sırasına göre birikimli en küçük değer. Döndürür: (anahtarlar, değerler, K)"""
+    C = smp['C']
+    K = len(C)
+    I, KK, S = [], [], []
+    poly = tool_shape(tool_r) is not None
+    step = 12 if poly else 256
+    reach = tool_reach(tool_r) + smax
+    for a in range(0, K, step):
+        Cc = C[a:a + step]
+        lo, hi = Cc.min(0) - reach, Cc.max(0) + reach
+        rid = np.where((M[:, 0] >= lo[0]) & (M[:, 0] <= hi[0]) & (M[:, 1] >= lo[1]) & (M[:, 1] <= hi[1]))[0]
+        if not len(rid):
+            continue
+        s = tool_ray_matrix(M[rid], N[rid], Cc, tool_r)
+        ok = np.isfinite(s) & (np.abs(s) <= smax) & ((s == 0) | (np.sign(s) == sd[rid, None]))
+        r_, k_ = np.nonzero(ok)
+        I.append(rid[r_]); KK.append(a + k_); S.append(np.abs(s[r_, k_]))
+    if not I:
+        return np.zeros(0, np.int64), np.zeros(0), K
+    I, KK, S = np.concatenate(I), np.concatenate(KK), np.concatenate(S)
+    key = I.astype(np.int64) * (K + 1) + KK
+    o = np.argsort(key, kind='stable')
+    key, I, S = key[o], I[o], S[o]
+    cm = pd.Series(S).groupby(I).cummin().to_numpy()
+    return key, cm, K
+
+
+def _pair_query(tab, ray, kmax):
+    """Işın ray için örnek no ≤ kmax olanların en küçük giriş mesafesi (yoksa inf)."""
+    key, cm, K = tab
+    if len(key) == 0:
+        return np.full(len(ray), np.inf)
+    q = ray.astype(np.int64) * (K + 1) + np.asarray(kmax, np.int64)
+    pos = np.searchsorted(key, q, side='right') - 1
+    ok = (pos >= 0) & (np.asarray(kmax) >= 0)
+    pos_c = np.clip(pos, 0, len(key) - 1)
+    ok &= (key[pos_c] // (K + 1)) == ray
+    return np.where(ok, cm[pos_c], np.inf)
+
+
+def _nearest_rays(M, Q):
+    try:
+        from scipy.spatial import cKDTree
+        return cKDTree(M).query(Q)[1]
+    except Exception:
+        out = np.empty(len(Q), int)
+        for a in range(0, len(Q), 2048):
+            d2 = ((Q[a:a + 2048, None, :] - M[None]) ** 2).sum(-1)
+            out[a:a + 2048] = np.argmin(d2, axis=1)
+        return out
+
+
+def compute_wear(timelines, radii, mold_points, fin=None, env_limit=0.0, a=1.0, b=0.5, v_ref=1000.0, K=0.0,
+                 n_bins=160):
+    """Kanal başına makara profili boyunca birikimli aşınma ve zaman–konum ısı haritası."""
+    M, N, _ = mold_rays(mold_points)
+    if len(M) < 2:
+        raise ValueError("Kalıp noktası yetersiz.")
+    total_T = max((tl[-1][1] for tl in timelines if tl), default=1.0)
+    act = [bool(tl) and channel_active([s for _a, _b, s in tl]) for tl in timelines]
+    samples = [(_wear_samples(timelines[i], radii[i]) if act[i] else None) for i in range(N_CH)]
+    # malzeme tarafı (ışın başına): ön form varsa ondan, yoksa takımın bulunduğu taraf
+    if fin is not None and len(fin.get('side', [])) == len(M):
+        sd = np.asarray(fin['side'], int)
+    else:
+        sd = np.zeros(len(M), int)
+        for i in range(N_CH):
+            if samples[i] is not None:
+                s_env = radius_envelope(M, N, samples[i]['C'], radii[i])
+                m = (sd == 0) & np.isfinite(s_env) & (s_env != 0)
+                sd[m] = np.sign(s_env[m]).astype(int)
+        sd[sd == 0] = 1
+    # başlangıç malzeme yüzeyi (kalıptan uzaklık)
+    if fin is not None and len(fin.get('T', [])) == len(M) and np.isfinite(fin['T']).any():
+        T0 = np.asarray(fin['T'], float)
+        S0 = np.where(np.isfinite(T0), T0, float(np.nanmedian(T0)))
+        src = "ön form kalınlığı (DXF)"
+    elif env_limit and env_limit > 0:
+        S0 = np.full(len(M), float(env_limit)); src = f"ham malzeme kalınlığı {env_limit:g} mm"
+    else:
+        rr = max([float(r) for r, a_ in zip(radii, act) if a_] or [10.0])
+        S0 = np.full(len(M), rr); src = f"takım yarıçapı ({rr:g} mm; ham kalınlık girilmedi)"
+    smax = float(np.max(S0)) + 1.0
+    tabs = [(_pair_table(M, N, samples[i], radii[i], sd, smax) if samples[i] is not None else None)
+            for i in range(N_CH)]
+    res = []
+    for i in range(N_CH):
+        smp = samples[i]
+        if smp is None:
+            res.append(None)
+            continue
+        B, nb, sb = _boundary(radii[i])
+        nB = len(B)
+        n_bins = int(min(120, max(20, len(smp['C']) // 14)))     # kutu başına ≥ ~14 örnek: şeritlenme olmasın
+        lag = 2.0 * tool_reach(radii[i])
+        W = np.zeros(nB)
+        H = np.zeros((n_bins, nB))
+        line_w = {}
+        hmax = 0.0
+        Kn = len(smp['C'])
+        kown = np.searchsorted(smp['arc'], smp['arc'] - lag, side='right') - 1
+        for a0 in range(0, Kn, 64):
+            ks = np.arange(a0, min(a0 + 64, Kn))
+            Q = (smp['C'][ks][:, None, :] + B[None]).reshape(-1, 2)
+            ray = _nearest_rays(M, Q)
+            nd = N[ray] * sd[ray][:, None]
+            sQ = ((Q - M[ray]) * nd).sum(1)
+            kk = np.repeat(ks, nB)
+            Sin = np.minimum(S0[ray], _pair_query(tabs[i], ray, kown[kk]))
+            for c in range(N_CH):
+                if c != i and tabs[c] is not None:
+                    kc = np.searchsorted(samples[c]['T'], smp['T'][kk], side='left') - 1
+                    Sin = np.minimum(Sin, _pair_query(tabs[c], ray, kc))
+            h = Sin - np.maximum(sQ, 0.0)
+            nbt = np.tile(nb, (len(ks), 1))
+            # temas yayı: kalıba bakan VE ilerleme yönüne bakan (ön) yüz; arka yüz malzemeden ayrılır
+            face = ((nbt * nd).sum(1) < 0.05) & ((nbt * smp['u'][kk]).sum(1) > 0.0)
+            ok = (h > 0) & face & (sQ > -0.5) & np.isfinite(h)
+            h = np.where(ok, h, 0.0)
+            hmax = max(hmax, float(h.max()) if len(h) else 0.0)
+            vt = (smp['v'][kk] / v_ref) ** b if b else 1.0
+            dW = (h ** a) * vt * smp['ds'][kk]
+            dW = dW.reshape(len(ks), nB)
+            W += dW.sum(0)
+            bins = np.minimum((smp['T'][ks] / max(total_T, 1e-9) * n_bins).astype(int), n_bins - 1)
+            np.add.at(H, bins, dW)
+            for ln, w_ in zip(smp['line'][ks], dW.sum(1)):
+                if w_ > 0:
+                    line_w[int(ln)] = line_w.get(int(ln), 0.0) + float(w_)
+        res.append({'B': B, 'nb': nb, 's': sb, 'W': W, 'H': H, 'lines': line_w, 'hmax': hmax,
+                    'T': total_T, 'K': K, 'shape': tool_shape(radii[i]) is not None})
+    return res, src
+
+
+def _prof_angle(B, W=None):
+    """Profil noktalarının merkeze göre açısı (°). W verilirse açılar, aşınan bölge ±180° sınırında
+    bölünmeyecek şekilde kaydırılır (en büyük boş aralığın ortasından kesilir)."""
+    ang = np.degrees(np.arctan2(B[:, 1], B[:, 0]))
+    if W is None or W.max() <= 0:
+        return ang
+    on = np.sort(ang[W > 0.01 * W.max()])
+    if len(on) < 2:
+        return ang
+    gaps = np.diff(np.r_[on, on[0] + 360.0])
+    k = int(np.argmax(gaps))
+    cut = on[k] + gaps[k] / 2.0                       # bu açının karşısında aşınma yok
+    return (ang - cut) % 360.0 + cut - 360.0 * (cut > 0)
+
+
+def wear_figures(i, w, color):
+    """(profil ısı figürü, zaman–konum ısı haritası, profil boyunca birikimli aşınma) → HTML"""
+    B, nb, W, H = w['B'], w['nb'], w['W'], w['H']
+    Wm = float(W.max()) if W.max() > 0 else 1.0
+    rel = W / Wm * 100.0
+    norm = mcolors.Normalize(0, 100)
+    # 1) profil: kenar rengi = göreli aşınma, kesikli = abartılı aşınmış profil
+    fig = Figure(figsize=(6.2, 5.2), dpi=100); FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    Bc = np.vstack([B, B[:1]])
+    ax.fill(Bc[:, 0], Bc[:, 1], color='#f2f2f2', zorder=0)
+    seg = np.stack([Bc[:-1], Bc[1:]], axis=1)
+    lc = LineCollection(seg, cmap=WEAR_CMAP, norm=norm, linewidths=5, capstyle='round', zorder=2)
+    lc.set_array(np.r_[rel])
+    ax.add_collection(lc)
+    reach = float(np.max(np.hypot(B[:, 0], B[:, 1])))
+    ex = 0.12 * reach
+    Wp = B - nb * (W / Wm * ex)[:, None]
+    Wp = np.vstack([Wp, Wp[:1]])
+    ax.plot(Wp[:, 0], Wp[:, 1], color=INK, linewidth=1.0, linestyle=(0, (4, 3)), zorder=3,
+            label=f"Aşınmış profil (abartılı: en çok aşınan yer {ex:.1f} mm içeri)")
+    ax.plot(Bc[:, 0], Bc[:, 1], color=INK2, linewidth=0.6, zorder=1)
+    km = int(np.argmax(W))
+    ax.plot([0], [0], '+', color=INK, markersize=9, markeredgewidth=1.4)
+    ax.plot([0, B[km, 0]], [0, B[km, 1]], color=INK2, linewidth=0.8, zorder=1)
+    ang = _prof_angle(B, W)
+    ax.annotate(f"en çok aşınma\n{ang[km]:.0f}°", B[km], xytext=(B[km] * 0.45), fontsize=8, color=INK,
+                ha='center', arrowprops=dict(arrowstyle='-', color=INK2, lw=0.8))
+    ax.set_aspect('equal', adjustable='box')
+    pad = reach * 0.45
+    ax.set_xlim(B[:, 0].min() - pad, B[:, 0].max() + pad); ax.set_ylim(B[:, 1].min() - pad, B[:, 1].max() + pad)
+    ax.grid(True, color=GRID, linewidth=0.8)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    ax.tick_params(labelsize=8, colors=INK2)
+    ax.set_title(f"Kanal {i + 1} — makara profili üzerinde göreli aşınma", fontsize=10, color=INK)
+    ax.legend(loc='lower left', fontsize=7, frameon=False)
+    cb = fig.colorbar(lc, ax=ax, fraction=0.04, pad=0.02)
+    cb.set_label('Göreli aşınma (%; en çok aşınan yer = 100)', fontsize=8, color=INK)
+    cb.ax.tick_params(labelsize=7, colors=INK2)
+    fig.tight_layout()
+    h1 = fig_to_svg_card(fig)
+    # 2) ısı haritası: yatay = profil üzerindeki açı (merkeze göre), dikey = zaman
+    on = W > 0.01 * Wm
+    o = np.argsort(ang)
+    ang_s, H_s, rel_s = ang[o], H[:, o], rel[o]
+    if on.any():
+        lo_a, hi_a = float(ang[on].min()) - 10, float(ang[on].max()) + 10
+    else:
+        lo_a, hi_a = -180.0, 180.0
+    sel = (ang_s >= lo_a) & (ang_s <= hi_a)
+    fig2 = Figure(figsize=(7.2, 4.6), dpi=100); FigureCanvasAgg(fig2)
+    ax2 = fig2.add_subplot(111)
+    Hm = float(H_s.max()) if H_s.max() > 0 else 1.0
+    if sel.sum() >= 2:
+        im = ax2.pcolormesh(ang_s[sel], (np.arange(H.shape[0]) + 0.5) * w['T'] / H.shape[0], H_s[:, sel] / Hm * 100,
+                            cmap=WEAR_CMAP, vmin=0, vmax=100, shading='nearest')
+        cb2 = fig2.colorbar(im, ax=ax2, fraction=0.04, pad=0.02)
+        cb2.set_label('Aşınma hızı (göreli, %)', fontsize=8, color=INK)
+        cb2.ax.tick_params(labelsize=7, colors=INK2)
+    ax2.set_xlabel('Makara profili üzerindeki konum — merkeze göre açı (°)', fontsize=9, color=INK)
+    ax2.set_ylabel('Zaman (s)', fontsize=9, color=INK)
+    ax2.set_title(f"Kanal {i + 1} — aşınmanın zaman ve profil konumuna göre dağılımı", fontsize=10, color=INK)
+    ax2.tick_params(labelsize=8, colors=INK2)
+    for sp in ('top', 'right'):
+        ax2.spines[sp].set_visible(False)
+    fig2.tight_layout()
+    h2 = fig_to_svg_card(fig2)
+    # 3) profil boyunca birikimli aşınma (tek seri)
+    fig3 = Figure(figsize=(7.2, 2.8), dpi=100); FigureCanvasAgg(fig3)
+    ax3 = fig3.add_subplot(111)
+    ax3.plot(ang_s[sel], rel_s[sel], color='#eb6834', linewidth=2)
+    ax3.set_xlabel('Makara profili üzerindeki konum — merkeze göre açı (°)', fontsize=9, color=INK)
+    ax3.set_ylabel('Göreli aşınma (%)', fontsize=9, color=INK)
+    ax3.set_title(f"Kanal {i + 1} — toplam aşınmanın profil boyunca dağılımı", fontsize=10, color=INK)
+    ax3.grid(True, axis='y', color=GRID, linewidth=0.8)
+    ax3.set_ylim(0, 105)
+    for sp in ('top', 'right'):
+        ax3.spines[sp].set_visible(False)
+    ax3.tick_params(labelsize=8, colors=INK2)
+    fig3.tight_layout()
+    h3 = fig_to_svg_card(fig3)
+    return h1 + h2 + h3
+
+
+# ===== Hücre 20 =====
 # -------------------------------------------------------------
 # ANİMASYON SAHNESİ (canlı oynatıcı ve MP4 aynı kodu kullanır)
 # -------------------------------------------------------------
@@ -3178,7 +3920,7 @@ def _scene_bounds(channels_segments, start_points, radii, mold_points, extra=Non
             if seg['type'] == 'move':
                 all_x.extend(p[0] for p in seg['orig_points'])
                 all_y.extend(p[1] for p in seg['orig_points'])
-    ra = [r for r, a in zip(radii, act) if a] or [0.0]
+    ra = [tool_reach(r) for r, a in zip(radii, act) if a] or [0.0]
     margin = max(10.0, max(ra) * 2)
     return min(all_x) - margin, max(all_x) + margin, min(all_y) - margin, max(all_y) + margin
 
@@ -3204,8 +3946,10 @@ def build_scene(channels_segments, start_points, radii, mold_points, xname='X', 
           'spoke_lines': [], 'contact_dots': [], 'tool_centers': []}
     for i in range(N_CH):
         (cline,) = ax.plot([], [], color=CHANNEL_COLORS[i], linewidth=2.2, label=f'Kanal {i+1} — kontur')
-        circ = Circle((0, 0), radii[i], facecolor=CHANNEL_COLORS[i], alpha=0.22,
-                      edgecolor=CHANNEL_COLORS[i], linewidth=1.8)
+        _ol = tool_outline(radii[i])
+        circ = MplPolygon(_ol, closed=True, facecolor=CHANNEL_COLORS[i], alpha=0.22,
+                          edgecolor=CHANNEL_COLORS[i], linewidth=1.8)
+        circ._tool_ol = _ol
         ax.add_patch(circ)
         (spoke,) = ax.plot([], [], color=CHANNEL_COLORS[i], linewidth=1.2)
         (dot,) = ax.plot([], [], 'o', color=CHANNEL_COLORS[i], markersize=5)
@@ -3229,7 +3973,7 @@ def render_scene(sc, timelines, total_time, t):
             sc['contact_lines'][i].set_data([p[0] for p in trail], [p[1] for p in trail])
         else:
             sc['contact_lines'][i].set_data([], [])
-        sc['tool_circles'][i].center = center_pos
+        sc['tool_circles'][i].set_xy(sc['tool_circles'][i]._tool_ol + np.asarray(center_pos, float))
         sc['tool_centers'][i].set_data([center_pos[0]], [center_pos[1]])
         sc['contact_dots'][i].set_data([contact_pos[0]], [contact_pos[1]])
         sc['spoke_lines'][i].set_data([center_pos[0], contact_pos[0]], [center_pos[1], contact_pos[1]])
@@ -3322,7 +4066,7 @@ def mp4_generator(channels_segments, start_points, radii, mold_points, timelines
 # -------------------------------------------------------------
 # JSON kaydet / yükle (Colab bölüm 11 ile uyumlu + y_offset ve AutoCAD ayarları eklendi)
 # -------------------------------------------------------------
-def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, preform=None):
+def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, preform=None, tools=None):
     data = {'channels': [], 'mold': dict(cfg['mold']),
             'settings': {'contact_mode': cfg['contact_mode'], 'g0_feed': cfg['g0_feed'], 'fps': fps, 'speed': speed},
             'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step},
@@ -3339,6 +4083,9 @@ def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, prefor
         data['channels'].append({'channel_id': idx + 1, 'x0': ch['x0'], 'y0': ch['y0'], 'tr': ch['tr'],
                                  'fd': ch['fd'], 'y_offset': ch['y_offset'], 'code': ch['code'],
                                  'dia_mode': ch['dia_mode'], 'dia_axis': ch['dia_axis']})
+        te = (tools or {}).get(str(idx))
+        if te and te.get('shape'):
+            data['channels'][-1]['tool_dxf'] = {'name': te.get('name'), 'shape': te['shape']}
     return data
 
 
@@ -3382,6 +4129,12 @@ def json_dict_to_updates(data, gr_update):
         ups.append(st)                                  # gr.State: değer doğrudan verilir
     else:
         ups.append(gr_update())                         # State değişmez
+    # makara profilleri: JSON'da kanal bilgisi varsa profiller JSON'daki gibi olur (olmayan kanal: daire)
+    if chans:
+        ups.append({str(k): chans[k]['tool_dxf'] for k in range(min(N_CH, len(chans)))
+                    if isinstance(chans[k], dict) and chans[k].get('tool_dxf')})
+    else:
+        ups.append(gr_update())
     return ups
 
 
@@ -3523,14 +4276,26 @@ function updatePanel(){
 }
 
 // ---- RADÜS İZİ (form yüzeyi): kalıp noktalarından normal yönünde ışın, takım dairesine ilk giriş ----
-var EV=D.env||null, envC=document.getElementById('envc'), NM=0, CP=256, Mx,My,Nx,Ny, envCk=[], envCache=[];
+var EV=D.env||null, envC=document.getElementById('envc'), NM=0, CP=(D.shp&&D.shp.some(function(v){return !!v;}))?64:256, Mx,My,Nx,Ny, envCk=[], envCache=[];
 if(EV){
   envC.checked=!!EV.show; NM=EV.M.length/2;
   Mx=new Float64Array(NM); My=new Float64Array(NM); Nx=new Float64Array(NM); Ny=new Float64Array(NM);
   for(var q0=0;q0<NM;q0++){Mx[q0]=EV.M[2*q0];My[q0]=EV.M[2*q0+1];Nx[q0]=EV.N[2*q0];Ny[q0]=EV.N[2*q0+1];}
 } else { envC.checked=false; envC.parentNode.style.display='none'; }
 envC.onchange=function(){draw();};
+function polyRayS(ox,oy,nx,ny,P){   // Python _poly_ray_s: içerideyse 0, değilse doğrultudaki en yakın kesişim
+  var best=Infinity, cnt=0, n=P.length/2-1;
+  for(var e=0;e<n;e++){ var ax=P[2*e]-ox, ay=P[2*e+1]-oy, dx=P[2*e+2]-P[2*e], dy=P[2*e+3]-P[2*e+1], den=nx*dy-ny*dx;
+    if(Math.abs(den)<=1e-12) continue; var sv=(ax*dy-ay*dx)/den, tv=(ax*ny-ay*nx)/den;
+    if(tv<0||tv>=1) continue; if(sv>0) cnt++; if(Math.abs(sv)<Math.abs(best)) best=sv; }
+  return (cnt%2===1)?0:best; }
 function applySamples(arr,ch,a,b){
+  var SH=D.shp?D.shp[ch]:null;
+  if(SH){ var C0=EV.S[ch].c, RR0=(D.rch[ch]+EV.lim[ch])*(D.rch[ch]+EV.lim[ch]);
+    for(var k=a;k<b;k++){ var cx=C0[2*k], cy=C0[2*k+1];
+      for(var i=0;i<NM;i++){ var dx=Mx[i]-cx, dy=My[i]-cy; if(dx*dx+dy*dy>RR0) continue;
+        var s0=polyRayS(dx,dy,Nx[i],Ny[i],SH); if(Math.abs(s0)<Math.abs(arr[i])) arr[i]=s0; } }
+    return; }
   var C=EV.S[ch].c, r2=D.r[ch]*D.r[ch], RR=(D.r[ch]+EV.lim[ch])*(D.r[ch]+EV.lim[ch]);
   for(var k=a;k<b;k++){ var cx=C[2*k], cy=C[2*k+1];
     for(var i=0;i<NM;i++){ var dx=Mx[i]-cx, dy=My[i]-cy, d2=dx*dx+dy*dy; if(d2>RR) continue;
@@ -3878,7 +4643,10 @@ function draw(){
       if(pen) ctx.lineTo(X(hx),Y(hy)); }
     ctx.stroke();
     var cx=lerp(c.cx,k,f), cy=lerp(c.cy,k,f), px=lerp(c.px,k,f), py=lerp(c.py,k,f);
-    ctx.beginPath(); ctx.arc(X(cx),Y(cy),D.r[i]*sc,0,6.2832); ctx.fillStyle=hex2rgba(col,0.22); ctx.fill();
+    ctx.beginPath();
+    if(D.shp && D.shp[i]){ var SP=D.shp[i]; ctx.moveTo(X(cx+SP[0]),Y(cy+SP[1])); for(var e2=2;e2<SP.length;e2+=2) ctx.lineTo(X(cx+SP[e2]),Y(cy+SP[e2+1])); ctx.closePath(); }
+    else ctx.arc(X(cx),Y(cy),D.r[i]*sc,0,6.2832);
+    ctx.fillStyle=hex2rgba(col,0.22); ctx.fill();
     ctx.strokeStyle=col; ctx.lineWidth=1.8; ctx.stroke();
     ctx.lineWidth=1.2; ctx.beginPath(); ctx.moveTo(X(cx),Y(cy)); ctx.lineTo(X(px),Y(py)); ctx.stroke();
     ctx.lineWidth=1.6; ctx.beginPath(); ctx.moveTo(X(cx)-6,Y(cy)); ctx.lineTo(X(cx)+6,Y(cy)); ctx.moveTo(X(cx),Y(cy)-6); ctx.lineTo(X(cx),Y(cy)+6); ctx.stroke();
@@ -4086,6 +4854,8 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
         chans.append(c)
     return {'T': float(total_time), 'n': n, 'dt': dt, 'b': [r3(xmin), r3(xmax), r3(ymin), r3(ymax)],
             'mold': [[r3(p[0]), r3(p[1])] for p in mold_points], 'r': [r3(r) for r in radii],
+            'shp': [([round(float(v), 4) for v in tool_shape(r).ravel()] if tool_shape(r) is not None else None) for r in radii],
+            'rch': [r3(tool_reach(r)) for r in radii],
             'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans,
             'env': env, 'cnc': cnc, 'act': [bool(channel_active(s)) for s in channels_segments]}
 
@@ -4096,7 +4866,7 @@ def build_player_html(data, height=960):
             f'style="width:100%;height:{height}px;border:1px solid #ddd;border-radius:8px;background:#fff"></iframe>')
 
 
-# ===== Hücre 20 =====
+# ===== Hücre 22 =====
 import gradio as gr
 
 N_ANIM_OUT = 14   # run_all çıktı sayısı
@@ -4111,6 +4881,8 @@ def _split_vals(vals):
     opts = opts_from_values(vals[N_CFG + 5:N_CFG + 5 + N_OPT])
     k = N_CFG + 5 + N_OPT
     opts['pf_state'] = vals[k] if len(vals) > k and isinstance(vals[k], dict) else None
+    opts['tool_state'] = vals[k + 1] if len(vals) > k + 1 and isinstance(vals[k + 1], dict) else {}
+    apply_tool_shapes(cfg, opts['tool_state'])
     return cfg, fps, speed, ac_s, ac_e, ac_st, opts
 
 
@@ -4344,6 +5116,8 @@ def make_mp4(*vals):
         mp4_fps = int(_num(vals[N_CFG], 20)) or 20
         cfg = cfg_from_values(vals[:N_CFG])
         opts = opts_from_values(vals[N_CFG + 1:N_CFG + 1 + N_OPT])
+        _ts = vals[N_CFG + 1 + N_OPT] if len(vals) > N_CFG + 1 + N_OPT else {}
+        apply_tool_shapes(cfg, _ts if isinstance(_ts, dict) else {})
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
@@ -4398,7 +5172,8 @@ def make_dxf(*vals):
 def export_json(*vals):
     try:
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
-        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st, opts, opts.get('pf_state'))
+        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st, opts, opts.get('pf_state'),
+                                   opts.get('tool_state'))
         out_dir = tempfile.mkdtemp(prefix='cnc_cfg_')
         path = os.path.join(out_dir, 'gcode_simulator_config.json')
         with open(path, 'w', encoding='utf-8') as f:
@@ -4409,7 +5184,7 @@ def export_json(*vals):
 
 
 def import_json(file_obj):
-    n_out = N_CFG + 2 + 3 + N_OPT + 1 + 1
+    n_out = N_CFG + 2 + 3 + N_OPT + 1 + 1 + 1
     if file_obj is None:
         return tuple([gr.update()] * (n_out - 1) + ["JSON dosyası seçilmedi."])
     try:
@@ -4420,6 +5195,117 @@ def import_json(file_obj):
         return tuple(ups) + ("JSON yüklendi ve arayüz güncellendi. Simülasyonu güncellemek için 'Çalıştır' butonuna bas.",)
     except Exception as e:
         return tuple([gr.update()] * (n_out - 1) + [f"JSON yüklenirken hata oluştu. Dosya formatını kontrol et: {e}"])
+
+
+# -------------------------------------------------------------
+# 6) Makara profili DXF, kalıp DXF → G-kodu, takım aşınması
+# -------------------------------------------------------------
+def _file_path(f):
+    if f is None:
+        return None
+    return f if isinstance(f, str) else getattr(f, 'name', None) or f['name']
+
+
+def make_upload_tool(k):
+    def _up(file_obj, state, tr):
+        state = dict(state or {})
+        path = _file_path(file_obj)
+        if path is None:
+            state.pop(str(k), None)
+            return state, "", f"Kanal {k + 1}: makara profili kaldırıldı — takım yarıçaplı daire olarak hesaplanır."
+        try:
+            entry, msg = load_tool_dxf(path, tr)
+            state[str(k)] = entry
+            return state, tool_preview_html(entry, tr, CHANNEL_COLORS[k]), f"Kanal {k + 1}: " + msg
+        except Exception as e:
+            return state, "", f"Kanal {k + 1}: makara DXF'i okunamadı: {e}"
+    return _up
+
+
+def make_tool_previews(state, *trs):
+    state = state or {}
+    return tuple(tool_preview_html(state.get(str(k)), trs[k], CHANNEL_COLORS[k]) if state.get(str(k)) else ""
+                 for k in range(N_CH))
+
+
+def upload_mold_dxf(file_obj, face, radial_sel, rev, *vals):
+    """vals = cfg_comps + [pf_radial]"""
+    path = _file_path(file_obj)
+    if path is None:
+        return (gr.update(),) * 5 + ("Kalıp DXF'i seçilmedi.",)
+    try:
+        cfg = cfg_from_values(vals[:N_CFG])
+        if radial_sel in ('X', 'Y'):
+            radial, why = radial_sel, 'seçildi'
+        else:
+            radial, why = resolve_radial(vals[N_CFG] if len(vals) > N_CFG else 'auto', cfg)
+        m, msg = dxf_to_mold(path, face or 'outer', radial, bool(rev))
+        return (gr.update(value=m['x0']), gr.update(value=m['y0']), gr.update(value=m['code']),
+                gr.update(value='radius'), gr.update(value='X', visible=False), msg)
+    except Exception as e:
+        return (gr.update(),) * 5 + (f"Kalıp DXF'i çevrilemedi: {e}",)
+
+
+def export_mold_json(*vals):
+    try:
+        cfg = cfg_from_values(vals[:N_CFG])
+        data = {'type': 'kalip', 'mold': dict(cfg['mold'])}
+        out_dir = tempfile.mkdtemp(prefix='cnc_mold_')
+        path = os.path.join(out_dir, 'kalip.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        return path, ("Kalıp 'kalip.json' olarak hazırlandı. Daha sonra 'JSON Ayar Dosyası Yükle' ile yüklersen "
+                      "yalnız kalıp alanları değişir, diğer ayarlar korunur.")
+    except Exception:
+        return None, "Kalıp JSON'u oluşturulamadı:\n" + traceback.format_exc()
+
+
+def run_wear(*vals):
+    """vals = all_inputs + [a, b, v_ref, K]"""
+    try:
+        a, b, vref, Kc = (_num(vals[-4], 1.0), _num(vals[-3], 0.5), _num(vals[-2], 1000.0) or 1000.0, _num(vals[-1], 0.0))
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-4])
+        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+        timelines, total_time = synchronize(segs)
+        if len(mold_pts) < 2:
+            return "", "Kalıp noktası yetersiz.", None, "Aşınma hesaplanamadı: kalıp yok."
+        form = _envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg) if _preform(opts, cfg) else None
+        fin = (form or {}).get('final')
+        res, src = compute_wear(timelines, radii, mold_pts, fin, opts['env_limit'], a, b, vref, Kc)
+        html_parts, rows, md = [], [], []
+        md.append(f"**Denklem:** her makara profili noktası için her adımda  dW = K · h^{a:g} · (F / {vref:g})^{b:g} · Δs  \n"
+                  f"h = noktanın gelen malzeme yüzeyinin altında kaldığı derinlik (süpürdüğü kalınlık, mm), "
+                  f"F = ilerleme hızı (mm/dk), Δs = adımda alınan yol (mm). Gelen yüzey: {src} ile önceki pasların / "
+                  f"diğer kanalların bıraktığı yüzeyin küçüğü.")
+        for i, w in enumerate(res):
+            if w is None:
+                continue
+            Wm = float(w['W'].max())
+            if Wm <= 0:
+                html_parts.append(f"<h4>Kanal {i + 1}</h4><p>Makara malzemeye girmiyor — aşınma yok.</p>")
+                continue
+            html_parts.append(f"<h4>Kanal {i + 1}{' — DXF makara profili' if w['shape'] else ' — daire (R' + format(float(radii[i]), 'g') + ')'}</h4>")
+            html_parts.append(wear_figures(i, w, CHANNEL_COLORS[i]))
+            ang = _prof_angle(w['B'], w['W'])
+            km = int(np.argmax(w['W']))
+            band = ang[w['W'] >= 0.5 * Wm]
+            line = (f"**Kanal {i + 1}:** en çok aşınan nokta merkeze göre **{ang[km]:.0f}°**; "
+                    f"aşınmanın yarıdan fazlası {band.min():.0f}° … {band.max():.0f}° arasında. "
+                    f"En derin temas (süpürülen kalınlık) {w['hmax']:.2f} mm. Toplam aşınma indeksi {w['W'].sum():.4g}.")
+            if Kc > 0:
+                line += f" Tahmini en büyük aşınma: **{Kc * Wm:.4g} µm** (K = {Kc:g})."
+            md.append(line)
+            tot = sum(w['lines'].values()) or 1.0
+            for ln, v in sorted(w['lines'].items(), key=lambda kv: -kv[1])[:12]:
+                code_ln = cfg['channels'][i]['code'].split('\n')[ln - 1].strip() if 0 < ln <= len(cfg['channels'][i]['code'].split('\n')) else ''
+                rows.append({'Kanal': i + 1, 'Satır': ln, 'Program': code_ln, 'Aşınma payı (%)': round(v / tot * 100, 1)})
+        md.append("Bu bir **yaklaşım**: a, b ve K gerçek aşınma ölçümleriyle kalibre edilmeli. Şekiller göreli dağılımı gösterir; "
+                  "K girilirse en büyük değer µm olarak tahmin edilir. Gelen yüzey ön formun **ilk** halinden alınır: "
+                  "simülasyonda malzemenin akıp gittiği yerlerde makaranın yan yüzlerindeki temas fazla görünebilir.")
+        df = pd.DataFrame(rows) if rows else None
+        return "".join(html_parts) or "<p>Aktif kanal yok.</p>", "\n\n".join(md), df, (note + "\n" if note else "") + "Aşınma hesaplandı."
+    except Exception:
+        return "", "", None, "Aşınma hesaplanırken hata oluştu:\n" + traceback.format_exc()
 
 
 def make_defaults_code(*vals):
@@ -4456,6 +5342,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
         with gr.Column(scale=4, min_width=380):
             cfg_comps = []
             dia_pairs = []
+            tool_files, tool_prevs, tool_trs = [], [], []
             with gr.Tabs():
                 for k in range(N_CH):
                     d = DEFAULT_CHANNELS[k]
@@ -4473,6 +5360,13 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                          visible=(d['dia_mode'] == 'diameter'))
                         dia_pairs.append((dmode, daxis))
                         cfg_comps += [x0, y0, tr, fd, yo, code, dmode, daxis]
+                        with gr.Accordion("Makara profili (DXF)", open=False):
+                            gr.Markdown("Makara kesitini **kapalı kontur** olarak çiz; DXF'teki **0,0 = makara merkezi** "
+                                        "(CNC'nin kontrol ettiği nokta). Yüklenirse radüs izi, temas noktası, mesafe ölçümü "
+                                        "ve çizimler bu profille yapılır; G41/G42 kompanzasyonu yukarıdaki takım yarıçapıyla yapılır.")
+                            tool_file = gr.File(label=f"Kanal {k+1} makara DXF", file_types=[".dxf"], file_count="single")
+                            tool_prev = gr.HTML()
+                        tool_files.append(tool_file); tool_prevs.append(tool_prev); tool_trs.append(tr)
 
             with gr.Accordion("Kalıp (Sabit Path)", open=True):
                 m_x0 = gr.Number(value=DEFAULT_MOLD['x0'], label="Kalıp Başlangıç X")
@@ -4483,6 +5377,18 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                 m_daxis = gr.Radio(DIA_AXIS_CHOICES, value=DEFAULT_MOLD['dia_axis'], label="Kalıp: çap hangi eksende?",
                                    visible=(DEFAULT_MOLD['dia_mode'] == 'diameter'))
                 dia_pairs.append((m_dmode, m_daxis))
+                with gr.Accordion("Kalıbı DXF'ten oluştur", open=False):
+                    gr.Markdown("Kalıp kesitini DXF olarak yükle: çizgiler doğru + yay olarak **kalıp G-koduna** (G1 / G2 / G3 R) "
+                                "çevrilip yukarıdaki alanlara yazılır. Açık çizgi olduğu gibi alınır; kapalı konturda seçilen yüz alınır. "
+                                "Saklamak için **Kalıbı JSON olarak indir** — sonra 'JSON Ayar Dosyası Yükle' ile geri yükle.")
+                    mold_file = gr.File(label="Kalıp DXF yükle", file_types=[".dxf"], file_count="single")
+                    with gr.Row():
+                        mold_face = gr.Dropdown(MOLD_FACE_CHOICES, value='outer', label="Kapalı konturda kullanılacak yüz")
+                        mold_radial = gr.Dropdown([('Otomatik (ön form ayarı)', 'auto'), ('X', 'X'), ('Y', 'Y')], value='auto',
+                                                  label="Parça yarıçapı ekseni")
+                        mold_rev = gr.Checkbox(value=False, label="Yönü ters çevir")
+                    mold_json_btn = gr.Button("💾 Kalıbı JSON olarak indir")
+                    mold_json_out = gr.File(label="Kalıp JSON", interactive=False)
                 contact_mode = gr.Dropdown(choices=CONTACT_MODE_CHOICES, value=DEFAULT_CONTACT_MODE,
                                            label="Çizilen yol")
                 cfg_comps += [m_x0, m_y0, m_code, m_dmode, m_daxis, contact_mode]
@@ -4526,6 +5432,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     pf_dx = gr.Number(value=0.0, label="Ön form kaydırma X (mm)")
                     pf_dy = gr.Number(value=0.0, label="Ön form kaydırma Y (mm)")
             pf_state = gr.State(None)
+            tool_state = gr.State({})
 
             with gr.Row():
                 fps_sl = gr.Slider(5, 40, value=20, step=1, label="FPS")
@@ -4627,10 +5534,26 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     dxf_btn = gr.Button("📐 DXF Oluştur", variant="primary")
                     dxf_file = gr.File(label="DXF indir", interactive=False)
 
+                with gr.Tab("🔥 Takım Aşınması"):
+                    gr.Markdown("Makara profilinin her noktasının ne kadar malzeme süpürdüğüne, ne kadar yol aldığına ve "
+                                "hangi hızla gittiğine göre **yaklaşık** aşınma:  **dW = K · hᵃ · (F / F_ref)ᵇ · Δs**. "
+                                "h: profil noktasının gelen malzeme yüzeyinin altında kaldığı derinlik (mm), F: ilerleme hızı, "
+                                "Δs: alınan yol. Sonuç profil üzerinde ısı haritası, zaman–konum ısı haritası ve program satırı "
+                                "payları olarak gösterilir. Ön form yüklüyse gelen yüzey ön formdan alınır.")
+                    with gr.Row():
+                        wear_a = gr.Number(value=1.0, label="a — kalınlık üssü")
+                        wear_b = gr.Number(value=0.5, label="b — hız üssü")
+                        wear_vref = gr.Number(value=1000.0, label="F_ref (mm/dk)")
+                        wear_K = gr.Number(value=0.0, label="K (µm / mm^(a+1)) — 0: yalnız göreli")
+                    wear_btn = gr.Button("🔥 Aşınmayı hesapla", variant="primary")
+                    wear_md = gr.Markdown()
+                    wear_html = gr.HTML()
+                    wear_df = gr.DataFrame(label="Aşınmaya en çok katkı veren program satırları")
+
     # ---------------- OLAYLAR ----------------
     opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit,
                  pf_use, pf_dx, pf_dy, pf_layers, pf_model, pf_radial, pf_sim] # sıra: opts_from_values
-    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps + [pf_state]
+    all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps + [pf_state, tool_state]
 
     run_btn.click(
         run_all, inputs=all_inputs,
@@ -4662,7 +5585,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     speed_sl.release(anim_retune, inputs=[fps_sl, speed_sl, anim_token], outputs=[frame_sl, play_timer])
 
     # MP4
-    mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps] + opt_comps,
+    mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps] + opt_comps + [tool_state],
                   outputs=[video_out, mp4_file, status])
 
     # DXF
@@ -4670,7 +5593,24 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
 
     # JSON
     json_btn.click(export_json, inputs=all_inputs, outputs=[json_file_out, status])
-    json_upload.upload(import_json, inputs=json_upload, outputs=all_inputs + [status])
+    json_upload.upload(import_json, inputs=json_upload, outputs=all_inputs + [status]).then(
+        make_tool_previews, inputs=[tool_state] + tool_trs, outputs=tool_prevs)
+
+    # makara profili DXF (kanal başına)
+    for _k in range(N_CH):
+        tool_files[_k].upload(make_upload_tool(_k), inputs=[tool_files[_k], tool_state, tool_trs[_k]],
+                              outputs=[tool_state, tool_prevs[_k], status])
+        tool_files[_k].clear(lambda st, tr, _k=_k: make_upload_tool(_k)(None, st, tr),
+                             inputs=[tool_state, tool_trs[_k]], outputs=[tool_state, tool_prevs[_k], status])
+
+    # kalıp DXF → G-kodu, kalıp JSON
+    mold_file.upload(upload_mold_dxf, inputs=[mold_file, mold_face, mold_radial, mold_rev] + cfg_comps + [pf_radial],
+                     outputs=[m_x0, m_y0, m_code, m_dmode, m_daxis, status])
+    mold_json_btn.click(export_mold_json, inputs=cfg_comps, outputs=[mold_json_out, status])
+
+    # takım aşınması
+    wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K],
+                   outputs=[wear_html, wear_md, wear_df, status])
 
     # Çap/yarıçap: eksen seçimi yalnızca "Çap" seçilince görünür
     for _dm, _da in dia_pairs:
