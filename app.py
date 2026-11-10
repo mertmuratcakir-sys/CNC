@@ -3154,6 +3154,25 @@ def sim_state(fin, sim, F, formed):
     return out
 
 
+def sim_xy(sim, st):
+    """Parçanın X ve Y eksenlerindeki toplam boyu: ön form → şimdiki ürün.
+    Döndürür: {'X': (önce, sonra), 'Y': (önce, sonra)}"""
+    if sim.get('kind') == 'strip':
+        P0, polys = sim['strip']['poly'], st.get('polys') or []
+    else:
+        P0, polys = sim['poly'], [st.get('fixed'), st.get('wall'), st.get('bridge'), st.get('rem')]
+    polys = [np.asarray(P, float) for P in polys if P is not None and len(P)]
+    A = np.vstack(polys) if polys else np.asarray(P0, float)
+    return {ax: (float(P0[:, i].max() - P0[:, i].min()), float(A[:, i].max() - A[:, i].min()))
+            for i, ax in enumerate(('X', 'Y'))}
+
+
+def sim_xy_text(sim, st, names=('X', 'Y')):
+    q = sim_xy(sim, st)
+    return ", ".join(f"{nm} boyu {q[ax][0]:.2f} → {q[ax][1]:.2f} mm ({q[ax][1] - q[ax][0]:+.2f})"
+                     for ax, nm in zip(('X', 'Y'), names))
+
+
 def sim_summary(sim, st):
     """Hacim dengesi ve uç uzaması (malzeme yönünde)."""
     if sim.get('kind') == 'strip':
@@ -3314,6 +3333,7 @@ def thickness_profile(form, step_mm=1.0):
             lines.append(f"**Simülasyon (hacim sabit):** ön form {q['Vtot']:,.0f} mm³ = kalıba sıvanan "
                          f"{q['Vwall']:,.0f} + kalan {q['Vrem']:,.0f} mm³ (fark %{q['err']:.2f}); " + el
                          + (" — **malzeme bitti**" if q['exhausted'] else ""))
+            lines.append("**Eksenlere göre uzama:** " + sim_xy_text(sm, sm['final']))
         else:
             lines.append(f"**Simülasyon çalışmadı:** {sm.get('why', '')}")
     idx = np.where(m)[0]
@@ -3896,6 +3916,79 @@ def wear_figures(i, w, color):
     return h1 + h2 + h3
 
 
+# -------------------------------------------------------------
+# AŞINMIŞ MAKARA PROFİLİ → DXF (0,0 = makara merkezi; makara DXF'i olarak geri yüklenebilir)
+# -------------------------------------------------------------
+def worn_profile(tool_r, w, depth_max, step=0.25):
+    """Orijinal profili (köşeleri koruyarak) sık örnekler, her noktayı aşınma derinliği kadar içeri alır.
+    depth_max: bu kanalın en çok aşınan noktasındaki derinlik (mm). Döndürür: (orijinal, aşınmış) kapalı poligonlar"""
+    O = tool_outline(tool_r, 720)
+    if poly_area(O) < 0:
+        O = O[::-1]
+    E = np.diff(O, axis=0)
+    L = np.hypot(E[:, 0], E[:, 1])
+    keep = L > 1e-9
+    O = np.vstack([O[:-1][keep], O[:1]]); E = np.diff(O, axis=0); L = np.hypot(E[:, 0], E[:, 1])
+    en = np.c_[E[:, 1], -E[:, 0]] / L[:, None]                 # kenar dış normalleri (saat yönü tersine kontur)
+    per = float(L.sum())
+    cum = np.r_[0, np.cumsum(L)]
+    W = w['W'] / max(float(w['W'].max()), 1e-30)
+    Ws = (np.roll(W, 2) + np.roll(W, 1) + W + np.roll(W, -1) + np.roll(W, -2)) / 5.0      # basamakları yumuşat
+    dfun = lambda sv: np.interp(sv, w['s'], Ws * depth_max, period=per)
+    pts = []
+    n = len(L)
+    for j in range(n):
+        vn = en[j] + en[j - 1]                                  # köşe normali: komşu kenarların ortalaması
+        vn = vn / max(np.hypot(*vn), 1e-12)
+        pts.append(O[j] - vn * dfun(cum[j]))
+        m = int(np.ceil(L[j] / step))
+        for q in range(1, m):
+            u = q / m
+            pts.append(O[j] + E[j] * u - en[j] * dfun(cum[j] + L[j] * u))
+    P = np.asarray(pts)
+    return O, np.vstack([P, P[:1]])
+
+
+def wear_dxf_files(res, radii, depth_mm, K):
+    """Kanal başına aşınmış profil DXF'i (yalnız aşınmış kontur, 0,0 merkez) + karşılaştırma DXF'i.
+    Ölçek: depth_mm > 0 ise en çok aşınan kanalın en derin noktası depth_mm; değilse K·W (µm)."""
+    act = [(i, w) for i, w in enumerate(res) if w is not None and w['W'].max() > 0]
+    if not act:
+        raise ValueError("Aşınma yok: makara malzemeye girmiyor.")
+    gmax = max(float(w['W'].max()) for _i, w in act)
+    if depth_mm and depth_mm > 0:
+        scale, how = depth_mm / gmax, f"en büyük aşınma derinliği {depth_mm:g} mm (girilen)"
+    elif K and K > 0:
+        scale, how = K / 1000.0, f"K = {K:g} µm ölçeği (en büyük derinlik {K * gmax / 1000.0:.4g} mm)"
+    else:
+        raise ValueError("Aşınma derinliği ölçeği yok: 'en büyük aşınma derinliği (mm)' ya da K gir.")
+    out_dir = tempfile.mkdtemp(prefix='cnc_wear_')
+    paths, lines = [], []
+    cmp_w = _DxfWriter()
+    for i, w in act:
+        dmax = float(w['W'].max()) * scale
+        O, Pw = worn_profile(radii[i], w, dmax)
+        wr = _DxfWriter()
+        wr.layer('MAKARA_ASINMIS', 1)
+        wr.polyline('MAKARA_ASINMIS', Pw[:-1], closed=True)
+        path = os.path.join(out_dir, f'makara_asinmis_kanal{i + 1}.dxf')
+        with open(path, 'w', encoding='ascii', errors='replace') as f:
+            f.write(wr.text())
+        paths.append(path)
+        cmp_w.layer(f'K{i + 1}_MAKARA_ORIJINAL', 7); cmp_w.layer(f'K{i + 1}_MAKARA_ASINMIS', 1)
+        cmp_w.polyline(f'K{i + 1}_MAKARA_ORIJINAL', O[:-1], closed=True)
+        cmp_w.polyline(f'K{i + 1}_MAKARA_ASINMIS', Pw[:-1], closed=True)
+        lines.append(f"Kanal {i + 1}: en derin aşınma {dmax:.4g} mm → makara_asinmis_kanal{i + 1}.dxf")
+    pc = os.path.join(out_dir, 'makara_asinma_karsilastirma.dxf')
+    with open(pc, 'w', encoding='ascii', errors='replace') as f:
+        f.write(cmp_w.text())
+    paths.append(pc)
+    msg = ("Aşınmış makara profilleri hazır — ölçek: " + how + ".\n" + "\n".join(lines) +
+           "\nKanal dosyaları yalnız aşınmış konturu içerir (0,0 = makara merkezi): 'Makara profili (DXF)' alanına "
+           "yüklersen simülasyon aşınmış makarayla yapılır. Karşılaştırma dosyasında orijinal ve aşınmış profil ayrı katmanlarda.")
+    return paths, msg
+
+
 # ===== Hücre 20 =====
 # -------------------------------------------------------------
 # ANİMASYON SAHNESİ (canlı oynatıcı ve MP4 aynı kodu kullanır)
@@ -4469,6 +4562,15 @@ function stripState(SS){
   var ax=1-ri, an=(ax===0)?'X':'Y', up=((ax===0?Mx[NM-1]:My[NM-1])>=(ax===0?Mx[0]:My[0]));
   out.elong[an+(up?'−':'+')+' ucu']=f0.eL; out.elong[an+(up?'+':'−')+' ucu']=fl.eR;
   return out; }
+var XY0=null;
+function bboxOf(Ps){ var a=[Infinity,Infinity,-Infinity,-Infinity]; Ps.forEach(function(P){ if(!P) return; P.forEach(function(p){ if(p[0]<a[0])a[0]=p[0]; if(p[1]<a[1])a[1]=p[1]; if(p[0]>a[2])a[2]=p[0]; if(p[1]>a[3])a[3]=p[1]; }); }); return a; }
+function xyLines(Ps){   // Python sim_xy: X ve Y eksenlerinde parça boyu, ön form → şimdi
+  if(!XY0) XY0=bboxOf(STS?[SPA,SPB]:[SIMP]);
+  var b=bboxOf(Ps); if(!isFinite(b[0])) b=XY0;
+  var x0=XY0[2]-XY0[0], y0=XY0[3]-XY0[1], x1=b[2]-b[0], y1=b[3]-b[1], sg=function(v){return (v>=0?'+':'')+v.toFixed(2);};
+  window.__XY={x0:x0,x1:x1,y0:y0,y1:y1};
+  return '<br>'+D.xn+' boyu: '+x0.toFixed(2)+' → '+x1.toFixed(2)+' mm (<b>'+sg(x1-x0)+'</b>)'+
+         '<br>'+D.yn+' boyu: '+y0.toFixed(2)+' → '+y1.toFixed(2)+' mm (<b>'+sg(y1-y0)+'</b>)'; }
 function drawStrip(X,Y,st){
   var fillP=function(P){ if(!P||P.length<3) return; ctx.beginPath(); P.forEach(function(p,q){ if(q) ctx.lineTo(X(p[0]),Y(p[1])); else ctx.moveTo(X(p[0]),Y(p[1])); }); ctx.closePath();
     ctx.fillStyle='rgba(61,111,182,0.62)'; ctx.fill(); ctx.strokeStyle='#16325c'; ctx.lineWidth=1.1; ctx.stroke(); };
@@ -4477,6 +4579,7 @@ function drawStrip(X,Y,st){
   var h='<b>Simülasyon — sac (hacim sabit)</b><br>Ön form hacmi: '+Math.round(SM.Vtot).toLocaleString('tr-TR')+' mm³<br>Kalıba sıvanan: %'+(st.Vwall/SM.Vtot*100).toFixed(1);
   var ks=Object.keys(st.elong); if(!ks.length) h+='<br>Makara henüz saca girmedi.';
   ks.forEach(function(k){ h+='<br>'+k+' uzaması: <b>'+st.elong[k].toFixed(2)+' mm</b>'; });
+  h+=xyLines(st.polys);
   if(st.exh) h+='<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti (bir uçta).</span>';
   box.innerHTML=h; }
 function drawSim(X,Y,st){
@@ -4496,7 +4599,7 @@ function drawSim(X,Y,st){
   box.innerHTML='<b>Simülasyon (hacim sabit)</b><br>Ön form hacmi: '+fm(SM.Vtot)+' mm³'+
     '<br>Yerinde kalan (makara değmedi): '+fm(st.V0)+' mm³'+
     '<br>Kalıba sıvanan duvar: '+fm(st.Vc)+' mm³ (%'+(st.Vc/SM.Vtot*100).toFixed(1)+')'+
-    '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+
+    '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+xyLines([st.fixed,wall,st.bridge,st.rem])+
     (st.bent?'<br><span style="color:#b9770e">Kalan ön form kalıba değdi — dışa doğru büküldü.</span>':'')+
     (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
@@ -5013,7 +5116,8 @@ def run_all(*vals):
                 else:
                     el = f"uç uzaması {q['elong']:.2f} mm ({q['axis']} yönünde)"
                 status += (f"\nSimülasyon: hacim sabit (fark %{q['err']:.2f}), {el or 'şekillenme yok'}"
-                           + (" — malzeme bitti." if q['exhausted'] else ". Hızlı Oynatıcıda adım adım izle."))
+                           + (" — malzeme bitti." if q['exhausted'] else ". Hızlı Oynatıcıda adım adım izle.")
+                           + "\nEksenlere göre uzama: " + sim_xy_text(_sm, _sm['final'], (opts['xname'], opts['yname'])))
             else:
                 status += "\nSimülasyon çalışmadı: " + _sm.get('why', '')
         return (frame0,
@@ -5260,18 +5364,40 @@ def export_mold_json(*vals):
         return None, "Kalıp JSON'u oluşturulamadı:\n" + traceback.format_exc()
 
 
+def _wear_compute(vals):
+    """vals = all_inputs + [a, b, v_ref, K] → (cfg, radii, sonuçlar, gelen yüzey kaynağı, not, (a, b, vref, K))"""
+    a, b, vref, Kc = (_num(vals[-4], 1.0), _num(vals[-3], 0.5), _num(vals[-2], 1000.0) or 1000.0, _num(vals[-1], 0.0))
+    cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-4])
+    segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+    timelines, total_time = synchronize(segs)
+    if len(mold_pts) < 2:
+        raise ValueError("Kalıp noktası yetersiz.")
+    form = _envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg) if _preform(opts, cfg) else None
+    fin = (form or {}).get('final')
+    res, src = compute_wear(timelines, radii, mold_pts, fin, opts['env_limit'], a, b, vref, Kc)
+    return cfg, radii, res, src, note, (a, b, vref, Kc)
+
+
+def run_wear_dxf(*vals):
+    """vals = all_inputs + [a, b, v_ref, K, en büyük aşınma derinliği (mm)]"""
+    try:
+        depth = _num(vals[-1], 0.0)
+        cfg, radii, res, src, note, (a, b, vref, Kc) = _wear_compute(vals[:-1])
+        paths, msg = wear_dxf_files(res, radii, depth, Kc)
+        return paths, msg
+    except ValueError as e:
+        return None, f"Aşınmış profil DXF'i oluşturulamadı: {e}"
+    except Exception:
+        return None, "Aşınmış profil DXF'i oluşturulurken hata oluştu:\n" + traceback.format_exc()
+
+
 def run_wear(*vals):
     """vals = all_inputs + [a, b, v_ref, K]"""
     try:
-        a, b, vref, Kc = (_num(vals[-4], 1.0), _num(vals[-3], 0.5), _num(vals[-2], 1000.0) or 1000.0, _num(vals[-1], 0.0))
-        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-4])
-        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
-        timelines, total_time = synchronize(segs)
-        if len(mold_pts) < 2:
-            return "", "Kalıp noktası yetersiz.", None, "Aşınma hesaplanamadı: kalıp yok."
-        form = _envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg) if _preform(opts, cfg) else None
-        fin = (form or {}).get('final')
-        res, src = compute_wear(timelines, radii, mold_pts, fin, opts['env_limit'], a, b, vref, Kc)
+        try:
+            cfg, radii, res, src, note, (a, b, vref, Kc) = _wear_compute(vals)
+        except ValueError as e:
+            return "", str(e), None, f"Aşınma hesaplanamadı: {e}"
         html_parts, rows, md = [], [], []
         md.append(f"**Denklem:** her makara profili noktası için her adımda  dW = K · h^{a:g} · (F / {vref:g})^{b:g} · Δs  \n"
                   f"h = noktanın gelen malzeme yüzeyinin altında kaldığı derinlik (süpürdüğü kalınlık, mm), "
@@ -5549,6 +5675,13 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     wear_md = gr.Markdown()
                     wear_html = gr.HTML()
                     wear_df = gr.DataFrame(label="Aşınmaya en çok katkı veren program satırları")
+                    gr.Markdown("**Aşınmış makara profili (DXF):** profilin her noktası aşınması oranında içeri alınır. "
+                                "Ölçek için en çok aşınan noktanın derinliğini gir (0 bırakırsan K kullanılır). "
+                                "Kanal dosyaları 0,0 merkezlidir; makara DXF'i olarak geri yüklenebilir.")
+                    with gr.Row():
+                        wear_depth = gr.Number(value=0.5, label="En büyük aşınma derinliği (mm) — 0: K'ya göre")
+                        wear_dxf_btn = gr.Button("📐 Aşınmış profili DXF indir")
+                    wear_dxf_out = gr.File(label="Aşınmış makara profili DXF", interactive=False, file_count="multiple")
 
     # ---------------- OLAYLAR ----------------
     opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit,
@@ -5611,6 +5744,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     # takım aşınması
     wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K],
                    outputs=[wear_html, wear_md, wear_df, status])
+    wear_dxf_btn.click(run_wear_dxf, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K, wear_depth],
+                       outputs=[wear_dxf_out, status])
 
     # Çap/yarıçap: eksen seçimi yalnızca "Çap" seçilince görünür
     for _dm, _da in dia_pairs:
