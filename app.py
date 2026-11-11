@@ -3734,9 +3734,9 @@ def _nearest_rays(M, Q):
         return out
 
 
-def compute_wear(timelines, radii, mold_points, fin=None, env_limit=0.0, a=1.0, b=0.5, v_ref=1000.0, K=0.0,
-                 n_bins=160):
-    """Kanal başına makara profili boyunca birikimli aşınma ve zaman–konum ısı haritası."""
+def _engage_setup(timelines, radii, mold_points, fin=None, env_limit=0.0):
+    """Temas hesabının ortak hazırlığı (aşınma ve proses hesapları): kalıp ışınları, malzeme tarafı,
+    gelen malzeme yüzeyi, takım örnekleri ve örnek→ışın giriş tabloları."""
     M, N, _ = mold_rays(mold_points)
     if len(M) < 2:
         raise ValueError("Kalıp noktası yetersiz.")
@@ -3759,6 +3759,15 @@ def compute_wear(timelines, radii, mold_points, fin=None, env_limit=0.0, a=1.0, 
         T0 = np.asarray(fin['T'], float)
         S0 = np.where(np.isfinite(T0), T0, float(np.nanmedian(T0)))
         src = "ön form kalınlığı (DXF)"
+        # ön formun ulaşmadığı ışınlar: malzeme oraya ancak akarak gelir. Simülasyon varsa, duvarın
+        # ulaşmadığı (malzemenin bittiği) ışınlarda gelen kalınlık 0 alınır.
+        sm = fin.get('sim')
+        if sm is not None and sm.get('ok') and sm.get('kind') != 'strip' and sm.get('final') is not None:
+            stf = sm['final']
+            a_, f_ = int(stf.get('start', 0)), int(stf.get('front', -1))
+            idx = np.arange(len(M))
+            S0 = np.where(~np.isfinite(T0) & ((idx < a_) | (idx > f_)), 0.0, S0)
+            src += "; duvarın ulaşmadığı yerde malzeme yok"
     elif env_limit and env_limit > 0:
         S0 = np.full(len(M), float(env_limit)); src = f"ham malzeme kalınlığı {env_limit:g} mm"
     else:
@@ -3767,44 +3776,78 @@ def compute_wear(timelines, radii, mold_points, fin=None, env_limit=0.0, a=1.0, 
     smax = float(np.max(S0)) + 1.0
     tabs = [(_pair_table(M, N, samples[i], radii[i], sd, smax) if samples[i] is not None else None)
             for i in range(N_CH)]
+    return {'M': M, 'N': N, 'sd': sd, 'S0': S0, 'src': src, 'samples': samples, 'tabs': tabs, 'T': total_T,
+            'radii': radii}
+
+
+def _engage_chunks(E, i, B, nb, chunk=64):
+    """Kanal i için örnek öbekleri: her (örnek, profil noktası) çiftinde
+    ray = en yakın kalıp ışını, sQ = noktanın kalıptan uzaklığı, Sin = gelen malzeme yüzeyi,
+    h = noktanın gelen yüzeyin altında kaldığı derinlik (yalnız ön / kalıba bakan yüzde > 0),
+    mold_face = nokta kalıba bakıyor mu. Diziler (örnek sayısı, profil noktası sayısı) biçiminde."""
+    M, N, sd, S0, samples, tabs = E['M'], E['N'], E['sd'], E['S0'], E['samples'], E['tabs']
+    smp = samples[i]
+    nB = len(B)
+    lag = 2.0 * tool_reach(E['radii'][i])
+    Kn = len(smp['C'])
+    kown = np.searchsorted(smp['arc'], smp['arc'] - lag, side='right') - 1
+    nM = len(M)
+    kE = np.where(np.hypot(*(M - M[-1]).T) > 1e-9)[0]
+    kS = np.where(np.hypot(*(M - M[0]).T) > 1e-9)[0]
+    tE = M[-1] - M[kE[-1]] if len(kE) else np.zeros(2)       # kalıbın son ve ilk ucundaki dışa doğru teğetler
+    tS = M[0] - M[kS[0]] if len(kS) else np.zeros(2)
+    for a0 in range(0, Kn, chunk):
+        ks = np.arange(a0, min(a0 + chunk, Kn))
+        Q = (smp['C'][ks][:, None, :] + B[None]).reshape(-1, 2)
+        ray = _nearest_rays(M, Q)
+        nd = N[ray] * sd[ray][:, None]
+        dQ = Q - M[ray]
+        # kalıba gerçek uzaklık (en yakın kalıp noktası), malzeme tarafında +; köşe / uç ışınlarının eğik
+        # normalleri sonucu bozmasın. Kalıbın iki ucunun ötesine düşen noktalar hesaba katılmaz.
+        sQ = np.hypot(dQ[:, 0], dQ[:, 1]) * np.where((dQ * nd).sum(1) < 0, -1.0, 1.0)
+        beyond = ((ray == nM - 1) & ((dQ * tE).sum(1) > 0)) | ((ray == 0) & ((dQ * tS).sum(1) > 0))
+        sQ = np.where(beyond, np.inf, sQ)
+        kk = np.repeat(ks, nB)
+        Sin = np.minimum(S0[ray], _pair_query(tabs[i], ray, kown[kk]))
+        for c in range(N_CH):
+            if c != i and tabs[c] is not None:
+                kc = np.searchsorted(samples[c]['T'], smp['T'][kk], side='left') - 1
+                Sin = np.minimum(Sin, _pair_query(tabs[c], ray, kc))
+        with np.errstate(invalid='ignore'):
+            h = Sin - np.maximum(sQ, 0.0)
+        nbt = np.tile(nb, (len(ks), 1))
+        mold_face = (nbt * nd).sum(1) < 0.05
+        # temas yayı: kalıba bakan VE ilerleme yönüne bakan (ön) yüz; arka yüz malzemeden ayrılır
+        face = mold_face & ((nbt * smp['u'][kk]).sum(1) > 0.0)
+        with np.errstate(invalid='ignore'):
+            ok = (h > 0) & face & (sQ > -0.5) & np.isfinite(h)
+        h = np.where(ok, h, 0.0)
+        sh = (len(ks), nB)
+        yield ks, ray.reshape(sh), sQ.reshape(sh), Sin.reshape(sh), h.reshape(sh), mold_face.reshape(sh)
+
+
+def compute_wear(timelines, radii, mold_points, fin=None, env_limit=0.0, a=1.0, b=0.5, v_ref=1000.0, K=0.0,
+                 n_bins=160):
+    """Kanal başına makara profili boyunca birikimli aşınma ve zaman–konum ısı haritası."""
+    E = _engage_setup(timelines, radii, mold_points, fin, env_limit)
+    total_T = E['T']
     res = []
     for i in range(N_CH):
-        smp = samples[i]
+        smp = E['samples'][i]
         if smp is None:
             res.append(None)
             continue
         B, nb, sb = _boundary(radii[i])
         nB = len(B)
         n_bins = int(min(120, max(20, len(smp['C']) // 14)))     # kutu başına ≥ ~14 örnek: şeritlenme olmasın
-        lag = 2.0 * tool_reach(radii[i])
         W = np.zeros(nB)
         H = np.zeros((n_bins, nB))
         line_w = {}
         hmax = 0.0
-        Kn = len(smp['C'])
-        kown = np.searchsorted(smp['arc'], smp['arc'] - lag, side='right') - 1
-        for a0 in range(0, Kn, 64):
-            ks = np.arange(a0, min(a0 + 64, Kn))
-            Q = (smp['C'][ks][:, None, :] + B[None]).reshape(-1, 2)
-            ray = _nearest_rays(M, Q)
-            nd = N[ray] * sd[ray][:, None]
-            sQ = ((Q - M[ray]) * nd).sum(1)
-            kk = np.repeat(ks, nB)
-            Sin = np.minimum(S0[ray], _pair_query(tabs[i], ray, kown[kk]))
-            for c in range(N_CH):
-                if c != i and tabs[c] is not None:
-                    kc = np.searchsorted(samples[c]['T'], smp['T'][kk], side='left') - 1
-                    Sin = np.minimum(Sin, _pair_query(tabs[c], ray, kc))
-            h = Sin - np.maximum(sQ, 0.0)
-            nbt = np.tile(nb, (len(ks), 1))
-            # temas yayı: kalıba bakan VE ilerleme yönüne bakan (ön) yüz; arka yüz malzemeden ayrılır
-            face = ((nbt * nd).sum(1) < 0.05) & ((nbt * smp['u'][kk]).sum(1) > 0.0)
-            ok = (h > 0) & face & (sQ > -0.5) & np.isfinite(h)
-            h = np.where(ok, h, 0.0)
-            hmax = max(hmax, float(h.max()) if len(h) else 0.0)
-            vt = (smp['v'][kk] / v_ref) ** b if b else 1.0
-            dW = (h ** a) * vt * smp['ds'][kk]
-            dW = dW.reshape(len(ks), nB)
+        for ks, ray, sQ, Sin, h, mface in _engage_chunks(E, i, B, nb):
+            hmax = max(hmax, float(h.max()) if h.size else 0.0)
+            vt = (smp['v'][ks] / v_ref) ** b if b else np.ones(len(ks))
+            dW = (h ** a) * (vt * smp['ds'][ks])[:, None]
             W += dW.sum(0)
             bins = np.minimum((smp['T'][ks] / max(total_T, 1e-9) * n_bins).astype(int), n_bins - 1)
             np.add.at(H, bins, dW)
@@ -3813,7 +3856,7 @@ def compute_wear(timelines, radii, mold_points, fin=None, env_limit=0.0, a=1.0, 
                     line_w[int(ln)] = line_w.get(int(ln), 0.0) + float(w_)
         res.append({'B': B, 'nb': nb, 's': sb, 'W': W, 'H': H, 'lines': line_w, 'hmax': hmax,
                     'T': total_T, 'K': K, 'shape': tool_shape(radii[i]) is not None})
-    return res, src
+    return res, E['src']
 
 
 def _prof_angle(B, W=None):
@@ -3987,6 +4030,152 @@ def wear_dxf_files(res, radii, depth_mm, K):
            "\nKanal dosyaları yalnız aşınmış konturu içerir (0,0 = makara merkezi): 'Makara profili (DXF)' alanına "
            "yüklersen simülasyon aşınmış makarayla yapılır. Karşılaştırma dosyasında orijinal ve aşınmış profil ayrı katmanlarda.")
     return paths, msg
+
+
+# -------------------------------------------------------------
+# PROSES HESAPLARI (teori) — IUL "Shear Forming and Flow Forming" ders notundaki bağıntılar
+#  Flow forming, Thamasett (slayt 7.20–7.21):
+#     b = Δs·cot α            temas boyu (ilerleme yönünde)      → burada profil geometrisinden ölçülür
+#     Δh = f·Δs / b           devir başına ezme
+#     l_d ≈ √(r_m,CD · Δh)    çevresel temas boyu
+#     F_r ≈ b · l_d · k_fm/η  radyal kuvvet   ( = √(r_m,CD·f·cot α)·Δs·k_fm/η ),  0,06 < η < 0,24
+#     F_a ≈ F_r · tan β       eksenel kuvvet
+#     F_t ≈ f · Δs · k_fm/η   teğetsel kuvvet → tork ve güç
+#  Akış yönü (7.17): 1/r_m,CD = 1/(2 r_makara) + 1/(2 r_kalıp),  1/r_m,LD = 1/(2 ρ_w);
+#     r_m,CD > r_m,LD ise akış ağırlıklı eksenel; değilse çevresel akış → çap büyümesi / yığılma riski
+#  Shear forming (7.33–7.38): sinüs kuralı s1 = s0·sin α, φ_v = 1/(√3·tan α), Kalpakcioglu F_t = k_f/√3·f·s0·cos α
+#  Makine esnemesi (ders notunda parametre olarak geçer; bağıntı burada eklenmiştir): boşluk F_r/c kadar açılır.
+# -------------------------------------------------------------
+PROC_COLORS = {'Fr': '#2a78d6', 'Fa': '#eb6834', 'Ft': '#1baf7a'}
+
+
+def _roll_med(x, w=7):
+    return pd.Series(x).rolling(w, center=True, min_periods=1).median().to_numpy()
+
+
+def compute_process(timelines, radii, mold_points, fin, env_limit, ri, n_rpm, kfm, eta, D_tool, z=1,
+                    beta_deg=0.0, c_stiff=0.0, shear=False):
+    """Takım yolu boyunca kuvvet / güç / akış yönü / esneme. ri: parça yarıçapı ekseni indeksi (0 = X, 1 = Y).
+    Döndürür: (kanal sonuçları, gelen yüzey kaynağı, E)"""
+    E = _engage_setup(timelines, radii, mold_points, fin, env_limit)
+    M, N = E['M'], E['N']
+    rT = max(float(D_tool), 1e-6) / 2.0
+    cN = float(c_stiff) * 1000.0                      # kN/mm → N/mm
+    out = []
+    for i in range(N_CH):
+        smp = E['samples'][i]
+        if smp is None:
+            out.append(None)
+            continue
+        B, nb, _sb = _boundary(radii[i], 360)
+        Kn = len(smp['C'])
+        s1 = np.full(Kn, np.nan); s0 = np.full(Kn, np.nan); bw = np.zeros(Kn); tipray = np.zeros(Kn, int)
+        for ks, ray, sQ, Sin, h, mface in _engage_chunks(E, i, B, nb):
+            rows = np.arange(len(ks))
+            g = np.where(mface & (sQ > -0.5), np.maximum(sQ, 0.0), np.inf)
+            tip = np.argmin(g, axis=1)
+            gmin = g[rows, tip]
+            s1[ks] = np.where(np.isfinite(gmin), gmin, np.nan)
+            s0k = Sin[rows, tip]
+            s0[ks] = s0k
+            proj = (B[None, :, :] * smp['u'][ks][:, None, :]).sum(2)
+            cont = (h > 0) & (sQ <= s0k[:, None] + 1e-6)
+            pmax = np.where(cont, proj, -np.inf).max(1)
+            bw[ks] = np.where(np.isfinite(pmax), np.clip(pmax - proj[rows, tip], 0.0, None), 0.0)
+            tipray[ks] = ray[rows, tip]
+        ds = np.clip(np.nan_to_num(s0 - s1), 0.0, None)
+        eng = (ds > 1e-3) & (bw > 1e-3) & np.isfinite(s1)
+        f = smp['v'] / max(float(n_rpm) * max(int(z), 1), 1e-9)          # mm / devir (makara başına)
+        rM = np.abs(M[tipray, ri])
+        rmCD = 2.0 * rT * rM / np.maximum(rT + rM, 1e-9)
+        rmLD = 2.0 * float(radii[i])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dh = np.where(eng, f * ds / np.maximum(bw, 1e-9), 0.0)
+            ld = np.sqrt(rmCD * dh)
+            Fr = np.where(eng, bw * ld * kfm / eta, 0.0)
+            Ft = np.where(eng, f * ds * kfm / eta, 0.0)
+            alpha = np.where(eng, np.arctan2(ds, np.maximum(bw, 1e-9)), 0.0)
+            beta = np.radians(beta_deg) if beta_deg and beta_deg > 0 else np.minimum(alpha, np.pi / 4)
+            Fa = Fr * np.tan(beta)
+            # makine esnemesi: F ∝ Δs kabulüyle kapalı çözüm  δ = Δs·x/(1+x),  x = F_r/(c·Δs)
+            x = np.where(eng & (cN > 0), Fr / np.maximum(cN * ds, 1e-9), 0.0)
+            dlt = np.where(eng, ds * x / (1.0 + x), 0.0)
+            eps = np.where(eng, ds / np.maximum(s0, 1e-9), 0.0)
+            phi = np.where(eng & (s1 > 1e-6), np.log(np.maximum(s0, 1e-9) / np.maximum(s1, 1e-9)), 0.0)
+        rc = rM + np.nan_to_num(s1)
+        P = Ft * 2 * np.pi * (rc / 1000.0) * float(n_rpm) / 60.0 * max(int(z), 1)      # W (tüm makaralar)
+        r = {'t': smp['T'], 'line': smp['line'], 'eng': eng, 's0': s0, 's1': s1, 'ds': ds, 'b': bw, 'f': f,
+             'Fr': _roll_med(Fr), 'Fa': _roll_med(Fa), 'Ft': _roll_med(Ft), 'P': _roll_med(P), 'dlt': _roll_med(dlt),
+             'alpha': alpha, 'eps': eps, 'phi': phi, 'flow': rmCD / max(rmLD, 1e-9), 'rM': rM, 'tipray': tipray,
+             'Mt': _roll_med(Ft * rc / 1000.0), 'z': max(int(z), 1)}
+        if shear and fin is not None and len(fin.get('T', [])) == len(M):
+            sinA = np.abs(N[tipray, 1 - ri]); cosA = np.abs(N[tipray, ri])
+            t0 = np.nan_to_num(np.asarray(fin['T'], float)[tipray])
+            with np.errstate(divide='ignore', invalid='ignore'):
+                r['sine'] = np.where(eng & (t0 * sinA > 1e-6), s1 / (t0 * sinA), np.nan)     # 1 = sinüs kuralı
+                r['FtK'] = np.where(eng, kfm / np.sqrt(3.0) * f * t0 * cosA, 0.0)
+                r['phiV'] = np.where(eng & (sinA > 1e-6), cosA / (np.sqrt(3.0) * sinA), np.nan)
+        out.append(r)
+    return out, E['src'], E
+
+
+def process_deflection_rays(E, res):
+    """Işın başına esneme payı δ: o ışında en küçük boşluğu veren (son şekli belirleyen) takım örneğinden."""
+    nM = len(E['M'])
+    best = np.full(nM, np.inf); d = np.full(nM, np.nan)
+    for r in res:
+        if r is None:
+            continue
+        for k in np.where(r['eng'])[0]:
+            j = r['tipray'][k]
+            if r['s1'][k] < best[j]:
+                best[j], d[j] = r['s1'][k], r['dlt'][k]
+    have = np.where(np.isfinite(d))[0]
+    if len(have) == 0:
+        return np.zeros(nM)
+    return np.interp(np.arange(nM), have, d[have])
+
+
+def process_figures(i, r, c_stiff):
+    """Kanal i için: kuvvetler, kalınlık (gelen / programlanan / esnemeli), güç."""
+    t = r['t']
+    te = t[r['eng']]
+    xlim = (max(float(te.min()) - 1.0, float(t.min())), min(float(te.max()) + 1.0, float(t.max()))) if len(te) else None
+    def base(title, ylab, h=3.0):
+        fig = Figure(figsize=(7.4, h), dpi=100); FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.set_title(title, fontsize=10, color=INK); ax.set_xlabel('Zaman (s)', fontsize=9, color=INK)
+        ax.set_ylabel(ylab, fontsize=9, color=INK); ax.grid(True, axis='y', color=GRID, linewidth=0.8)
+        for sp in ('top', 'right'):
+            ax.spines[sp].set_visible(False)
+        ax.tick_params(labelsize=8, colors=INK2)
+        if xlim:
+            ax.set_xlim(*xlim)
+        return fig, ax
+    fig, ax = base(f"Kanal {i + 1} — şekillendirme kuvvetleri (Thamasett), makara başına", 'Kuvvet (kN)')
+    for key, lab in (('Fr', 'F_r radyal'), ('Fa', 'F_a eksenel'), ('Ft', 'F_t teğetsel')):
+        y = r[key] / 1000.0
+        ax.plot(t, y, color=PROC_COLORS[key], linewidth=2, label=lab)
+        k = int(np.argmax(y))
+        if y[k] > 0:
+            ax.annotate(f"{y[k]:.1f}", (t[k], y[k]), xytext=(0, 4), textcoords='offset points', ha='center',
+                        fontsize=8, color=INK)
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.22); ax.legend(fontsize=8, frameon=False, loc='upper left', ncol=3)
+    fig.tight_layout(); h1 = fig_to_svg_card(fig)
+    fig, ax = base(f"Kanal {i + 1} — makara altındaki kalınlık", 'Kalınlık (mm)')
+    e = r['eng']
+    s0 = np.where(e, r['s0'], np.nan); s1 = np.where(e, r['s1'], np.nan)
+    ax.plot(t, s0, color=INK2, linewidth=1.4, label='Gelen kalınlık s₀')
+    ax.plot(t, s1, color='#2a78d6', linewidth=2, label='Programlanan boşluk s₁')
+    if c_stiff and c_stiff > 0:
+        ax.plot(t, s1 + np.where(e, r['dlt'], np.nan), color='#eb6834', linewidth=2, label='Esnemeyle tahmini s₁')
+    ax.set_ylim(bottom=0); ax.legend(fontsize=8, frameon=False, loc='lower left', ncol=3)
+    fig.tight_layout(); h2 = fig_to_svg_card(fig)
+    fig, ax = base(f"Kanal {i + 1} — şekillendirme gücü ({r['z']} makara toplamı)", 'Güç (kW)', 2.6)
+    ax.plot(t, r['P'] / 1000.0, color='#2a78d6', linewidth=2)
+    ax.set_ylim(bottom=0)
+    fig.tight_layout(); h3 = fig_to_svg_card(fig)
+    return h1 + h2 + h3
 
 
 # ===== Hücre 20 =====
@@ -5423,8 +5612,9 @@ def run_wear(*vals):
             md.append(line)
             tot = sum(w['lines'].values()) or 1.0
             for ln, v in sorted(w['lines'].items(), key=lambda kv: -kv[1])[:12]:
-                code_ln = cfg['channels'][i]['code'].split('\n')[ln - 1].strip() if 0 < ln <= len(cfg['channels'][i]['code'].split('\n')) else ''
-                rows.append({'Kanal': i + 1, 'Satır': ln, 'Program': code_ln, 'Aşınma payı (%)': round(v / tot * 100, 1)})
+                _cl = cfg['channels'][i]['code'].split('\n')          # segment satır no 0'dan başlar
+                code_ln = _cl[ln].strip() if 0 <= ln < len(_cl) else ''
+                rows.append({'Kanal': i + 1, 'Satır': ln + 1, 'Program': code_ln, 'Aşınma payı (%)': round(v / tot * 100, 1)})
         md.append("Bu bir **yaklaşım**: a, b ve K gerçek aşınma ölçümleriyle kalibre edilmeli. Şekiller göreli dağılımı gösterir; "
                   "K girilirse en büyük değer µm olarak tahmin edilir. Gelen yüzey ön formun **ilk** halinden alınır: "
                   "simülasyonda malzemenin akıp gittiği yerlerde makaranın yan yüzlerindeki temas fazla görünebilir.")
@@ -5432,6 +5622,105 @@ def run_wear(*vals):
         return "".join(html_parts) or "<p>Aktif kanal yok.</p>", "\n\n".join(md), df, (note + "\n" if note else "") + "Aşınma hesaplandı."
     except Exception:
         return "", "", None, "Aşınma hesaplanırken hata oluştu:\n" + traceback.format_exc()
+
+
+def run_process(*vals):
+    """vals = all_inputs + [devir, k_fm, η, makara çapı, makara sayısı, β, makine rijitliği]"""
+    try:
+        n_rpm, kfm, eta, Dt = _num(vals[-7], 0.0), _num(vals[-6], 0.0), _num(vals[-5], 0.15), _num(vals[-4], 0.0)
+        z, beta, cst = int(max(_num(vals[-3], 1.0), 1)), _num(vals[-2], 0.0), max(_num(vals[-1], 0.0), 0.0)
+        if n_rpm <= 0 or kfm <= 0 or Dt <= 0 or not (0 < eta <= 1):
+            return "", "Devir, akma gerilmesi ve makara çapı sıfırdan büyük; η 0 ile 1 arasında olmalı.", None, \
+                "Proses hesabı yapılamadı: girdileri kontrol et."
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-7])
+        segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
+        timelines, total_time = synchronize(segs)
+        if len(mold_pts) < 2:
+            return "", "Kalıp noktası yetersiz.", None, "Proses hesabı yapılamadı: kalıp yok."
+        pf = _preform(opts, cfg)
+        form = _envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg) if pf else None
+        fin = (form or {}).get('final')
+        radial = pf['radial'] if pf else resolve_radial(opts.get('pf_radial', 'auto'), cfg)[0]
+        ri = 0 if radial == 'X' else 1
+        shear = bool(fin) and fin.get('mode') == 'shear'
+        res, src, E = compute_process(timelines, radii, mold_pts, fin, opts['env_limit'], ri, n_rpm, kfm, eta, Dt,
+                                      z, beta, cst, shear)
+        md = [f"**Girdiler:** n = {n_rpm:g} dev/dk, k_fm = {kfm:g} MPa, η = {eta:g}, makara çapı {Dt:g} mm, "
+              f"kanal başına {z} makara, parça yarıçapı ekseni {radial}"
+              + (f", makine rijitliği {cst:g} kN/mm" if cst > 0 else ", makine rijit kabul edildi")
+              + f". Gelen kalınlık: {src}.",
+              "**Bağıntılar (Thamasett):** Δh = f·Δs/b,  l_d ≈ √(r_m,CD·Δh),  **F_r ≈ b·l_d·k_fm/η**,  "
+              "**F_a ≈ F_r·tan β**,  **F_t ≈ f·Δs·k_fm/η**;  f = F/(n·z) devir başına ilerleme, Δs = s₀ − s₁, "
+              "b = temas boyu (profilden ölçülür; b = Δs·cot α)."
+              + (" β girilmedi: β = α (etkin giriş açısı, en fazla 45°) alındı." if not beta > 0 else "")]
+        if not (0.06 <= eta <= 0.24):
+            md.append(f"Not: ders notunda η için 0,06 – 0,24 aralığı veriliyor; girilen {eta:g} bu aralığın dışında.")
+        html_parts, rows = [], []
+        for i, r in enumerate(res):
+            if r is None:
+                continue
+            e = r['eng']
+            if not e.any():
+                html_parts.append(f"<h4>Kanal {i + 1}</h4><p>Makara malzemeye girmiyor — kuvvet yok.</p>")
+                continue
+            html_parts.append(f"<h4>Kanal {i + 1}</h4>" + process_figures(i, r, cst))
+            kF = int(np.argmax(r['Fr']))
+            fl = r['flow'][e]
+            line = (f"**Kanal {i + 1}:** en büyük F_r **{r['Fr'].max() / 1000:.1f} kN** (t = {r['t'][kF]:.1f} s, satır {int(r['line'][kF]) + 1}), "
+                    f"F_a {r['Fa'].max() / 1000:.1f} kN, F_t {r['Ft'].max() / 1000:.2f} kN, "
+                    f"tork {r['Mt'].max():.0f} N·m, güç **{r['P'].max() / 1000:.1f} kW**. "
+                    f"En büyük Δs {r['ds'][e].max():.2f} mm (ezme %{r['eps'][e].max() * 100:.0f}, φ = {r['phi'][e].max():.2f}), "
+                    f"f = {r['f'][e].min():.2f}–{r['f'][e].max():.2f} mm/dev, etkin giriş açısı α ≈ {np.degrees(np.median(r['alpha'][e])):.0f}°.")
+            if fl.min() < 1.0:
+                line += (f" **Akış yönü:** r_m,CD / r_m,LD en az {fl.min():.2f} (< 1) — temasın bir kısmında çevresel akış baskın: "
+                         "çap büyümesi / yığılma riski (makara burun yarıçapı büyük ya da makara / kalıp çapı küçük).")
+            else:
+                line += f" **Akış yönü:** r_m,CD / r_m,LD ≥ {fl.min():.1f} (> 1) — akış ağırlıklı eksenel."
+            if cst > 0:
+                line += f" Makine esnemesi: boşluk en fazla **{r['dlt'][e].max():.3f} mm** açılıyor."
+            if 'sine' in r:
+                sr = r['sine'][e & np.isfinite(r['sine'])]
+                if len(sr):
+                    q = float(np.median(sr))
+                    line += (f" **Sinüs kuralı:** boşluk / (s₀·sin α) ortanca {q:.2f}"
+                             + (" — boşluk fazla: buruşma riski." if q > 1.05 else
+                                " — boşluk dar: kenar (flanş) oluşumu / yığılma." if q < 0.95 else " — sinüs kuralına uygun.")
+                             + f" Kalpakcioglu F_t en büyük {np.nanmax(r['FtK']) / 1000:.2f} kN, φ_v ortanca {np.nanmedian(r['phiV'][e]):.2f}.")
+            md.append(line)
+            for ln in sorted(set(int(v) for v in r['line'][e])):
+                m = e & (r['line'] == ln)
+                cl = cfg['channels'][i]['code'].split('\n')
+                row = {'Kanal': i + 1, 'Satır': ln + 1, 'Program': cl[ln].strip() if 0 <= ln < len(cl) else '',
+                       'F_r (kN)': round(float(r['Fr'][m].max()) / 1000, 2), 'F_a (kN)': round(float(r['Fa'][m].max()) / 1000, 2),
+                       'F_t (kN)': round(float(r['Ft'][m].max()) / 1000, 3), 'Güç (kW)': round(float(r['P'][m].max()) / 1000, 2),
+                       'f (mm/dev)': round(float(np.median(r['f'][m])), 3), 'Δs (mm)': round(float(r['ds'][m].max()), 2),
+                       'Ezme (%)': round(float(r['eps'][m].max()) * 100, 1), 'α (°)': round(float(np.degrees(np.median(r['alpha'][m]))), 1),
+                       'r_CD/r_LD': round(float(r['flow'][m].min()), 2)}
+                if cst > 0:
+                    row['Esneme (mm)'] = round(float(r['dlt'][m].max()), 3)
+                rows.append(row)
+        sm = (fin or {}).get('sim') if fin else None
+        if cst > 0 and sm is not None and sm.get('ok') and sm.get('final') is not None:
+            d = process_deflection_rays(E, res)
+            if sm.get('kind') == 'strip':
+                st2 = strip_state(fin, sm, np.where(fin['formed'], np.nan_to_num(fin['F']) + d, np.inf), fin['formed'])
+            else:
+                st2 = sim_state(fin, sm, sm['F'] + d, sm['formed'])
+            nm = (opts['xname'], opts['yname'])
+            md.append("**Esnemenin simülasyona etkisi** (boşluk F_r/c kadar açılmış halde yeniden hesaplandı):  \n"
+                      f"rijit makine — {sim_xy_text(sm, sm['final'], nm)}  \n"
+                      f"esneme dahil — {sim_xy_text(sm, st2, nm)}")
+        elif cst > 0:
+            md.append("Esnemenin uzamaya etkisi için ön form yükleyip simülasyonu aç.")
+        md.append("Bunlar **analitik yaklaşımlardır** (ideal plastik malzeme, sürtünme ve geri yaylanma η içinde): "
+                  "kuvvetlerin mertebesini ve satırlar arası karşılaştırmayı verir. k_fm ve η'yı makinede ölçülen "
+                  "kuvvet ya da akımla ayarla. Bağıntılar eksenel ilerlemeli flow forming içindir; radyal dalma "
+                  "satırlarında ve shear / sac modelinde yaklaşık kalır.")
+        df = pd.DataFrame(rows) if rows else None
+        return ("".join(html_parts) or "<p>Aktif kanal yok.</p>", "\n\n".join(md), df,
+                (note + "\n" if note else "") + "Proses hesapları tamamlandı.")
+    except Exception:
+        return "", "", None, "Proses hesaplanırken hata oluştu:\n" + traceback.format_exc()
 
 
 def make_defaults_code(*vals):
@@ -5660,6 +5949,25 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     dxf_btn = gr.Button("📐 DXF Oluştur", variant="primary")
                     dxf_file = gr.File(label="DXF indir", interactive=False)
 
+                with gr.Tab("📐 Proses Hesapları"):
+                    gr.Markdown("Takım yolu boyunca **şekillendirme kuvvetleri, tork, güç, akış yönü ve makine esnemesi** — "
+                                "Thamasett bağıntılarıyla (F_r ≈ b·l_d·k_fm/η, F_a ≈ F_r·tan β, F_t ≈ f·Δs·k_fm/η). "
+                                "Δs ve temas boyu simülasyondaki makara–malzeme temasından alınır. Makine rijitliği girilirse "
+                                "boşluğun F_r/c kadar açıldığı kabul edilir ve uzama buna göre yeniden hesaplanır.")
+                    with gr.Row():
+                        pr_n = gr.Number(value=300.0, label="İş mili devri n (dev/dk)")
+                        pr_kf = gr.Number(value=300.0, label="Ortalama akma gerilmesi k_fm (MPa)")
+                        pr_eta = gr.Number(value=0.15, label="Verim η (0,06 – 0,24)")
+                        pr_D = gr.Number(value=250.0, label="Makara çapı D (mm)")
+                    with gr.Row():
+                        pr_z = gr.Number(value=1, precision=0, label="Kanal başına makara sayısı z")
+                        pr_beta = gr.Number(value=0.0, label="β (°) — 0: giriş açısı α alınır")
+                        pr_c = gr.Number(value=0.0, label="Makine rijitliği c (kN/mm) — 0: rijit")
+                    pr_btn = gr.Button("📐 Proses hesaplarını yap", variant="primary")
+                    pr_md = gr.Markdown()
+                    pr_html = gr.HTML()
+                    pr_df = gr.DataFrame(label="Program satırlarına göre en büyük değerler")
+
                 with gr.Tab("🔥 Takım Aşınması"):
                     gr.Markdown("Makara profilinin her noktasının ne kadar malzeme süpürdüğüne, ne kadar yol aldığına ve "
                                 "hangi hızla gittiğine göre **yaklaşık** aşınma:  **dW = K · hᵃ · (F / F_ref)ᵇ · Δs**. "
@@ -5744,6 +6052,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     # takım aşınması
     wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K],
                    outputs=[wear_html, wear_md, wear_df, status])
+    pr_btn.click(run_process, inputs=all_inputs + [pr_n, pr_kf, pr_eta, pr_D, pr_z, pr_beta, pr_c],
+                 outputs=[pr_html, pr_md, pr_df, status])
     wear_dxf_btn.click(run_wear_dxf, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K, wear_depth],
                        outputs=[wear_dxf_out, status])
 
