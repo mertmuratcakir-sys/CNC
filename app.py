@@ -207,6 +207,7 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
                 r_comp = (r + tool_radius) if clockwise else (r - tool_radius)
             elif active_comp == 'G42':
                 r_comp = (r - tool_radius) if clockwise else (r + tool_radius)
+            _rc_bad = r_comp <= 0.01
             r_comp = max(r_comp, 0.01)
 
             pts = _resample_arc((cx, cy), r_comp, start_ang, end_ang)
@@ -226,19 +227,69 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
             }
             seg['tangent_start'] = _tangent_for(seg, start_ang)
             seg['tangent_end'] = _tangent_for(seg, end_ang)
+            if _rc_bad:
+                seg['comp_warn'] = (f'iç yayın yarıçapı ({r:.2f}) takım yarıçapından ({tool_radius:g}) küçük: '
+                                    'takım bu yaya sığmıyor, kompanzeli yol tanımsız')
             _app(seg)
 
         x, y = target_x, target_y
 
-    # Başlangıç noktası: program G41/G42 ile başlıyorsa (ilk hareketten önce veya ilk hareket satırında)
-    # takım merkezi kompanze başlangıçta durur; yoksa girilen nokta takım merkezidir (G40 / G0 konumlama).
-    _first = next((s_ for s_ in segments if s_['type'] == 'move'), None)
-    if _first is not None and _first['comp_mode'] in ('G41', 'G42'):
-        for s_ in segments:
-            if s_ is _first:
-                break
-            if s_['type'] == 'dwell':
-                s_['point'] = tuple(_first['points'][0])
+    return _comp_transitions(segments)
+
+
+def _comp_transitions(segments):
+    """Kompanzasyonun açıldığı ve kapandığı blokları gerçek CNC gibi düzenler:
+    - AÇILIŞ (G40 → G41/G42 ya da programın G41/G42 ile başlaması): blok bir YAKLAŞMA bloğudur. Takım merkezi,
+      bir sonraki kontur bloğunun başlangıcına dik kompanzeli noktada biter (blok kendi yönüne dik kaydırılmaz).
+      Öncesinde hareket varsa oradaki merkezden başlar; program kompanzasyonla başlıyorsa girilen başlangıç
+      noktası da kontur noktası sayılır ve aynı miktarda kaydırılır (takım programlanan çizgiye paralel yaklaşır).
+    - KAPANIŞ (G41/G42 → G40): blok bir AYRILMA bloğudur. Takım merkezi son kompanzeli noktadan programlanan
+      uç noktaya düz gider (sıçrama olmaz).
+    - G41 ↔ G42 doğrudan geçiş: önceki bloğun bittiği merkezden yeni tarafın kompanzeli noktasına gidilir.
+    - Beklemeler (G4) takımın o anki merkezinde durur."""
+    mv = [k for k, s_ in enumerate(segments) if s_['type'] == 'move']
+
+    def _retime(s_):
+        P = s_['points']
+        dist = float(np.hypot(P[-1][0] - P[0][0], P[-1][1] - P[0][1]))
+        s_['duration'] = (dist / s_['feed']) * 60 if s_.get('feed', 0) > 0 else 0.0
+
+    for q, k in enumerate(mv):
+        s_ = segments[k]
+        prev = segments[mv[q - 1]] if q > 0 else None
+        nxt = segments[mv[q + 1]] if q + 1 < len(mv) else None
+        cm = s_['comp_mode']
+        pcm = prev['comp_mode'] if prev is not None else 'G40'
+        if s_['kind'] != 'line':
+            continue
+        if cm != 'G40' and pcm != cm:                     # açılış / taraf değişimi: yaklaşma bloğu
+            p0, p1 = s_['orig_points'][0], s_['orig_points'][-1]
+            if nxt is not None and nxt['comp_mode'] == cm:
+                E = tuple(nxt['points'][0])
+            else:
+                E = tuple(s_['points'][-1])
+            if prev is not None:
+                S = tuple(prev['points'][-1])
+            else:
+                S = (p0[0] + E[0] - p1[0], p0[1] + E[1] - p1[1])
+            s_['points'] = [S, E]
+            s_['approach'] = True
+            _retime(s_)
+        elif cm == 'G40' and pcm != 'G40':                # kapanış: ayrılma bloğu
+            S = tuple(prev['points'][-1])
+            s_['points'] = [S, tuple(s_['points'][-1])]
+            s_['orig_points'] = list(s_['points'])
+            s_['retract'] = True
+            _retime(s_)
+    last = None
+    first = segments[mv[0]]['points'][0] if mv else None
+    for s_ in segments:
+        if s_['type'] == 'move':
+            last = s_['points'][-1]
+        elif s_['type'] == 'dwell':
+            c_ = last if last is not None else first
+            if c_ is not None:
+                s_['point'] = tuple(c_)
     return segments
 
 
@@ -343,7 +394,7 @@ def apply_corner_compensation(segments, tool_radius):
 
         segA, segB = seg, segments[j]
 
-        if segA['comp_mode'] == segB['comp_mode'] and segA['comp_mode'] != 'G40':
+        if segA['comp_mode'] == segB['comp_mode'] and segA['comp_mode'] != 'G40' and not segA.get('approach'):
             tin, tout = segA['tangent_end'], segB['tangent_start']
             cross = tin[0] * tout[1] - tin[1] * tout[0]
             if abs(cross) > 1e-9:
@@ -390,6 +441,15 @@ def apply_corner_compensation(segments, tool_radius):
                     else:
                         P = _circle_circle_intersection(segA['center'], segA['radius'],
                                                           segB['center'], segB['radius'], V)
+                    if P is not None and segA['kind'] == 'line' and segB['kind'] == 'line':
+                        _dA = (segA['points'][-1][0] - segA['points'][0][0], segA['points'][-1][1] - segA['points'][0][1])
+                        _dB = (segB['points'][-1][0] - segB['points'][0][0], segB['points'][-1][1] - segB['points'][0][1])
+                        _tA = (P[0] - segA['points'][0][0]) * _dA[0] + (P[1] - segA['points'][0][1]) * _dA[1]
+                        _tB = (segB['points'][-1][0] - P[0]) * _dB[0] + (segB['points'][-1][1] - P[1]) * _dB[1]
+                        if _tA < -1e-9 or _tB < -1e-9:
+                            segB['comp_warn'] = ('takım yarıçapı iç köşeye sığmıyor: kompanzeli yollar blok '
+                                                 'içinde kesişmiyor (kısa blok / dar köşe)')
+                            P = None
                     if P is not None:
                         if segA['kind'] == 'arc':
                             _trim_arc(segA, P, False)
@@ -800,6 +860,9 @@ def build_channels_cfg(cfg):
         tr = ToolR(ch['tr'], ch.get('shape'))           # yarıçap (kompanzasyon) + varsa DXF makara profili
         segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
         segs = apply_corner_compensation(segs, float(tr))
+        for _s in segs:
+            if _s.get('comp_warn'):
+                notes.append(f"Uyarı: Kanal {ci + 1}, satır {(_s.get('line') or 0) + 1}: {_s['comp_warn']}.")
         if use_geo:
             segs = apply_geometric_contact(segs, mold_points, tr, (x0, y0))
             gaps = [s['gap_min'] for s in segs if 'gap_min' in s]
