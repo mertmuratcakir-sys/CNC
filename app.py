@@ -246,6 +246,7 @@ def _comp_transitions(segments):
     - KAPANIŞ (G41/G42 → G40): blok bir AYRILMA bloğudur. Takım merkezi son kompanzeli noktadan programlanan
       uç noktaya düz gider (sıçrama olmaz).
     - G41 ↔ G42 doğrudan geçiş: önceki bloğun bittiği merkezden yeni tarafın kompanzeli noktasına gidilir.
+    - Geçiş bir YAY bloğunda olursa yayın başına düz bir geçiş hareketi eklenir (merkez sıçramaz).
     - Beklemeler (G4) takımın o anki merkezinde durur."""
     mv = [k for k, s_ in enumerate(segments) if s_['type'] == 'move']
 
@@ -254,6 +255,7 @@ def _comp_transitions(segments):
         dist = float(np.hypot(P[-1][0] - P[0][0], P[-1][1] - P[0][1]))
         s_['duration'] = (dist / s_['feed']) * 60 if s_.get('feed', 0) > 0 else 0.0
 
+    inserts = []
     for q, k in enumerate(mv):
         s_ = segments[k]
         prev = segments[mv[q - 1]] if q > 0 else None
@@ -261,6 +263,23 @@ def _comp_transitions(segments):
         cm = s_['comp_mode']
         pcm = prev['comp_mode'] if prev is not None else 'G40'
         if s_['kind'] != 'line':
+            # yay bloğunda açılış / taraf değişimi / kapanış: yay kendi (yeni) konumunda çizilir, önceki merkezden
+            # yayın başına sıçrama olmaması için araya aynı satıra ait düz bir geçiş hareketi eklenir
+            if prev is not None and (pcm != cm) and s_['kind'] == 'arc':
+                S, E = tuple(prev['points'][-1]), tuple(s_['points'][0])
+                if np.hypot(E[0] - S[0], E[1] - S[1]) > 1e-6:
+                    con = {k_: v_ for k_, v_ in s_.items()
+                           if k_ not in ('center', 'radius', 'orig_radius', 'start_ang', 'end_ang', 'clockwise',
+                                         'prog_arc', 'tangent_start', 'tangent_end')}
+                    ps_ = tuple(s_.get('prog_start') or s_['orig_points'][0])
+                    con.update({'kind': 'line', 'points': [S, E], 'orig_points': [ps_, ps_],
+                                'orig_start': ps_, 'orig_end': ps_, 'prog_start': ps_, 'prog_end': ps_,
+                                'comp_mode': cm, 'g0': False})
+                    _d = (E[0] - S[0], E[1] - S[1]); _n = float(np.hypot(*_d))
+                    con['tangent_start'] = con['tangent_end'] = (_d[0] / _n, _d[1] / _n)
+                    con['approach' if cm != 'G40' else 'retract'] = True
+                    _retime(con)
+                    inserts.append((k, con))
             continue
         if cm != 'G40' and pcm != cm:                     # açılış / taraf değişimi: yaklaşma bloğu
             p0, p1 = s_['orig_points'][0], s_['orig_points'][-1]
@@ -281,6 +300,8 @@ def _comp_transitions(segments):
             s_['orig_points'] = list(s_['points'])
             s_['retract'] = True
             _retime(s_)
+    for k, con in reversed(inserts):
+        segments.insert(k, con)
     last = None
     first = segments[mv[0]]['points'][0] if mv else None
     for s_ in segments:
@@ -725,11 +746,11 @@ CONTACT_MODE_CHOICES = [
 ]
 
 DIA_MODE_CHOICES = [('Yarıçap', 'radius'), ('Çap (÷2)', 'diameter')]
-DIA_AXIS_CHOICES = [('X ekseni', 'X'), ('Y ekseni', 'Y'), ('X ve Y', 'XY')]
+DIA_AXIS_CHOICES = [('Yatay eksen', 'X'), ('Dikey eksen', 'Y'), ('İkisi de', 'XY')]
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1 + 1      # 31: kalıp(5) + çizilen yol modu + G0 hızı
+N_CFG = MOLD_START + 5 + 1 + 1 + 4  # 35: kalıp(5) + çizilen yol modu + G0 hızı + düzlem(4: düzlem, yatay harf, dikey harf, ayna)
 N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
                                     # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
@@ -751,7 +772,9 @@ def _dia(mode, axis):
 
 
 def cfg_from_values(v):
-    """Gradio bileşen değerleri listesi (N_CFG eleman) -> konfigürasyon sözlüğü."""
+    """Gradio bileşen değerleri listesi (N_CFG eleman) -> konfigürasyon sözlüğü.
+    Eski (kısa) listeler varsayılanlarla tamamlanır."""
+    v = list(v) + [None] * (N_CFG - len(v))
     channels = []
     for k in range(N_CH):
         b = k * CH_STRIDE
@@ -766,7 +789,8 @@ def cfg_from_values(v):
     mold = {'x0': _num(v[m]), 'y0': _num(v[m + 1]), 'code': v[m + 2] or '', 'dia_mode': dm, 'dia_axis': da}
     mode = v[m + 5] if v[m + 5] in ('geometric', 'programmed') else 'geometric'
     g0 = _num(v[m + 6], DEFAULT_G0_FEED)
-    return {'channels': channels, 'mold': mold, 'contact_mode': mode, 'g0_feed': g0}
+    return {'channels': channels, 'mold': mold, 'contact_mode': mode, 'g0_feed': g0,
+            'plane': plane_cfg(v[m + 7], v[m + 8], v[m + 9], v[m + 10])}
 
 
 def opts_from_values(v):
@@ -794,16 +818,18 @@ def _fmt_num(v):
     return '0' if s in ('', '-0') else s
 
 
-def apply_diameter(code, x0, y0, mode, axis):
+def apply_diameter(code, x0, y0, mode, axis, letters=('X', 'Y')):
     """mode='diameter' ise seçilen eksenin (X, Y veya ikisi) G-kodu koordinatlarını ve başlangıç
     değerini 2'ye böler. I/J/R değerleri (zaten yarıçap/mesafe) ve Y offset değişmez.
     Döndürür: (yeni_kod, x0, y0)"""
     if mode != 'diameter':
         return code, x0, y0
     axes = set(axis) if axis in ('X', 'Y', 'XY') else set()
+    lmap = {'X': letters[0].upper(), 'Y': letters[1].upper()}   # yatay / dikey eksenin programdaki harfi
+    lets = {lmap[a] for a in axes}
 
     def repl(m):
-        if m.group(1).upper() in axes:
+        if m.group(1).upper() in lets:
             return f"{m.group(1)}{m.group(2)}{_fmt_num(float(m.group(3)) / 2.0)}"
         return m.group(0)
 
@@ -811,25 +837,167 @@ def apply_diameter(code, x0, y0, mode, axis):
     for line in code.split('\n'):
         body, sep, comment = line.partition(';')
         if not body.strip().upper().startswith('WAIT'):
-            body = re.sub(r'(?<![A-Za-z])([XYxy])(\s*)(-?\d+\.?\d*)', repl, body)
+            body = re.sub(r'(?<![A-Za-z])([XYZxyz])(\s*)(-?\d+\.?\d*)', repl, body)
         out.append(body + sep + comment)
     return "\n".join(out), (x0 / 2.0 if 'X' in axes else x0), (y0 / 2.0 if 'Y' in axes else y0)
 
 
-def _dia_note(label, d):
+def _dia_note(label, d, pc=None):
     if d['dia_mode'] != 'diameter':
         return ''
-    ax = {'X': 'X', 'Y': 'Y', 'XY': 'X ve Y'}[d['dia_axis']]
+    hl, vl = (pc['hl'], pc['vl']) if pc else ('X', 'Y')
+    ax = {'X': f'yatay, {hl}', 'Y': f'dikey, {vl}', 'XY': f'{hl} ve {vl}'}[d['dia_axis']]
     return f"{label}: çap girişi ({ax} ekseni) — koordinatlar ve başlangıç değeri ÷2 uygulandı."
+
+
+# -------------------------------------------------------------
+# ÇALIŞMA DÜZLEMİ (G17 / G18 / G19) VE EKSEN HARFLERİ
+# Ekran her zaman: yatay eksen sağa (+), dikey eksen yukarı (+).
+# Programdaki hangi harfin yatay, hangisinin dikey olduğu ve düzlemin bakış yönü
+# G2/G3 (saat yönü) ile G41/G42 (sol/sağ) yorumunu belirler.
+# -------------------------------------------------------------
+PLANE_AXES = {'G17': ('X', 'Y'), 'G18': ('Z', 'X'), 'G19': ('Y', 'Z')}
+PLANE_OF = {frozenset(v): k for k, v in PLANE_AXES.items()}
+ARC_OFF = {'X': 'I', 'Y': 'J', 'Z': 'K'}
+PLANE_CHOICES = [('Otomatik (programdaki G17/G18/G19, yoksa eksen harflerinden)', 'auto'),
+                 ('G17 — X/Y düzlemi', 'G17'), ('G18 — Z/X düzlemi (torna)', 'G18'), ('G19 — Y/Z düzlemi', 'G19')]
+AXIS_LETTERS = ['X', 'Y', 'Z']
+DEFAULT_PLANE = {'plane': 'auto', 'hl': 'X', 'vl': 'Y', 'mirror': False}
+
+
+def plane_cfg(plane=None, hl=None, vl=None, mirror=None):
+    hl = str(hl or 'X').strip().upper()[:1]
+    vl = str(vl or 'Y').strip().upper()[:1]
+    hl = hl if hl in AXIS_LETTERS else 'X'
+    vl = vl if vl in AXIS_LETTERS else 'Y'
+    if vl == hl:
+        vl = 'Y' if hl != 'Y' else 'X'
+    return {'plane': plane if plane in ('auto', 'G17', 'G18', 'G19') else 'auto',
+            'hl': hl, 'vl': vl, 'mirror': bool(mirror)}
+
+
+def plane_flip(plane, pc):
+    """Ekrandaki dönüş yönü düzlemin standart yönüne göre ters mi? Döndürür (ters_mi, düzlem_eksenleri_uyuyor_mu)."""
+    a, b = PLANE_AXES.get(plane, ('X', 'Y'))
+    hv = (pc['hl'], pc['vl'])
+    if set(hv) != {a, b}:
+        return bool(pc['mirror']), False
+    return (hv == (b, a)) != bool(pc['mirror']), True
+
+
+def _start_plane(cmds, pc):
+    if pc['plane'] != 'auto':
+        return pc['plane']
+    for c in cmds:
+        for g in c.get('Gs', []):
+            if int(round(g)) in (17, 18, 19):
+                return f"G{int(round(g))}"
+    return PLANE_OF.get(frozenset((pc['hl'], pc['vl'])), 'G17')
+
+
+_SWAP = {2: 3, 3: 2, 41: 42, 42: 41}
+
+
+def plane_map(cmds, pc, label='Program'):
+    """parse_gcode çıktısını ekran X(yatay)/Y(dikey) komutlarına çevirir:
+    X <- yatay harf, Y <- dikey harf, I/J <- bu harflerin yay merkezi kelimeleri (I/J/K).
+    Düzlem bakış yönü ters ise G2<->G3 ve G41<->G42 değiştirilir. Döndürür: (komutlar, notlar)"""
+    pc = pc or DEFAULT_PLANE
+    hl, vl = pc['hl'], pc['vl']
+    plane = _start_plane(cmds, pc)
+    flip, ok = plane_flip(plane, pc)
+    notes, warned, out = [], set(), []
+    if not ok:
+        notes.append(f"Uyarı: {label}: {plane} düzlemi {PLANE_AXES[plane][0]}/{PLANE_AXES[plane][1]} eksenlerini içerir, "
+                     f"seçilen yatay/dikey harfler {hl}/{vl} — yay ve G41/G42 yönü bu yüzden belirsiz.")
+    other = [L for L in AXIS_LETTERS if L not in (hl, vl)]
+    for c in cmds:
+        if c.get('type') != 'CMD':
+            out.append(c)
+            continue
+        gs = [int(round(g)) for g in c.get('Gs', [])]
+        for g in gs:
+            if g in (17, 18, 19):
+                if pc['plane'] == 'auto' and f"G{g}" != plane:
+                    plane = f"G{g}"
+                    flip, ok = plane_flip(plane, pc)
+                    if not ok and ('pl', plane) not in warned:
+                        warned.add(('pl', plane))
+                        notes.append(f"Uyarı: {label}, satır {c['_line'] + 1}: G{g} düzlemi seçilen {hl}/{vl} eksenlerini içermiyor.")
+                elif pc['plane'] != 'auto' and f"G{g}" != pc['plane'] and ('ig', g) not in warned:
+                    warned.add(('ig', g))
+                    notes.append(f"Not: {label}, satır {c['_line'] + 1}: programdaki G{g} yok sayıldı, "
+                                 f"ayarlarda {pc['plane']} seçili.")
+        d = {k: v for k, v in c.items() if k not in ('X', 'Y', 'Z', 'I', 'J', 'K')}
+        if hl in c:
+            d['X'] = c[hl]
+        if vl in c:
+            d['Y'] = c[vl]
+        if ARC_OFF[hl] in c:
+            d['I'] = c[ARC_OFF[hl]]
+        if ARC_OFF[vl] in c:
+            d['J'] = c[ARC_OFF[vl]]
+        for L in other:
+            if L in c and ('ax', L) not in warned:
+                warned.add(('ax', L))
+                notes.append(f"Uyarı: {label}, satır {c['_line'] + 1}: {L} kelimesi var ama ekran eksenleri {hl} (yatay) / "
+                             f"{vl} (dikey) seçili — {L} hareketleri yok sayıldı. Eksen harflerini kontrol et.")
+        if flip and gs:
+            d['Gs'] = [float(_SWAP.get(g, g)) for g in gs]
+            if 'G' in c:
+                d['G'] = float(_SWAP.get(int(round(c['G'])), int(round(c['G']))))
+        out.append(d)
+    return out, notes
+
+
+def plane_legend(pc, plane=None):
+    """Geçerli ayarlarla ekranda G2/G3 ve G41/G42'nin nasıl göründüğünü anlatan kısa metin."""
+    pc = pc or DEFAULT_PLANE
+    pl = plane or (pc['plane'] if pc['plane'] != 'auto' else PLANE_OF.get(frozenset((pc['hl'], pc['vl'])), 'G17'))
+    flip, ok = plane_flip(pl, pc)
+    g2 = 'saat yönünün TERSİ' if flip else 'saat yönü'
+    g3 = 'saat yönü' if flip else 'saat yönünün tersi'
+    g41, g42 = ('sağında', 'solunda') if flip else ('solunda', 'sağında')
+    s = (f"**Ekran:** yatay = **{pc['hl']}** (sağa +), dikey = **{pc['vl']}** (yukarı +), düzlem **{pl}**"
+         f"{' (otomatik)' if pc['plane'] == 'auto' else ''}{', ayna açık' if pc['mirror'] else ''}.  \n"
+         f"Ekranda **G2 = {g2}**, **G3 = {g3}**; ilerleme yönüne bakınca **G41 = takım yolun {g41}**, "
+         f"**G42 = {g42}**." + ("  \n⚠️ Yön ekranda aynalanıyor (G2↔G3, G41↔G42 ters görünür)." if flip else ''))
+    if not ok:
+        s += f"  \n⚠️ {pl} düzlemi {pc['hl']}/{pc['vl']} eksenlerini içermiyor — eksen harflerini kontrol et."
+    return s
+
+
+def program_cmds(code, x0, y0, dmode, daxis, pc, label):
+    """Çap dönüşümü + ayrıştırma + düzlem/eksen eşleme. Döndürür: (komutlar, x0, y0, notlar)"""
+    pc = pc or DEFAULT_PLANE
+    code, x0, y0 = apply_diameter(code, x0, y0, dmode, daxis, (pc['hl'], pc['vl']))
+    cmds, notes = plane_map(parse_gcode(code), pc, label)
+    return cmds, x0, y0, notes
+
+
+def screen_to_program(code, pc):
+    """Ekran X/Y ile yazılmış G-kodunu (ör. DXF'ten üretilen kalıp) seçilen harflere ve dönüş yönüne çevirir."""
+    pc = pc or DEFAULT_PLANE
+    flip, _ok = plane_flip(_start_plane([], pc), pc)
+    m = {'X': pc['hl'], 'Y': pc['vl'], 'I': ARC_OFF[pc['hl']], 'J': ARC_OFF[pc['vl']]}
+    out = []
+    for line in code.split('\n'):
+        body, sep, com = line.partition(';')
+        body = re.sub(r'(?<![A-Za-z])([XYIJ])(?=\s*-?\d)', lambda q: m[q.group(1)], body)
+        if flip:
+            body = re.sub(r'(?<![A-Za-z0-9])G0*(2|3|41|42)(?!\d)', lambda q: 'G' + str(_SWAP[int(q.group(1))]), body)
+        out.append(body + sep + com)
+    return '\n'.join(out)
 
 
 # -------------------------------------------------------------
 # Widget'tan bağımsız build_channels (Colab'daki ile aynı mantık)
 # -------------------------------------------------------------
-def get_mold_points_cfg(mold, g0_feed=DEFAULT_G0_FEED):
-    code, x0, y0 = apply_diameter(mold['code'], mold['x0'], mold['y0'],
-                                  mold.get('dia_mode'), mold.get('dia_axis'))
-    mold_cmds = parse_gcode(code)
+def get_mold_points_cfg(mold, g0_feed=DEFAULT_G0_FEED, pc=None, notes=None):
+    mold_cmds, x0, y0, nn = program_cmds(mold['code'], mold['x0'], mold['y0'],
+                                         mold.get('dia_mode'), mold.get('dia_axis'), pc, 'Kalıp')
+    if notes is not None:
+        notes.extend(nn)
     mold_segs = simulate_channel(mold_cmds, x0, y0, 0.0, 1000.0, g0_feed=g0_feed)
     pts = [(x0, y0)]
     for seg in mold_segs:
@@ -840,10 +1008,11 @@ def get_mold_points_cfg(mold, g0_feed=DEFAULT_G0_FEED):
 
 def build_channels_cfg(cfg):
     g0_feed = cfg.get('g0_feed', DEFAULT_G0_FEED)
-    mold_points = get_mold_points_cfg(cfg['mold'], g0_feed)
-    use_geo = (cfg['contact_mode'] == 'geometric')
+    pc = cfg.get('plane') or DEFAULT_PLANE
     notes = []
-    n = _dia_note('Kalıp', cfg['mold'])
+    mold_points = get_mold_points_cfg(cfg['mold'], g0_feed, pc, notes)
+    use_geo = (cfg['contact_mode'] == 'geometric')
+    n = _dia_note('Kalıp', cfg['mold'], pc)
     if n:
         notes.append(n)
     if use_geo and len(mold_points) < 2:
@@ -852,11 +1021,12 @@ def build_channels_cfg(cfg):
                      "hesaplanamadı, programlanan yol kullanılıyor.")
     channels_segments, start_points, radii = [], [], []
     for ci, ch in enumerate(cfg['channels']):
-        code, x0, y0 = apply_diameter(ch['code'], ch['x0'], ch['y0'], ch.get('dia_mode'), ch.get('dia_axis'))
-        n = _dia_note(f"Kanal {ci + 1}", ch)
+        cmds, x0, y0, nn = program_cmds(ch['code'], ch['x0'], ch['y0'], ch.get('dia_mode'), ch.get('dia_axis'),
+                                        pc, f"Kanal {ci + 1}")
+        notes.extend(nn)
+        n = _dia_note(f"Kanal {ci + 1}", ch, pc)
         if n:
             notes.append(n)
-        cmds = parse_gcode(code)
         tr = ToolR(ch['tr'], ch.get('shape'))           # yarıçap (kompanzasyon) + varsa DXF makara profili
         segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
         segs = apply_corner_compensation(segs, float(tr))
@@ -4413,7 +4583,8 @@ def mp4_generator(channels_segments, start_points, radii, mold_points, timelines
 # -------------------------------------------------------------
 def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, preform=None, tools=None):
     data = {'channels': [], 'mold': dict(cfg['mold']),
-            'settings': {'contact_mode': cfg['contact_mode'], 'g0_feed': cfg['g0_feed'], 'fps': fps, 'speed': speed},
+            'settings': {'contact_mode': cfg['contact_mode'], 'g0_feed': cfg['g0_feed'], 'fps': fps, 'speed': speed,
+                         'plane': dict(cfg.get('plane') or DEFAULT_PLANE)},
             'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step},
             'plot': {'label_font': opts['label_font'], 'label_shift': opts['label_shift'],
                      'xname': opts['xname'], 'yname': opts['yname'],
@@ -4451,6 +4622,9 @@ def json_dict_to_updates(data, gr_update):
     st = data.get('settings', {}) or {}
     ups.append(pick(st, 'contact_mode'))
     ups.append(pick(st, 'g0_feed'))
+    plc = st.get('plane') if isinstance(st.get('plane'), dict) else (data.get('plane') if isinstance(data.get('plane'), dict) else {})
+    for key in ('plane', 'hl', 'vl', 'mirror'):
+        ups.append(pick(plc, key))
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
     ac = data.get('autocad', {}) or {}
@@ -4514,6 +4688,9 @@ input[type=range]{vertical-align:middle}
 #mstat{font-size:12px;line-height:1.4}
 #tm{flex:1;min-width:140px}
 #cncrow{flex:0 0 auto;display:flex;gap:8px;padding:8px;background:#1b1f24;border-top:1px solid #ddd;overflow-x:auto}
+.csys{flex:0 0 auto;display:flex;flex-direction:column;gap:4px;color:#8b949e;font:12px Arial;padding-right:4px}
+.csys button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px 7px;cursor:pointer;font-size:11px;text-align:left}
+.csys button.on{background:#f2b600;color:#000;border-color:#f2b600;font-weight:bold}
 .cnc{flex:1 1 0;min-width:290px;background:#0d1117;color:#d8dee9;border-radius:6px;padding:6px 8px;font-family:Consolas,'Courier New',monospace;font-size:12px}
 .cnc .hdr{display:flex;justify-content:space-between;gap:8px;font-weight:bold;border-bottom:1px solid #2d333b;padding-bottom:3px;margin-bottom:4px}
 .cnc .hdr .st{color:#f2b600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -4914,8 +5091,16 @@ function drawEnv(X,Y){
 // ---- CNC EKRANI: program satırları, eksen konumu, kalan mesafe ----
 var CN=D.cnc||null, cncRow=document.getElementById('cncrow'), cards=[];
 var MODE=['G0','G1','G2','G3','G4','WAIT','G1'];
+var CSYS='MKS';     // MKS: makara merkezi (kompanzasyonsuz, makine ekranı gibi) | WKS: programlanan kontur
+var csysBar=null;
+function setCsys(m){ CSYS=m; if(csysBar){ var bs=csysBar.getElementsByTagName('button'); for(var i=0;i<bs.length;i++) bs[i].className=(bs[i].getAttribute('data-m')===m)?'on':''; } if(typeof updateCNC==='function') updateCNC(); }
 function el(tag,cls,txt){var e=document.createElement(tag); if(cls) e.className=cls; if(txt!==undefined) e.textContent=txt; return e;}
 if(!CN){ cncRow.style.display='none'; } else {
+  csysBar=el('div','csys');
+  csysBar.appendChild(el('span','', 'Gösterim:'));
+  [['MKS','MKS — makara merkezi'],['WKS','WKS — programlanan kontur']].forEach(function(o){
+    var b=el('button','',o[1]); b.setAttribute('data-m',o[0]); b.onclick=function(){setCsys(o[0]);}; csysBar.appendChild(b); });
+  cncRow.appendChild(csysBar);
   CN.forEach(function(c,i){
     var card=el('div','cnc'), hdr=el('div','hdr'), body=el('div','body'), prog=el('div','prog'), pos=el('div','pos');
     var ttl=el('span','', 'KANAL '+(i+1)); ttl.style.color=D.col[i]==='#0072B2'?'#58a6ff':'#ff9b6b';
@@ -4923,11 +5108,11 @@ if(!CN){ cncRow.style.display='none'; } else {
     var lines=[]; for(var q=0;q<6;q++){var d=el('div','ln',''); prog.appendChild(d); lines.push(d);}
     var tb=el('table'), th=el('tr'); ['', 'Konum', 'Kalan'].forEach(function(h){th.appendChild(el('th','',h));}); tb.appendChild(th);
     function row(lbl){var r=el('tr'); var k=el('td','k',lbl), a=el('td','big',''), b=el('td','',''); r.appendChild(k); r.appendChild(a); r.appendChild(b); tb.appendChild(r); return [a,b];}
-    var rx=row('X'+(c.fx===2?' Ø':'')), ry=row('Y'+(c.fy===2?' Ø':''));
+    var rx=row((c.hl||'X')+(c.fx===2?' Ø':'')), ry=row((c.vl||'Y')+(c.fy===2?' Ø':''));
     var rl=el('tr'), lk=el('td','k','Yol'), lv=el('td','',''), lv2=el('td','','');
     rl.appendChild(lk); rl.appendChild(lv); rl.appendChild(lv2); tb.appendChild(rl);
     pos.appendChild(tb); body.appendChild(prog); body.appendChild(pos); card.appendChild(hdr); card.appendChild(body); cncRow.appendChild(card);
-    cards.push({st:st, lines:lines, rx:rx, ry:ry, lk:lk, lv:lv, lv2:lv2});
+    cards.push({st:st, lines:lines, rx:rx, ry:ry, lk:lk, lv:lv, lv2:lv2, hd:tb.getElementsByTagName('th')[1]});
   });
 }
 function f3(v){return (Math.abs(v)<5e-4?0:v).toFixed(3);}
@@ -4935,6 +5120,7 @@ function blockAt(B,tt){var lo=0,hi=B.length-1,ans=-1; while(lo<=hi){var m=(lo+hi
 function updateCNC(){
   if(!CN) return;
   CN.forEach(function(c,i){
+    cards[i].hd.textContent=(CSYS==='MKS')?'Merkez':'Kontur';
     if(D.act && !D.act[i]){ cards[i].st.textContent='BOŞ PROGRAM'; return; }
     var cd=cards[i], B=c.B, k=blockAt(B,t), L=c.L;
     var b=(k>=0)?B[k]:null, done=(!b)||(k===B.length-1&&t>b[1]+1e-6);
@@ -4946,6 +5132,11 @@ function updateCNC(){
       if(code===2||code===3){ var a=b[11]+(b[12]-b[11])*f; px=b[8]+b[10]*Math.cos(a); py=b[9]+b[10]*Math.sin(a); rem=Math.abs(b[12]-b[11])*b[10]*(1-f); }
       else { px=b[4]+(b[6]-b[4])*f; py=b[5]+(b[7]-b[5])*f; rem=Math.hypot(b[6]-px,b[7]-py); }
       rx=(b[6]-px)*c.fx; ry=(b[7]-py)*c.fy;
+      if(CSYS==='MKS' && b.length>16){
+        var dc=D.ch[i], qq=kf(), mx=lerp(dc.cx,qq[0],qq[1]), my=lerp(dc.cy,qq[0],qq[1]);
+        if(mx===null||mx===undefined||!isFinite(mx)){ mx=b[14]; my=b[15]; }
+        px=mx; py=my; rx=(b[14]-mx)*c.fx; ry=(b[15]-my)*c.fy; rem=b[16]*(1-f);
+      }
       if(done){ status='PROGRAM SONU'; rem=0; rx=0; ry=0; }
       else if(code===5){ status='WAIT – diğer kanallar bekleniyor'; remLbl='Bekleme'; remTxt=(b[1]-t).toFixed(2)+' s'; }
       else if(code===4){ status='G4 bekleme'; remLbl='Bekleme'; remTxt=(b[1]-t).toFixed(2)+' s'; }
@@ -5050,7 +5241,7 @@ tm.oninput=function(){setT(tm.value/10000*D.T);};
 fsB.onclick=function(){ if(!document.fullscreenElement){ document.documentElement.requestFullscreen().catch(function(e){alert('Tam ekran açılamadı: '+e.message);}); } else { document.exitFullscreen(); } };
 document.addEventListener('fullscreenchange',function(){setTimeout(resize,100);});
 if(window.ResizeObserver){new ResizeObserver(resize).observe(document.getElementById('cwrap'));} else {window.addEventListener('resize',resize);}
-setSpeed(speed); resize(); ui();
+setSpeed(speed); resize(); setCsys(CSYS); ui();
 })();
 </script></body></html>"""
 
@@ -5066,18 +5257,26 @@ _CODE_G = {'line': 1, 'fillet': 6}
 
 def build_block_table(segs, timeline, total_time, start=None):
     """CNC ekranı için blok tablosu. Her satır:
-    [t0, t1, satır, kod, sx, sy, ex, ey, cx, cy, r, a0, a1, F]
-    kod: 0=G0 1=G1 2=G2 3=G3 4=G4 5=WAIT 6=köşe geçişi. Koordinatlar programlanan (kompanzasyonsuz)."""
+    [t0, t1, satır, kod, sx, sy, ex, ey, cx, cy, r, a0, a1, F, mex, mey, mL]
+    kod: 0=G0 1=G1 2=G2 3=G3 4=G4 5=WAIT 6=köşe geçişi. sx..ey ve yay: programlanan kontur (WKS);
+    mex, mey: blok sonunda makara MERKEZİ, mL: bloktaki merkez yolu uzunluğu (MKS göstergesi için)."""
     r4 = lambda v: round(float(v), 4)
     entries = list(timeline)
     blocks, ei, t_prev, last = [], 0, 0.0, (tuple(start) if start is not None else None)
+    lastc = None
+    for _s in segs:
+        if _s['type'] == 'move':
+            lastc = tuple(_s['points'][0])
+            break
+    if lastc is None:
+        lastc = last or (0.0, 0.0)
     for seg in segs:
         if seg['type'] == 'wait':
             t0 = t_prev
             t1 = max(entries[ei][0] if ei < len(entries) else total_time, t0)
             p = last or (0.0, 0.0)
             blocks.append([r4(t0), r4(t1), seg.get('line'), 5, r4(p[0]), r4(p[1]), r4(p[0]), r4(p[1]),
-                           0, 0, 0, 0, 0, 0])
+                           0, 0, 0, 0, 0, 0, r4(lastc[0]), r4(lastc[1]), 0])
             t_prev = t1
             continue
         if ei >= len(entries):
@@ -5099,8 +5298,16 @@ def build_block_table(segs, timeline, total_time, start=None):
                     arc = [r4(v) for v in s_['prog_arc']]
             else:
                 code = _CODE_G.get(s_.get('kind'), 1)
+        if s_['type'] == 'move':
+            _P = np.asarray(s_['points'], float)
+            mL = float(np.hypot(*np.diff(_P, axis=0).T).sum()) if len(_P) > 1 else 0.0
+            lastc = (float(_P[-1, 0]), float(_P[-1, 1]))
+        else:
+            mL = 0.0
+            if s_.get('point') is not None:
+                lastc = tuple(s_['point'])
         blocks.append([r4(t0), r4(t1), s_.get('line'), code, r4(ps[0]), r4(ps[1]), r4(pe[0]), r4(pe[1])]
-                      + arc + [round(float(F), 1)])
+                      + arc + [round(float(F), 1), r4(lastc[0]), r4(lastc[1]), r4(mL)])
         t_prev, last = t1, pe
     return blocks
 
@@ -5116,6 +5323,7 @@ def player_cnc_data(cfg, channels_segments, timelines, total_time, start_points=
                                            start_points[i] if start_points else (ch['x0'], ch['y0'])),
                     'fx': 2 if (dia and 'X' in ax) else 1, 'fy': 2 if (dia and 'Y' in ax) else 1,
                     'yo': round(float(ch.get('y_offset', 0.0)), 4),
+                    'hl': (cfg.get('plane') or {}).get('hl', 'X'), 'vl': (cfg.get('plane') or {}).get('vl', 'Y'),
                     'p0': [round(float(v), 4) for v in (start_points[i] if start_points else (ch['x0'], ch['y0']))]})
     return out
 
@@ -5596,6 +5804,11 @@ def upload_mold_dxf(file_obj, face, radial_sel, rev, *vals):
         else:
             radial, why = resolve_radial(vals[N_CFG] if len(vals) > N_CFG else 'auto', cfg)
         m, msg = dxf_to_mold(path, face or 'outer', radial, bool(rev))
+        pc = cfg.get('plane') or DEFAULT_PLANE
+        if (pc['hl'], pc['vl']) != ('X', 'Y') or plane_flip(_start_plane([], pc), pc)[0]:
+            m['code'] = screen_to_program(m['code'], pc)
+            msg += (f"\nKalıp G-kodu seçili eksen harfleriyle yazıldı (yatay {pc['hl']}, dikey {pc['vl']}"
+                    f"{', yay yönleri aynalı' if plane_flip(_start_plane([], pc), pc)[0] else ''}).")
         return (gr.update(value=m['x0']), gr.update(value=m['y0']), gr.update(value=m['code']),
                 gr.update(value='radius'), gr.update(value='X', visible=False), msg)
     except Exception as e:
@@ -5605,7 +5818,7 @@ def upload_mold_dxf(file_obj, face, radial_sel, rev, *vals):
 def export_mold_json(*vals):
     try:
         cfg = cfg_from_values(vals[:N_CFG])
-        data = {'type': 'kalip', 'mold': dict(cfg['mold'])}
+        data = {'type': 'kalip', 'mold': dict(cfg['mold']), 'plane': dict(cfg['plane'])}
         out_dir = tempfile.mkdtemp(prefix='cnc_mold_')
         path = os.path.join(out_dir, 'kalip.json')
         with open(path, 'w', encoding='utf-8') as f:
@@ -5791,7 +6004,8 @@ def make_defaults_code(*vals):
     chans = pprint.pformat(cfg['channels'], sort_dicts=False, width=110)
     mold = pprint.pformat(cfg['mold'], sort_dicts=False, width=110)
     return (f"DEFAULT_CHANNELS = {chans}\n\nDEFAULT_MOLD = {mold}\n\n"
-            f"DEFAULT_CONTACT_MODE = {cfg['contact_mode']!r}\n\nDEFAULT_G0_FEED = {cfg['g0_feed']!r}")
+            f"DEFAULT_CONTACT_MODE = {cfg['contact_mode']!r}\n\nDEFAULT_G0_FEED = {cfg['g0_feed']!r}\n\n"
+            f"DEFAULT_PLANE = {cfg['plane']!r}")
 
 
 def _textbox(**kw):
@@ -5874,6 +6088,20 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
             g0_feed = gr.Number(value=DEFAULT_G0_FEED, label="G0 (hızlı hareket) hızı (mm/dk)",
                                 info="G0 satırında F yazılmamışsa bu hız kullanılır.")
             cfg_comps.append(g0_feed)
+
+            with gr.Accordion("Çalışma düzlemi ve eksen harfleri (G17 / G18 / G19)", open=True):
+                gr.Markdown("Ekranda yatay eksen sağa, dikey eksen yukarı doğru pozitiftir. Programda hangi harfin "
+                            "yatay, hangisinin dikey olduğunu ve düzlemi seçin; **G2/G3** ve **G41/G42** yönleri buna göre "
+                            "yorumlanır. Torna / flow forming: genelde **G18**, yatay **Z**, dikey **X**. "
+                            "Makinedeki görünüş ekrandakinin aynası ise (ör. ön taret, X ekseni aşağı) **Ayna**'yı açın.")
+                with gr.Row():
+                    pl_plane = gr.Dropdown(PLANE_CHOICES, value=DEFAULT_PLANE['plane'], label="Düzlem")
+                    pl_hl = gr.Dropdown(AXIS_LETTERS, value=DEFAULT_PLANE['hl'], label="Yatay eksen harfi")
+                    pl_vl = gr.Dropdown(AXIS_LETTERS, value=DEFAULT_PLANE['vl'], label="Dikey eksen harfi")
+                    pl_mirror = gr.Checkbox(value=DEFAULT_PLANE['mirror'], label="Ayna (dönüş yönlerini ters çevir)")
+                pl_legend = gr.Markdown(plane_legend(DEFAULT_PLANE))
+            plane_comps = [pl_plane, pl_hl, pl_vl, pl_mirror]
+            cfg_comps += plane_comps
 
             with gr.Accordion("Grafik eksen adları", open=False):
                 with gr.Row():
@@ -6111,6 +6339,15 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     mold_file.upload(upload_mold_dxf, inputs=[mold_file, mold_face, mold_radial, mold_rev] + cfg_comps + [pf_radial],
                      outputs=[m_x0, m_y0, m_code, m_dmode, m_daxis, status])
     mold_json_btn.click(export_mold_json, inputs=cfg_comps, outputs=[mold_json_out, status])
+
+    # düzlem açıklaması: ayarlar değişince ekrandaki G2/G41 yönünü yeniden yaz
+    def _plane_md(*v):
+        try:
+            return plane_legend(plane_cfg(*v))
+        except Exception:
+            return ""
+    for _c in plane_comps:
+        _c.change(_plane_md, inputs=plane_comps, outputs=pl_legend)
 
     # takım aşınması
     wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K],
