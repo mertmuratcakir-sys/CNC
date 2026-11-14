@@ -3,7 +3,7 @@ services:
     name: cnc-simulator
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python warmup.py
     startCommand: python app.py
     envVars:
       - key: PYTHON_VERSION

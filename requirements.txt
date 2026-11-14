@@ -2,7 +2,6 @@ gradio
 imageio
 imageio-ffmpeg
 matplotlib
-moviepy
 numpy
 pandas
 pillow

@@ -6,11 +6,13 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD")
 if not APP_USER or not APP_PASSWORD:
     raise RuntimeError("APP_USER ve APP_PASSWORD ortam değişkenleri tanımlı değil")
 
+# yazı tipi önbelleği proje klasöründe tutulur (build sırasında ısıtılır, soğuk açılışı hızlandırır)
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mplcache"))
 import matplotlib
 matplotlib.use("Agg")   # sunucuda ekransız çizim
 
 # ===== Hücre 2 =====
-# [render] kaldırıldı: !pip install gradio moviepy -q
+# [render] kaldırıldı: !pip install gradio imageio imageio-ffmpeg -q
 
 
 # ===== Hücre 4 =====
@@ -4675,7 +4677,7 @@ def register_anim(channels_segments, start_points, radii, mold_points, timelines
     token = uuid.uuid4().hex
     with _ANIM_LOCK:
         _ANIM[token] = {'scene': sc, 'timelines': timelines, 'total_time': total_time, 'n_frames': n_frames}
-        while len(_ANIM) > 8:                       # eski oturumları temizle
+        while len(_ANIM) > 3:                       # eski oturumları temizle (her sahne bir matplotlib figürü tutar)
             _ANIM.pop(next(iter(_ANIM)))
     return token, n_frames
 
@@ -4708,35 +4710,23 @@ def mp4_generator(channels_segments, start_points, radii, mold_points, timelines
     """Her ~5 karede bir (kare_no, toplam) üretir; bittiğinde dosya yazılmış olur."""
     sc = build_scene(channels_segments, start_points, radii, mold_points, xname, yname)
     n_frames = max(int(total_time * fps), 2)
-    writer, frames = None, None
     try:
         try:
             import imageio.v2 as iio
         except ImportError:
             import imageio as iio
         writer = iio.get_writer(path, fps=fps, codec='libx264', pixelformat='yuv420p', macro_block_size=1)
-    except Exception:
-        writer, frames = None, []            # imageio-ffmpeg yoksa moviepy'ye düş
-
-    for k in range(n_frames):
-        render_scene(sc, timelines, total_time, (k / n_frames) * total_time)
-        img = _even_crop(scene_rgb(sc))
-        if writer is not None:
-            writer.append_data(img)
-        else:
-            frames.append(img.copy())
-        if k % 5 == 0 or k == n_frames - 1:
-            yield k + 1, n_frames
-    if writer is not None:
+    except Exception as e:
+        raise RuntimeError("MP4 yazıcısı açılamadı: 'imageio' ve 'imageio-ffmpeg' paketleri kurulu olmalı "
+                           f"(pip install imageio imageio-ffmpeg). Ayrıntı: {e}")
+    try:
+        for k in range(n_frames):                 # kareler tek tek diske yazılır, bellekte biriktirilmez
+            render_scene(sc, timelines, total_time, (k / n_frames) * total_time)
+            writer.append_data(_even_crop(scene_rgb(sc)))
+            if k % 5 == 0 or k == n_frames - 1:
+                yield k + 1, n_frames
+    finally:
         writer.close()
-    else:
-        try:
-            from moviepy.editor import ImageSequenceClip
-        except Exception:
-            from moviepy import ImageSequenceClip
-        clip = ImageSequenceClip(frames, fps=fps)
-        clip.write_videofile(path, fps=fps, codec='libx264', logger=None,
-                             ffmpeg_params=['-pix_fmt', 'yuv420p'])
 
 
 # -------------------------------------------------------------
@@ -5599,6 +5589,49 @@ def build_player_html(data, height=960):
 
 # ===== Hücre 22 =====
 import gradio as gr
+import functools, gc, inspect
+
+
+def free_memory():
+    """Python çöpünü topla ve glibc'nin tutmaya devam ettiği boş belleği işletim sistemine geri ver.
+    Ağır hesaplardan sonra RSS'yi ~70 MB düşürür (512 MB'lık sunucularda önemli)."""
+    try:
+        gc.collect()
+        import ctypes
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _trim(fn):
+    """Ağır olay işleyicisi bittikten sonra belleği iade eder (üreteç olmayan fonksiyonlar için)."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        finally:
+            free_memory()
+    return wrapper
+
+
+def _queue_kwargs():
+    """Gradio sürümüne uygun kuyruk ayarı: aynı anda en fazla 2 ağır iş, bekleyen en fazla 12 istek.
+    (Sunucu belleğinin birkaç kullanıcıda birden dolmasını engeller.) Bilinmeyen parametreler atlanır."""
+    try:
+        par = inspect.signature(gr.Blocks.queue).parameters
+    except Exception:
+        return {}
+    kw = {}
+    if 'default_concurrency_limit' in par:
+        kw['default_concurrency_limit'] = 2
+    elif 'concurrency_count' in par:
+        kw['concurrency_count'] = 2
+    if 'max_size' in par:
+        kw['max_size'] = 12
+    return kw
+
+
+QUEUE_KW = _queue_kwargs()
 
 N_ANIM_OUT = 14   # run_all çıktı sayısı
 
@@ -5704,6 +5737,7 @@ def _static_plots(segs, starts, radii, mold_pts, opts, form=None):
 # -------------------------------------------------------------
 # 1) Ana çalıştırma: animasyon + analizler + hızlı oynatıcı
 # -------------------------------------------------------------
+@_trim
 def run_all(*vals):
     try:
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
@@ -5759,6 +5793,7 @@ def run_all(*vals):
         return tuple([gr.update()] * (N_ANIM_OUT - 1) + [err])
 
 
+@_trim
 def redraw_plots(*vals):
     """Yazı boyutu / kaydırma / eksen adı / radüs izi ayarı değişince yalnızca statik grafikleri yeniden çizer."""
     try:
@@ -5773,6 +5808,7 @@ def redraw_plots(*vals):
         return (gr.update(),) * 7 + ("Grafikler yeniden çizilirken hata oluştu:\n" + traceback.format_exc(),)
 
 
+@_trim
 def upload_preform(file_obj):
     """Ön form DXF yüklenince: state + katman listesi + durum mesajı."""
     if file_obj is None:
@@ -5863,11 +5899,14 @@ def make_mp4(*vals):
         yield path, path, f"Tamamlandı: cnc_simulation.mp4 ({total_time:.2f} sn, {mp4_fps} FPS). Aşağıdan indirebilirsin."
     except Exception:
         yield gr.update(), gr.update(), "MP4 oluşturulurken hata oluştu:\n" + traceback.format_exc()
+    finally:
+        free_memory()
 
 
 # -------------------------------------------------------------
 # 4) DXF çıktısı (AutoCAD'de doğrudan açılır)
 # -------------------------------------------------------------
+@_trim
 def make_dxf(*vals):
     """vals = all_inputs + [seçili DXF katmanları]"""
     try:
@@ -5960,6 +5999,7 @@ def make_tool_previews(state, *trs):
                  for k in range(N_CH))
 
 
+@_trim
 def upload_mold_dxf(file_obj, face, radial_sel, rev, *vals):
     """vals = cfg_comps + [pf_radial]"""
     path = _file_path(file_obj)
@@ -6011,6 +6051,7 @@ def _wear_compute(vals):
     return cfg, radii, res, src, note, (a, b, vref, Kc)
 
 
+@_trim
 def run_wear_dxf(*vals):
     """vals = all_inputs + [a, b, v_ref, K, en büyük aşınma derinliği (mm)]"""
     try:
@@ -6024,6 +6065,7 @@ def run_wear_dxf(*vals):
         return None, "Aşınmış profil DXF'i oluşturulurken hata oluştu:\n" + traceback.format_exc()
 
 
+@_trim
 def run_wear(*vals):
     """vals = all_inputs + [a, b, v_ref, K]"""
     try:
@@ -6068,6 +6110,7 @@ def run_wear(*vals):
         return "", "", None, "Aşınma hesaplanırken hata oluştu:\n" + traceback.format_exc()
 
 
+@_trim
 def run_process(*vals):
     """vals = all_inputs + [devir, k_fm, η, makara çapı, makara sayısı, β, makine rijitliği]"""
     try:
@@ -6538,4 +6581,4 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     # Python varsayılan kodu
     defaults_btn.click(make_defaults_code, inputs=cfg_comps, outputs=defaults_out)
 
-demo.queue().launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)), auth=(APP_USER, APP_PASSWORD))
+demo.queue(**globals().get("QUEUE_KW", {})).launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)), auth=(APP_USER, APP_PASSWORD))
