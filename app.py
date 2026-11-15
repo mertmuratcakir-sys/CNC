@@ -798,7 +798,7 @@ DIA_AXIS_CHOICES = [('Yatay eksen', 'X'), ('Dikey eksen', 'Y'), ('İkisi de', 'X
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1 + 1 + 5  # 36: kalıp(5) + çizilen yol modu + G0 hızı + düzlem(5: düzlem, yatay, dikey, ayna, takım referansı)
+N_CFG = MOLD_START + 5 + 1 + 1 + 7  # 38: kalıp(5) + çizilen yol modu + G0 hızı + düzlem(7: düzlem, yatay, dikey, ayna, takım referansı, DXF X, DXF Y)
 N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
                                     # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
@@ -838,7 +838,7 @@ def cfg_from_values(v):
     mode = v[m + 5] if v[m + 5] in ('geometric', 'programmed') else 'geometric'
     g0 = _num(v[m + 6], DEFAULT_G0_FEED)
     return {'channels': channels, 'mold': mold, 'contact_mode': mode, 'g0_feed': g0,
-            'plane': plane_cfg(v[m + 7], v[m + 8], v[m + 9], v[m + 10], tip=v[m + 11])}
+            'plane': plane_cfg(v[m + 7], v[m + 8], v[m + 9], v[m + 10], tip=v[m + 11], dxf_h=v[m + 12], dxf_v=v[m + 13])}
 
 
 def opts_from_values(v):
@@ -912,7 +912,11 @@ PLANE_CHOICES = [('Otomatik (programdaki G17/G18/G19, yoksa eksen harflerinden)'
 AXIS_LETTERS = ['X', 'Y', 'Z']
 AXIS_CHOICES = ['X', '-X', 'Y', '-Y', 'Z', '-Z']     # '-X': programda X büyüdükçe ekranda sola / aşağı
 DEFAULT_PLANE = {'plane': 'auto', 'hl': 'X', 'vl': 'Y', 'mirror': False, 'hneg': False, 'vneg': False,
-                 'hsel': 'X', 'vsel': 'Y', 'tip': 'center'}
+                 'hsel': 'X', 'vsel': 'Y', 'tip': 'center', 'dxf_h': 'auto', 'dxf_v': 'auto'}
+# DXF (CAD) eksenlerinin makine eksenlerine eşlemesi: makara / kalıp / ön form DXF'leri ve DXF çıktıları için.
+DXF_AXIS_CHOICES = [('Ekranla aynı (DXF X = yatay, DXF Y = dikey)', 'auto')] + \
+                   [(f"makine {a}" if not a.startswith('-') else f"makine {a} (ters yön)", a) for a in ['X', '-X', 'Y', '-Y', 'Z', '-Z']]
+DXF_AXIS_VALUES = [v for _l, v in DXF_AXIS_CHOICES]
 # G40'ta (kompanzasyon kapalı) programlanan nokta makaranın neresi? (Sinumerik "kesici uç konumu" karşılığı)
 TIP_CHOICES = [('Makara merkezi', 'center'),
                ('Makara kenarı, X− tarafı (merkez = nokta + R·X)', 'X-'), ('Makara kenarı, X+ tarafı', 'X+'),
@@ -921,7 +925,7 @@ TIP_CHOICES = [('Makara merkezi', 'center'),
 TIP_VALUES = [v for _l, v in TIP_CHOICES]
 
 
-def plane_cfg(plane=None, hl=None, vl=None, mirror=None, hneg=None, vneg=None, tip=None):
+def plane_cfg(plane=None, hl=None, vl=None, mirror=None, hneg=None, vneg=None, tip=None, dxf_h=None, dxf_v=None):
     """hl / vl: 'X', '-X', 'Z' … (eksi: o eksen ekranda ters yönde). hneg/vneg ayrıca verilebilir (eski JSON)."""
     hs, vs = str(hl or 'X').strip().upper().replace(' ', ''), str(vl or 'Y').strip().upper().replace(' ', '')
     hn, vn = hs.startswith('-'), vs.startswith('-')
@@ -934,7 +938,83 @@ def plane_cfg(plane=None, hl=None, vl=None, mirror=None, hneg=None, vneg=None, t
     return {'plane': plane if plane in ('auto', 'G17', 'G18', 'G19') else 'auto',
             'hl': hl, 'vl': vl, 'mirror': bool(mirror), 'hneg': hn, 'vneg': vn,
             'hsel': ('-' if hn else '') + hl, 'vsel': ('-' if vn else '') + vl,
-            'tip': tip if tip in TIP_VALUES else 'center'}
+            'tip': tip if tip in TIP_VALUES else 'center',
+            'dxf_h': dxf_h if dxf_h in DXF_AXIS_VALUES else 'auto', 'dxf_v': dxf_v if dxf_v in DXF_AXIS_VALUES else 'auto'}
+
+
+def dxf_matrix(pc):
+    """DXF (u, v) → ekran (yatay, dikey) dönüşümü: 2x2 matris M (ekran = M @ [u, v]) ve uyarı metni.
+    DXF'in X ekseni 'dxf_h', Y ekseni 'dxf_v' makine ekseniyle eşlenir (ör. 'X', '-Z'); makine eksenleri
+    ekrana yatay/dikey harf ve yönleriyle (−X: sola +) yerleşir. 'auto' = DXF doğrudan ekran eksenlerinde."""
+    pc = pc or DEFAULT_PLANE
+    dh, dv = str(pc.get('dxf_h') or 'auto'), str(pc.get('dxf_v') or 'auto')
+    hl, vl = pc['hl'], pc['vl']
+    if dh == 'auto' and dv == 'auto':
+        return np.eye(2), None
+
+    def parse(s):
+        s = s.strip().upper()
+        return s.lstrip('+-')[:1], (-1.0 if s.startswith('-') else 1.0)
+    if dh == 'auto':
+        Lv, sv_ = parse(dv)
+        Lh, sh_ = (hl if Lv != hl else vl), 1.0
+    elif dv == 'auto':
+        Lh, sh_ = parse(dh)
+        Lv, sv_ = (vl if Lh != vl else hl), 1.0
+    else:
+        (Lh, sh_), (Lv, sv_) = parse(dh), parse(dv)
+    if {Lh, Lv} != {hl, vl}:
+        return np.eye(2), (f"Uyarı: DXF eksen eşlemesi ({Lh}, {Lv}) ekranın yatay/dikey eksenleriyle ({hl}, {vl}) aynı "
+                           f"harfleri içermiyor — eşleme yok sayıldı (DXF doğrudan ekran eksenlerinde kabul edildi).")
+    ssg = {hl: (-1.0 if pc.get('hneg') else 1.0), vl: (-1.0 if pc.get('vneg') else 1.0)}
+    row = {hl: 0, vl: 1}
+    M = np.zeros((2, 2))
+    M[row[Lh], 0] = sh_ * ssg[Lh]
+    M[row[Lv], 1] = sv_ * ssg[Lv]
+    return M, None
+
+
+def dxf_is_identity(M):
+    return bool(np.allclose(M, np.eye(2)))
+
+
+def dxf_to_screen(P, M):
+    """DXF noktaları (n,2) → ekran koordinatları."""
+    P = np.asarray(P, float).reshape(-1, 2)
+    return P @ np.asarray(M, float).T
+
+
+_XFORM_STATE = []          # [(ham_durum, M anahtarı, dönüşmüş durum)] — küçük önbellek (kimlik sabit kalsın, kontur onarımı önbelleği çalışsın)
+
+
+def state_to_screen(st, M):
+    """Ön form durumunu (ham DXF koordinatları) ekran eksenlerine çevirir; kimlik dönüşümde aynısı döner."""
+    if not st or not st.get('layers') or dxf_is_identity(M):
+        return st
+    key = tuple(np.round(np.asarray(M, float).ravel(), 6))
+    for raw, k, out in _XFORM_STATE:
+        if raw is st and k == key:
+            return out
+    out = {'name': st.get('name'),
+           'layers': {k_: [[[float(x), float(y)] for x, y in dxf_to_screen(pl, M)] for pl in v]
+                      for k_, v in st['layers'].items()}}
+    _XFORM_STATE.append((st, key, out))
+    del _XFORM_STATE[:-4]
+    return out
+
+
+def dxf_map_text(pc):
+    """Ekranda gösterilecek kısa eşleme açıklaması (örn. 'DXF X → makine X → ekranda yatay (sola +)')."""
+    pc = pc or DEFAULT_PLANE
+    M, warn = dxf_matrix(pc)
+    if dxf_is_identity(M) and not warn:
+        return "DXF eksenleri ekran eksenleriyle aynı (DXF X = yatay sağa +, DXF Y = dikey yukarı +)."
+    names = {0: 'yatay', 1: 'dikey'}
+    parts = []
+    for col, nm in ((0, 'X'), (1, 'Y')):
+        r = int(np.argmax(np.abs(M[:, col])))
+        parts.append(f"DXF {nm} (+) → ekranda {names[r]}, {'sağa' if r == 0 and M[r, col] > 0 else 'sola' if r == 0 else 'yukarı' if M[r, col] > 0 else 'aşağı'}")
+    return "; ".join(parts) + "." + (f" {warn}" if warn else "")
 
 
 def plane_flip(plane, pc):
@@ -1029,6 +1109,7 @@ def plane_legend(pc, plane=None):
          f"**G42 = {g42}**." + ("  \n⚠️ Yön ekranda aynalanıyor (G2↔G3, G41↔G42 ters görünür)." if flip else ''))
     if not ok:
         s += f"  \n⚠️ {pl} düzlemi {pc['hl']}/{pc['vl']} eksenlerini içermiyor — eksen harflerini kontrol et."
+    s += "  \n**DXF eşlemesi:** " + dxf_map_text(pc)
     return s
 
 
@@ -1866,8 +1947,12 @@ _DXF_ACI = {'contour': [5, 30, 4], 'envelope': [3, 6, 1], 'center': [8, 8, 8], '
 _DXF_NAME = {'contour': 'KONTUR', 'envelope': 'RADUS_IZI', 'center': 'TAKIM_MERKEZI', 'circles': 'CEMBER', 'g0': 'G0'}
 
 
+DXF_OUT_INV = [None]          # ekran → DXF (CAD) eksenleri dönüşümü (2x2); None = dönüşümsüz
+
+
 class _DxfWriter:
     def __init__(self):
+        self.inv = DXF_OUT_INV[0]
         self.layers = {}          # ad -> renk (ACI)
         self.ent = []
         self.ext = [np.inf, np.inf, -np.inf, -np.inf]
@@ -1883,6 +1968,8 @@ class _DxfWriter:
         P = [(float(p[0]), float(p[1])) for p in pts if np.isfinite(p[0]) and np.isfinite(p[1])]
         if len(P) < 2:
             return
+        if self.inv is not None:
+            P = [tuple(q) for q in np.asarray(P) @ self.inv.T]
         out = ['0', 'POLYLINE', '8', layer, '66', '1', '70', '1' if closed else '0',
                '10', '0.0', '20', '0.0', '30', '0.0']
         for x, y in P:
@@ -1895,6 +1982,8 @@ class _DxfWriter:
         x, y = float(c[0]), float(c[1])
         if not (np.isfinite(x) and np.isfinite(y)) or r <= 0:
             return
+        if self.inv is not None:
+            x, y = (float(t) for t in self.inv @ np.array([x, y]))
         self.ent.append(['0', 'CIRCLE', '8', layer, '10', f'{x:.6f}', '20', f'{y:.6f}', '30', '0.0',
                          '40', f'{float(r):.6f}'])
         self._grow(x, y, r)
@@ -3801,11 +3890,13 @@ def load_tool_dxf(path, tr=None):
     return {'name': name, 'shape': [[round(float(x), 5), round(float(y), 5)] for x, y in P]}, "\n".join(lines)
 
 
-def tool_preview_html(entry, tr, color='#0072B2'):
+def tool_preview_html(entry, tr, color='#0072B2', M=None):
     """Yüklenen makara profilinin küçük önizlemesi (0,0 merkez, kesikli: kompanzasyon yarıçapı)."""
     if not entry:
         return ""
     P = np.asarray(entry['shape'], float)
+    if M is not None and not dxf_is_identity(M):
+        P = tool_shape_screen(P, M)              # önizleme simülasyonda kullanılan (ekran) yönde gösterilir
     fig = Figure(figsize=(3.6, 3.2), dpi=100)
     FigureCanvasAgg(fig)
     ax = fig.add_subplot(111)
@@ -3825,12 +3916,21 @@ def tool_preview_html(entry, tr, color='#0072B2'):
     return fig_to_svg_card(fig)
 
 
+def tool_shape_screen(shape, M):
+    """Makara profilini (DXF koordinatları, 0,0 = merkez) ekran eksenlerine çevirir; sargı yönü düzeltilir."""
+    P = dxf_to_screen(shape, M) if not dxf_is_identity(M) else np.asarray(shape, float)
+    if len(P) > 2 and poly_area(P) < 0:
+        P = P[::-1]
+    return P
+
+
 def apply_tool_shapes(cfg, tool_state):
-    """Arayüzdeki makara profillerini (kanal no → {'shape'}) konfigürasyona işler."""
+    """Arayüzdeki makara profillerini (kanal no → {'shape'}) konfigürasyona işler (DXF eksen eşlemesi uygulanır)."""
     ts = tool_state if isinstance(tool_state, dict) else {}
+    M, _w = dxf_matrix(cfg.get('plane'))
     for i, ch in enumerate(cfg['channels']):
         e = ts.get(str(i)) or ts.get(i)
-        ch['shape'] = np.asarray(e['shape'], float) if e and e.get('shape') else None
+        ch['shape'] = tool_shape_screen(e['shape'], M) if e and e.get('shape') else None
     return cfg
 
 
@@ -3961,7 +4061,7 @@ MOLD_FACE_CHOICES = [('Dış yüz (yarıçapı büyük taraf)', 'outer'), ('İç
                      ('Tüm kontur (olduğu gibi)', 'all')]
 
 
-def dxf_to_mold(path, face='outer', radial='X', reverse=False, tol=MOLD_FIT_TOL):
+def dxf_to_mold(path, face='outer', radial='X', reverse=False, tol=MOLD_FIT_TOL, M=None):
     """Kalıp DXF'ini kalıp G-koduna çevirir. Açık çizgi ise olduğu gibi; kapalı konturdan seçilen yüz alınır.
     Varsayılan yön: eksen koordinatı büyük uçtan küçüğe (ters çevrilebilir).
     Döndürür: ({'x0','y0','code','dia_mode','dia_axis','source'}, mesaj)"""
@@ -3969,11 +4069,18 @@ def dxf_to_mold(path, face='outer', radial='X', reverse=False, tol=MOLD_FIT_TOL)
     ch = _join_chains(st, None)
     if not ch:
         raise ValueError("Kalıp DXF'inde çizgi bulunamadı.")
+    _raw = np.vstack([c[0] for c in ch])
+    _map_note = ''
+    if M is not None and not dxf_is_identity(M):
+        ch = [(dxf_to_screen(c[0], M), c[1]) for c in ch]
+        _scr = np.vstack([c[0] for c in ch])
+        _map_note = (f"DXF koordinatları X {_raw[:, 0].min():.1f}…{_raw[:, 0].max():.1f}, Y {_raw[:, 1].min():.1f}…{_raw[:, 1].max():.1f}"
+                     f" → ekranda yatay {_scr[:, 0].min():.1f}…{_scr[:, 0].max():.1f}, dikey {_scr[:, 1].min():.1f}…{_scr[:, 1].max():.1f} (DXF eksen eşlemesi uygulandı).")
     plen = lambda A: float(np.hypot(*np.diff(A, axis=0).T).sum())
     ch = sorted(ch, key=lambda c: -plen(c[0]))
     P, closed = ch[0]
     ri = 0 if radial == 'X' else 1
-    notes = []
+    notes = [_map_note] if _map_note else []
     if len(ch) > 1:
         notes.append(f"DXF'te {len(ch)} ayrı çizgi zinciri var; en uzunu ({plen(P):.1f} mm) kalıp olarak alındı.")
     if closed and face != 'all':
@@ -4780,7 +4887,7 @@ def json_dict_to_updates(data, gr_update):
             plc[k_] = plc[s_]
         elif plc.get(k_) and plc.get(n_):
             plc[k_] = '-' + str(plc[k_]).lstrip('-')
-    for key in ('plane', 'hl', 'vl', 'mirror', 'tip'):
+    for key in ('plane', 'hl', 'vl', 'mirror', 'tip', 'dxf_h', 'dxf_v'):
         ups.append(pick(plc, key))
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
@@ -5644,7 +5751,11 @@ def _split_vals(vals):
     ac_s, ac_e, ac_st = (_num(vals[N_CFG + 2], 0.0), _num(vals[N_CFG + 3], 0.0), _num(vals[N_CFG + 4], 0.1))
     opts = opts_from_values(vals[N_CFG + 5:N_CFG + 5 + N_OPT])
     k = N_CFG + 5 + N_OPT
-    opts['pf_state'] = vals[k] if len(vals) > k and isinstance(vals[k], dict) else None
+    raw = vals[k] if len(vals) > k and isinstance(vals[k], dict) else None
+    opts['pf_state_raw'] = raw                       # JSON'a ham (DXF) koordinatlarıyla kaydedilir
+    M, _w = dxf_matrix(cfg.get('plane'))
+    opts['pf_state'] = state_to_screen(raw, M)       # simülasyon ekran eksenlerinde çalışır
+    opts['dxf_M'] = M
     opts['tool_state'] = vals[k + 1] if len(vals) > k + 1 and isinstance(vals[k + 1], dict) else {}
     apply_tool_shapes(cfg, opts['tool_state'])
     return cfg, fps, speed, ac_s, ac_e, ac_st, opts
@@ -5668,6 +5779,11 @@ def _preform(opts, cfg=None):
     radial, warn = radial_guard(chains, radial)
     if warn:
         why = 'otomatik düzeltildi'
+    if opts.get('dxf_M') is not None and not dxf_is_identity(opts['dxf_M']):
+        _b = np.vstack([c[0] for c in chains])
+        rnote = ((rnote + "\n") if rnote else "") + (
+            f"DXF eksen eşlemesi uygulandı: ön form ekranda yatay {_b[:, 0].min():.1f}…{_b[:, 0].max():.1f}, "
+            f"dikey {_b[:, 1].min():.1f}…{_b[:, 1].max():.1f} mm.")
     return {'chains': chains, 'model': opts.get('pf_model', 'strip'), 'radial': radial, 'radial_why': why,
             'radial_warn': warn, 'repair_note': rnote, 'sim': bool(opts.get('pf_sim'))}
 
@@ -5921,8 +6037,13 @@ def make_dxf(*vals):
         envs = (_envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg)
                 if {'envelope', 'preform', 'final'} & set(layers) else None)
         end_used = ac_e if ac_e > ac_s else total_time
-        txt, summary = build_dxf_text(layers, segs, radii, mold_pts, timelines, total_time,
-                                      ac_s, end_used, ac_st, envs)
+        _M = opts.get('dxf_M')
+        DXF_OUT_INV[0] = None if _M is None or dxf_is_identity(_M) else np.linalg.inv(np.asarray(_M, float))
+        try:
+            txt, summary = build_dxf_text(layers, segs, radii, mold_pts, timelines, total_time,
+                                          ac_s, end_used, ac_st, envs)
+        finally:
+            DXF_OUT_INV[0] = None
         out_dir = tempfile.mkdtemp(prefix='cnc_dxf_')
         path = os.path.join(out_dir, 'cnc_simulasyon.dxf')
         with open(path, 'w', encoding='ascii', newline='\r\n') as f:
@@ -5943,7 +6064,7 @@ def make_dxf(*vals):
 def export_json(*vals):
     try:
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
-        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st, opts, opts.get('pf_state'),
+        data = config_to_json_dict(cfg, fps, speed, ac_s, ac_e, ac_st, opts, opts.get('pf_state_raw'),
                                    opts.get('tool_state'))
         out_dir = tempfile.mkdtemp(prefix='cnc_cfg_')
         path = os.path.join(out_dir, 'gcode_simulator_config.json')
@@ -5978,7 +6099,7 @@ def _file_path(f):
 
 
 def make_upload_tool(k):
-    def _up(file_obj, state, tr):
+    def _up(file_obj, state, tr, *pl):
         state = dict(state or {})
         path = _file_path(file_obj)
         if path is None:
@@ -5987,15 +6108,23 @@ def make_upload_tool(k):
         try:
             entry, msg = load_tool_dxf(path, tr)
             state[str(k)] = entry
-            return state, tool_preview_html(entry, tr, CHANNEL_COLORS[k]), f"Kanal {k + 1}: " + msg
+            M = None
+            if len(pl) >= 7:
+                _pc = plane_cfg(*pl[:5], dxf_h=pl[5], dxf_v=pl[6])
+                M, _w = dxf_matrix(_pc)
+                msg += "\n" + dxf_map_text(_pc)
+            return state, tool_preview_html(entry, tr, CHANNEL_COLORS[k], M), f"Kanal {k + 1}: " + msg
         except Exception as e:
             return state, "", f"Kanal {k + 1}: makara DXF'i okunamadı: {e}"
     return _up
 
 
-def make_tool_previews(state, *trs):
+def make_tool_previews(state, *args):
+    """args = N_CH takım yarıçapı + düzlem ayarları (7)."""
     state = state or {}
-    return tuple(tool_preview_html(state.get(str(k)), trs[k], CHANNEL_COLORS[k]) if state.get(str(k)) else ""
+    trs, pl = args[:N_CH], args[N_CH:]
+    M, _w = dxf_matrix(plane_cfg(*pl[:5], dxf_h=pl[5], dxf_v=pl[6])) if len(pl) >= 7 else (None, None)
+    return tuple(tool_preview_html(state.get(str(k)), trs[k], CHANNEL_COLORS[k], M) if state.get(str(k)) else ""
                  for k in range(N_CH))
 
 
@@ -6011,7 +6140,10 @@ def upload_mold_dxf(file_obj, face, radial_sel, rev, *vals):
             radial, why = radial_sel, 'seçildi'
         else:
             radial, why = resolve_radial(vals[N_CFG] if len(vals) > N_CFG else 'auto', cfg)
-        m, msg = dxf_to_mold(path, face or 'outer', radial, bool(rev))
+        M, _w = dxf_matrix(cfg.get('plane'))
+        m, msg = dxf_to_mold(path, face or 'outer', radial, bool(rev), M=M)
+        if _w:
+            msg += "\n" + _w
         pc = cfg.get('plane') or DEFAULT_PLANE
         if (pc['hl'], pc['vl']) != ('X', 'Y') or plane_flip(_start_plane([], pc), pc)[0]:
             m['code'] = screen_to_program(m['code'], pc)
@@ -6057,7 +6189,12 @@ def run_wear_dxf(*vals):
     try:
         depth = _num(vals[-1], 0.0)
         cfg, radii, res, src, note, (a, b, vref, Kc) = _wear_compute(vals[:-1])
-        paths, msg = wear_dxf_files(res, radii, depth, Kc)
+        _M, _w = dxf_matrix(cfg.get('plane'))
+        DXF_OUT_INV[0] = None if dxf_is_identity(_M) else np.linalg.inv(_M)
+        try:
+            paths, msg = wear_dxf_files(res, radii, depth, Kc)
+        finally:
+            DXF_OUT_INV[0] = None
         return paths, msg
     except ValueError as e:
         return None, f"Aşınmış profil DXF'i oluşturulamadı: {e}"
@@ -6316,8 +6453,14 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                      label="G40'ta programlanan nokta (takım referansı / kesici uç konumu)",
                                      info="Sinumerik'te makara çoğu zaman kenarından ölçülür: G40 ile X700'e giderken "
                                           "merkez X ekseninde R kadar dışarıdadır. G41/G42 açıkken etkisi yoktur.")
+                with gr.Row():
+                    pl_dxfh = gr.Dropdown(DXF_AXIS_CHOICES, value='auto', label="DXF'in X ekseni = makinede",
+                                          info="Makara / kalıp / ön form DXF'lerinin CAD X ekseni hangi makine eksenine karşılık geliyor?")
+                    pl_dxfv = gr.Dropdown(DXF_AXIS_CHOICES, value='auto', label="DXF'in Y ekseni = makinede",
+                                          info="Örn. DXF X–Y'de çizilen kalıp makinede Z (yatay) / X (dikey) ise: X→Z, Y→X seçin. "
+                                               "Ters çizildiyse −Z / −X seçin. DXF çıktıları da aynı eşlemeyle geri yazılır.")
                 pl_legend = gr.Markdown(plane_legend(DEFAULT_PLANE))
-            plane_comps = [pl_plane, pl_hl, pl_vl, pl_mirror, pl_tip]
+            plane_comps = [pl_plane, pl_hl, pl_vl, pl_mirror, pl_tip, pl_dxfh, pl_dxfv]
             cfg_comps += plane_comps
 
             with gr.Accordion("Grafik eksen adları", open=False):
@@ -6543,11 +6686,11 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     # JSON
     json_btn.click(export_json, inputs=all_inputs, outputs=[json_file_out, status])
     json_upload.upload(import_json, inputs=json_upload, outputs=all_inputs + [status]).then(
-        make_tool_previews, inputs=[tool_state] + tool_trs, outputs=tool_prevs)
+        make_tool_previews, inputs=[tool_state] + tool_trs + plane_comps, outputs=tool_prevs)
 
     # makara profili DXF (kanal başına)
     for _k in range(N_CH):
-        tool_files[_k].upload(make_upload_tool(_k), inputs=[tool_files[_k], tool_state, tool_trs[_k]],
+        tool_files[_k].upload(make_upload_tool(_k), inputs=[tool_files[_k], tool_state, tool_trs[_k]] + plane_comps,
                               outputs=[tool_state, tool_prevs[_k], status])
         tool_files[_k].clear(lambda st, tr, _k=_k: make_upload_tool(_k)(None, st, tr),
                              inputs=[tool_state, tool_trs[_k]], outputs=[tool_state, tool_prevs[_k], status])
@@ -6560,11 +6703,13 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     # düzlem açıklaması: ayarlar değişince ekrandaki G2/G41 yönünü yeniden yaz
     def _plane_md(*v):
         try:
-            return plane_legend(plane_cfg(v[0], v[1], v[2], v[3], tip=v[4]))
+            return plane_legend(plane_cfg(v[0], v[1], v[2], v[3], tip=v[4], dxf_h=v[5], dxf_v=v[6]))
         except Exception:
             return ""
     for _c in plane_comps:
         _c.change(_plane_md, inputs=plane_comps, outputs=pl_legend)
+    for _c in (pl_plane, pl_hl, pl_vl, pl_dxfh, pl_dxfv):     # DXF eşlemesi değişince makara önizlemeleri yenilensin
+        _c.change(make_tool_previews, inputs=[tool_state] + tool_trs + plane_comps, outputs=tool_prevs)
 
     # takım aşınması
     wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K],
