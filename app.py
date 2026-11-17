@@ -30,7 +30,7 @@ def parse_gcode(text):
         if _kind is None:
             continue
         if _kind == 'WAIT':
-            commands.append({'type': 'WAIT', '_line': _ln})
+            commands.append({'type': 'WAIT', '_line': _ln, **{k_: v_ for k_, v_ in (line or {}).items() if k_ != 'text'}})
             continue
         tokens = re.findall(r'([A-Za-z])\s*(-?\d+\.?\d*)', line)
         if not tokens:
@@ -58,6 +58,25 @@ def _nc_eval(expr):
         return None
 
 
+def _wait_info(line):
+    """WAIT satırının anlamı: WAITM(işaret, kanallar) / WAITMC(...) → işaretli bekleme, WAITE(kanallar) → o kanalların
+    program sonunu bekle, düz WAIT → tüm kanallarla sıradaki WAIT'te buluş."""
+    m = re.match(r'^(WAIT[A-Z]*)\s*(?:\(([^)]*)\))?', line.strip(), re.I)
+    name = m.group(1).upper()
+    args = [int(float(a)) for a in re.findall(r'-?\d+\.?\d*', m.group(2) or '')]
+    if name in ('WAITM', 'WAITMC') and args:
+        info = {'wkind': 'M', 'mark': args[0], 'chans': args[1:]}
+        text = f"{name}({','.join(str(a) for a in args)})"
+    elif name == 'WAITE' and args:
+        info = {'wkind': 'E', 'chans': args}
+        text = f"WAITE({','.join(str(a) for a in args)})"
+    else:
+        info = {'wkind': 'P'}
+        text = 'WAIT'
+    info['text'] = text
+    return info
+
+
 def _nc_line(raw):
     """Bir program satırını sadeleştirir. Döndürür: ('WAIT', None) | ('CMD', satır) | (None, None)
     Desteklenen Sinumerik yazımları: N10 etiketleri, WAITM()/WAITE()/WAITMC(), CR=…, X=516.374+1,
@@ -68,7 +87,7 @@ def _nc_line(raw):
     if not line:
         return None, None
     if re.match(r'^(WAIT[A-Z]*)\b', line, re.I):                  # WAIT, WAITM(…), WAITE(…), WAITMC(…)
-        return 'WAIT', None
+        return 'WAIT', _wait_info(line)
     if _NC_SKIP.match(line):
         return None, None
     line = re.sub(r'\bDIAM(ON|OF|90)\b', ' ', line, flags=re.I)
@@ -142,7 +161,7 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
 
     for cmd in commands:
         if cmd['type'] == 'WAIT':
-            _app({'type': 'wait'})
+            _app({'type': 'wait', **{k_: cmd[k_] for k_ in ('wkind', 'mark', 'chans') if k_ in cmd}})
             continue
 
         for _gv in cmd.get('Gs', [cmd['G']] if 'G' in cmd else []):
@@ -798,7 +817,7 @@ DIA_AXIS_CHOICES = [('Yatay eksen', 'X'), ('Dikey eksen', 'Y'), ('İkisi de', 'X
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1 + 1 + 5  # 36: kalıp(5) + çizilen yol modu + G0 hızı + eksenler(5: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı)
+N_CFG = MOLD_START + 5 + 1 + 1 + 6  # 37: kalıp(5) + çizilen yol modu + G0 hızı + eksenler(6: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon)
 N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
                                     # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
@@ -838,7 +857,8 @@ def cfg_from_values(v):
     mode = v[m + 5] if v[m + 5] in ('geometric', 'programmed') else 'geometric'
     g0 = _num(v[m + 6], DEFAULT_G0_FEED)
     return {'channels': channels, 'mold': mold, 'contact_mode': mode, 'g0_feed': g0,
-            'plane': plane_cfg(v[m + 7], v[m + 8], v[m + 9], v[m + 10], tip=v[m + 11])}
+            'plane': plane_cfg(v[m + 7], v[m + 8], v[m + 9], v[m + 10], tip=v[m + 11],
+                               prof_comp=v[m + 12] if len(v) > m + 12 else None)}
 
 
 def opts_from_values(v):
@@ -970,7 +990,7 @@ def _side_for(pc, flip, dir_letter):
 
 
 def plane_cfg(hl=None, vl=None, g42_dir=None, g42_side=None, tip=None, hneg=None, vneg=None,
-              plane=None, mirror=None):
+              plane=None, mirror=None, prof_comp=None):
     """hl / vl: DXF X (ekranda yatay) ve DXF Y (dikey) eksenlerinin programdaki karşılığı: 'X', '-X', 'Z' …
     g42_dir / g42_side: G42 kuralı, ör. 'Z+' yönünde ilerlerken takım 'X-' tarafında.
     plane / mirror / hneg / vneg yalnızca eski kayıtları okumak içindir (G42 kuralı verilmemişse onlardan hesaplanır)."""
@@ -979,7 +999,8 @@ def plane_cfg(hl=None, vl=None, g42_dir=None, g42_side=None, tip=None, hneg=None
     if vl == hl:
         vl = 'Y' if hl != 'Y' else 'X'
     pc = {'hl': hl, 'vl': vl, 'hneg': bool(hn or hneg), 'vneg': bool(vn or vneg),
-          'tip': tip if tip in TIP_VALUES else 'center'}
+          'tip': tip if tip in TIP_VALUES else 'center',
+          'prof_comp': True if prof_comp is None else bool(prof_comp)}
     pc['hsel'] = ('-' if pc['hneg'] else '') + hl
     pc['vsel'] = ('-' if pc['vneg'] else '') + vl
     if _dir_sel(g42_dir) is None or _dir_sel(g42_side) is None:
@@ -1004,7 +1025,7 @@ def plane_cfg_from_dict(d):
     hl = d.get('hsel') or (('-' if d.get('hneg') else '') + str(d.get('hl') or 'X').lstrip('-'))
     vl = d.get('vsel') or (('-' if d.get('vneg') else '') + str(d.get('vl') or 'Y').lstrip('-'))
     return plane_cfg(hl, vl, d.get('g42_dir'), d.get('g42_side'), d.get('tip'),
-                     plane=d.get('plane'), mirror=d.get('mirror'))
+                     plane=d.get('plane'), mirror=d.get('mirror'), prof_comp=d.get('prof_comp'))
 
 
 DEFAULT_PLANE = plane_cfg('X', 'Y', 'X+', 'Y-', 'center')
@@ -1112,7 +1133,7 @@ def nc_normalize_text(code):
     out = []
     for raw in (code or '').split('\n'):
         kind, line = _nc_line(raw)
-        out.append('WAIT' if kind == 'WAIT' else (line if kind == 'CMD' and line.strip() else ';'))
+        out.append((line or {}).get('text', 'WAIT') if kind == 'WAIT' else (line if kind == 'CMD' and line.strip() else ';'))
     return '\n'.join(out)
 
 
@@ -1249,6 +1270,10 @@ def build_channels_cfg(cfg):
         tr = ToolR(ch['tr'], ch.get('shape'))           # yarıçap (kompanzasyon) + varsa DXF makara profili
         segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
         segs = apply_corner_compensation(segs, float(tr))
+        if tool_shape(tr) is not None and pc.get('prof_comp', True):
+            segs, pn = apply_profile_compensation(segs, tool_shape(tr), float(tr))
+            if pn:
+                notes.append(f"Kanal {ci + 1}: {pn}")
         tv = tip_vector(pc, float(tr))
         if tv == 'bad':
             notes.append(f"Uyarı: Kanal {ci + 1}: takım referans kenarı ({pc['tip']}) ekran eksenlerinde değil — merkez kullanıldı.")
@@ -1266,7 +1291,225 @@ def build_channels_cfg(cfg):
         channels_segments.append(segs)
         start_points.append((x0, y0))
         radii.append(tr)
+    _tl, _T, sync_notes = synchronize_marks(channels_segments)
+    notes.extend(sync_notes)
     return channels_segments, start_points, radii, mold_points, "\n".join(notes)
+
+
+# -------------------------------------------------------------
+# KANALLAR ARASI BEKLEME (Sinumerik WAITM / WAITE / WAIT)
+# -------------------------------------------------------------
+def synchronize_marks(channels_segments):
+    """WAITM(işaret, kanal, kanal…) yalnız listelenen kanalları aynı işaret numarasında buluşturur (kendi kanalı her
+    zaman dahil; olmayan kanal numaraları yok sayılır). WAITE(kanallar): o kanalların program sonunu bekler.
+    Düz WAIT: tüm kanallar n'inci düz WAIT'lerinde buluşur (WAIT'i olmayan kanal için program sonu beklenir).
+    Döndürür: (timelines, toplam_süre, notlar) — timelines[i] = [(t0, t1, segment), …]"""
+    n = len(channels_segments)
+    tl = [[] for _ in range(n)]
+    t, idx = [0.0] * n, [0] * n
+    done, blocked = [False] * n, [None] * n
+    occ = [dict() for _ in range(n)]
+    arr = {}                                  # (anahtar, sıra) → {kanal: varış zamanı}
+    notes, warned = [], set()
+
+    def _members(seg, ci):
+        k = seg.get('wkind', 'P')
+        ch = {c - 1 for c in (seg.get('chans') or []) if 1 <= c <= n}
+        bad = [c for c in (seg.get('chans') or []) if not 1 <= c <= n]
+        if bad and ('bad', ci, tuple(bad)) not in warned:
+            warned.add(('bad', ci, tuple(bad)))
+            notes.append(f"Not: Kanal {ci + 1}, satır {(seg.get('line') or 0) + 1}: bekleme komutundaki kanal "
+                         f"{', '.join(map(str, bad))} simülasyonda yok — yok sayıldı.")
+        if k == 'M':
+            return ('M', seg.get('mark')), ch | {ci}, 'M'
+        if k == 'E':
+            return None, ch - {ci}, 'E'
+        return ('P',), set(range(n)), 'P'
+
+    while True:
+        moved = True
+        while moved:
+            moved = False
+            for ci in range(n):
+                if done[ci] or blocked[ci] is not None:
+                    continue
+                segs = channels_segments[ci]
+                while idx[ci] < len(segs):
+                    seg = segs[idx[ci]]
+                    idx[ci] += 1
+                    if seg['type'] == 'wait':
+                        key, mem, kind = _members(seg, ci)
+                        o = None
+                        if key is not None:
+                            occ[ci][key] = o = occ[ci].get(key, 0) + 1
+                            arr.setdefault((key, o), {})[ci] = t[ci]
+                        blocked[ci] = (key, o, mem, kind, seg)
+                        break
+                    dur = float(seg.get('duration', 0.0) or 0.0)
+                    tl[ci].append((t[ci], t[ci] + dur, seg))
+                    t[ci] += dur
+                else:
+                    done[ci] = True
+                moved = True
+            for ci in range(n):
+                b = blocked[ci]
+                if b is None:
+                    continue
+                key, o, mem, kind, seg = b
+                if kind == 'E':
+                    if all(done[c] for c in mem):
+                        t[ci] = max([t[ci]] + [t[c] for c in mem])
+                        blocked[ci] = None
+                        moved = True
+                    continue
+                got = arr.get((key, o), {})
+                if all(c in got or done[c] for c in mem):
+                    miss = [c for c in mem if c not in got]
+                    if miss and kind == 'M' and ('miss', ci, key, o) not in warned:
+                        warned.add(('miss', ci, key, o))
+                        notes.append(f"Uyarı: Kanal {ci + 1}, satır {(seg.get('line') or 0) + 1}: "
+                                     f"WAITM({key[1]}) için kanal {', '.join(str(c + 1) for c in miss)} bu işarete hiç "
+                                     f"gelmiyor — makinede bu kanal sonsuza kadar bekler; simülasyonda o kanalın "
+                                     f"program sonu beklendi.")
+                    t[ci] = max([got[c] for c in got if c in mem] + [t[c] for c in miss] + [t[ci]])
+                    blocked[ci] = None
+                    moved = True
+        if all(done):
+            break
+        stuck = [ci for ci in range(n) if blocked[ci] is not None]
+        if not stuck:
+            break
+        notes.append("Uyarı: kanallar birbirini karşılıklı bekliyor (kilitlenme: " +
+                     ", ".join(f"Kanal {ci + 1} satır {(blocked[ci][4].get('line') or 0) + 1}" for ci in stuck) +
+                     ") — makinede program durur; simülasyonda beklemeler bırakıldı.")
+        tmax = max(t[ci] for ci in stuck)
+        for ci in stuck:
+            t[ci] = tmax
+            blocked[ci] = None
+    return tl, (max(t) if t else 0.0), notes
+
+
+def synchronize(channels_segments):
+    """Kanalları WAIT / WAITM / WAITE komutlarına göre zaman çizelgesine yerleştirir. Döndürür: (timelines, toplam_süre)"""
+    tl, T, _n = synchronize_marks(channels_segments)
+    return tl, T
+
+
+# -------------------------------------------------------------
+# MAKARA PROFİLİNE GÖRE KOMPANZASYON
+# Daire kompanzasyonu merkezi konturdan R kadar uzaklaştırır; DXF profili daire değilse bitmiş ürün konturdan
+# ayrılır. Burada her merkez noktası için konturun en yakın noktası q ve yön n bulunur, profilin o yöndeki en uç
+# noktası p* konturun üstüne konur: merkez = q − p*. Böylece profil konturu her yerde tam teğet olarak izler.
+# -------------------------------------------------------------
+def _hull(P):
+    P = sorted(set(map(tuple, np.round(np.asarray(P, float), 9))))
+    if len(P) < 3:
+        return np.asarray(P, float)
+    cr = lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lo, up = [], []
+    for p in P:
+        while len(lo) >= 2 and cr(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    for p in reversed(P):
+        while len(up) >= 2 and cr(up[-2], up[-1], p) <= 0:
+            up.pop()
+        up.append(p)
+    return np.asarray(lo[:-1] + up[:-1], float)
+
+
+def _nearest_on(Q0, Q1, c):
+    """Kontur kenarları (Q0→Q1) üzerinde c'ye en yakın nokta."""
+    d = Q1 - Q0
+    L2 = np.maximum((d * d).sum(1), 1e-18)
+    t = np.clip(((c - Q0) * d).sum(1) / L2, 0.0, 1.0)
+    F = Q0 + d * t[:, None]
+    k = int(np.argmin(((F - c) ** 2).sum(1)))
+    return F[k]
+
+
+def _line_x(a0, a1, b0, b1):
+    da, db = a1 - a0, b1 - b0
+    den = da[0] * db[1] - da[1] * db[0]
+    if abs(den) < 1e-12:
+        return None
+    t = ((b0[0] - a0[0]) * db[1] - (b0[1] - a0[1]) * db[0]) / den
+    return a0 + da * t
+
+
+def apply_profile_compensation(segs, shape, R):
+    """G41/G42 bloklarında makara merkezini DXF profilinin konturla teğet olacağı yere taşır. Döndürür: (segs, not)"""
+    H = _hull(shape)
+    if len(H) < 3 or R <= 0:
+        return segs, ''
+    comp = [i for i, s_ in enumerate(segs) if s_['type'] == 'move' and s_.get('comp_mode') in ('G41', 'G42')
+            and not s_.get('approach') and len(s_.get('orig_points') or []) >= 1]
+    if not comp:
+        return segs, ''
+    E0, E1 = [], []
+    for i in comp:
+        O = np.asarray(segs[i]['orig_points'], float)
+        if len(O) == 1:
+            O = np.vstack([O, O])
+        E0.append(O[:-1]); E1.append(O[1:])
+    Q0, Q1 = np.vstack(E0), np.vstack(E1)
+    hs, changed = [], set()
+    for i in comp:
+        s_ = segs[i]
+        P = np.asarray(s_['points'], float)
+        NP = P.copy()
+        for k, c in enumerate(P):
+            q = _nearest_on(Q0, Q1, c)
+            d = float(np.hypot(*(c - q)))
+            if d < 1e-9 or abs(d - R) > 0.02 * R + 1e-3:
+                continue                           # iç köşe kesişimi / kompanzasyon dışı nokta: aşağıda düzeltilir
+            n = (c - q) / d
+            ps = H[int(np.argmax(H @ (-n)))]
+            NP[k] = q - ps
+            hs.append(float(ps @ (-n)))
+        if not np.allclose(NP, P):
+            s_['points'] = [tuple(map(float, p)) for p in NP]
+            s_['prof_comp'] = True
+            changed.add(i)
+    if not changed:
+        return segs, ''
+    # iç köşeler: iki doğru bloğun yeni uçlarını kesişim noktasında birleştir
+    for a, b in zip(comp, comp[1:]):
+        A, B = segs[a], segs[b]
+        pa, pb = np.asarray(A['points'], float), np.asarray(B['points'], float)
+        if np.hypot(*(pa[-1] - pb[0])) < 1e-6:
+            continue
+        if A.get('kind') == 'line' and B.get('kind') == 'line' and len(pa) >= 2 and len(pb) >= 2:
+            X = _line_x(pa[-2], pa[-1], pb[0], pb[1])
+            if X is not None and np.hypot(*(X - pa[-1])) < 3 * R:
+                A['points'] = A['points'][:-1] + [tuple(map(float, X))]
+                B['points'] = [tuple(map(float, X))] + B['points'][1:]
+                continue
+        B['points'] = [tuple(A['points'][-1])] + B['points'][1:]
+    # yaklaşma / ayrılma blokları yeni başlangıç / bitiş noktalarına uzatılır
+    for i, s_ in enumerate(segs):
+        if s_['type'] != 'move' or i in changed:
+            continue
+        P = np.asarray(s_['points'], float)
+        if len(P) < 2:
+            continue
+        nxt = next((j for j in range(i + 1, len(segs)) if segs[j]['type'] == 'move'), None)
+        prv = next((j for j in range(i - 1, -1, -1) if segs[j]['type'] == 'move'), None)
+        w = np.linspace(0.0, 1.0, len(P))[:, None]
+        if nxt in changed:
+            P = P + w * (np.asarray(segs[nxt]['points'][0], float) - P[-1])
+        if prv in changed:
+            P = P + (1 - w) * (np.asarray(segs[prv]['points'][-1], float) - P[0])
+        s_['points'] = [tuple(map(float, p)) for p in P]
+    note = ''
+    if hs:
+        lo, hi = min(hs), max(hs)
+        note = (f"kompanzasyon DXF makara profiline göre yapıldı (profil konturu teğet izler). Bu yolda profilin "
+                f"merkezden temas mesafesi {lo:.2f}–{hi:.2f} mm, takım yarıçapı {R:g} mm.")
+        if hi - lo > 0.05 * R or abs(hi - R) > 0.05 * R or abs(lo - R) > 0.05 * R:
+            note += (" ⚠️ Profil burnu bu R ile dairesel değil: makinede takım tablosundaki R / kesici konumu "
+                     "profile uymuyorsa gerçek parça bu simülasyondan farklı olur (eski yorum için seçeneği kapatın).")
+    return segs, note
 
 
 # ===== Hücre 14 =====
@@ -2707,6 +2950,9 @@ def radial_guard(chains, radial):
     P = np.vstack(pts)
     cross = lambda k: float(P[:, k].min()) < -0.5 and float(P[:, k].max()) > 0.5
     k = 0 if radial == 'X' else 1
+    if cross(k) and cross(1 - k):
+        return radial, ("UYARI: Ön form her iki eksende de 0 çizgisinin iki tarafına geçiyor — tam kesit veya çap "
+                        "çizilmiş görünüyor. Ön formu dönme ekseninin bir tarafında, yarıçap değerleriyle (yarım kesit) çizin.")
     if cross(k) and not cross(1 - k):
         other = 'Y' if radial == 'X' else 'X'
         return other, (f"UYARI: Ön form {radial}=0 çizgisinin iki tarafına geçiyor; {radial} parça yarıçapı olamaz. "
@@ -4040,6 +4286,10 @@ def dxf_to_mold(path, face='outer', radial='X', reverse=False, tol=MOLD_FIT_TOL)
     if closed and face != 'all':
         P = _split_face(P, ri, face)
         notes.append(f"Kapalı kontur: {'dış' if face == 'outer' else 'iç'} yüz alındı (parça yarıçapı ekseni {radial}).")
+    if float(P[:, ri].min()) < -0.5 and float(P[:, ri].max()) > 0.5:
+        notes.append(f"⚠️ UYARI: Kalıp yarıçap ekseninin ({radial}) 0 çizgisinin iki tarafına geçiyor — tam kesit veya "
+                     f"çap çizilmiş görünüyor. Kalıbı dönme ekseninin bir tarafında, yarıçap değerleriyle çizin "
+                     f"(ya da 'Parça yarıçapı ekseni' seçimini kontrol edin).")
     ai = 1 - ri
     if not closed or face != 'all':
         if P[0, ai] < P[-1, ai]:
@@ -4837,10 +5087,10 @@ def json_dict_to_updates(data, gr_update):
     plc = st.get('plane') if isinstance(st.get('plane'), dict) else (data.get('plane') if isinstance(data.get('plane'), dict) else {})
     if plc:
         _pc = plane_cfg_from_dict(plc)            # eski (düzlem + ayna) kayıtlar aynı yön kuralına çevrilir
-        for key in ('hsel', 'vsel', 'g42_dir', 'g42_side', 'tip'):
+        for key in ('hsel', 'vsel', 'g42_dir', 'g42_side', 'tip', 'prof_comp'):
             ups.append(gr_update(value=_pc[key]))
     else:
-        ups += [gr_update()] * 5
+        ups += [gr_update()] * 6
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
     ac = data.get('autocad', {}) or {}
@@ -6008,7 +6258,10 @@ def export_json(*vals):
         path = os.path.join(out_dir, 'gcode_simulator_config.json')
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-        return path, "Konfigürasyon 'gcode_simulator_config.json' olarak hazırlandı — yukarıdaki dosya kutusundan indirebilirsin."
+        _tp = [f"Kanal {c['channel_id']}: {c['tool_dxf'].get('name') or 'profil'}" for c in data['channels'] if c.get('tool_dxf')]
+        return path, ("Konfigürasyon 'gcode_simulator_config.json' olarak hazırlandı — yukarıdaki dosya kutusundan indirebilirsin.\n"
+                      + ("Makara profilleri JSON'a eklendi: " + "; ".join(_tp) if _tp else
+                         "Makara profili yüklü değil — kanallar takım yarıçaplı daire olarak kaydedildi."))
     except Exception:
         return None, "JSON dışa aktarılırken hata oluştu:\n" + traceback.format_exc()
 
@@ -6022,7 +6275,11 @@ def import_json(file_obj):
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         ups = json_dict_to_updates(data, gr.update)
-        return tuple(ups) + ("JSON yüklendi ve arayüz güncellendi. Simülasyonu güncellemek için 'Çalıştır' butonuna bas.",)
+        _tp = [f"Kanal {k + 1}: {c['tool_dxf'].get('name') or 'profil'}" for k, c in enumerate(data.get('channels') or [])
+               if isinstance(c, dict) and isinstance(c.get('tool_dxf'), dict) and c['tool_dxf'].get('shape')]
+        return tuple(ups) + ("JSON yüklendi ve arayüz güncellendi. Simülasyonu güncellemek için 'Çalıştır' butonuna bas.\n"
+                             + ("Makara profilleri JSON'dan yüklendi (önizlemeler kanal kutularında): " + "; ".join(_tp)
+                                if _tp else "JSON'da makara profili yok — kanallar takım yarıçaplı daire."),)
     except Exception as e:
         return tuple([gr.update()] * (n_out - 1) + [f"JSON yüklenirken hata oluştu. Dosya formatını kontrol et: {e}"])
 
@@ -6342,7 +6599,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                 with gr.Accordion("Kalıbı DXF'ten oluştur", open=False):
                     gr.Markdown("Kalıp kesitini DXF olarak yükle: çizgiler doğru + yay olarak **kalıp G-koduna** (G1 / G2 / G3 R) "
                                 "çevrilip yukarıdaki alanlara yazılır. Açık çizgi olduğu gibi alınır; kapalı konturda seçilen yüz alınır. "
-                                "Saklamak için **Kalıbı JSON olarak indir** — sonra 'JSON Ayar Dosyası Yükle' ile geri yükle.")
+                                "Saklamak için **Kalıbı JSON olarak indir** — sonra 'JSON Ayar Dosyası Yükle' ile geri yükle.  \n"
+                                + '⚠️ **Yarıçap çizin:** kesiti dönme ekseninin yalnız **bir tarafında** (yarım kesit) ve **yarıçap** değerleriyle çizin — dönme ekseni = yarıçap ekseninin 0 çizgisi. Çap değerleriyle veya eksenin iki tarafına uzanan tam kesit çizilirse kalıp / hacim / kalınlık yanlış çıkar.')
                     mold_file = gr.File(label="Kalıp DXF yükle", file_types=[".dxf"], file_count="single")
                     with gr.Row():
                         mold_face = gr.Dropdown(MOLD_FACE_CHOICES, value='outer', label="Kapalı konturda kullanılacak yüz")
@@ -6377,8 +6635,12 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                      label="G40'ta programlanan nokta (takım referansı / kesici uç konumu)",
                                      info="Sinumerik'te makara çoğu zaman kenarından ölçülür: G40 ile X700'e giderken "
                                           "merkez X ekseninde R kadar dışarıdadır. G41/G42 açıkken etkisi yoktur.")
+                pl_prof = gr.Checkbox(value=True, label="Kompanzasyonu DXF makara profiline göre yap",
+                                      info="Açık: makara profili konturu her yerde teğet izler (bitmiş ürün = kontur). "
+                                           "Kapalı: makine gibi yalnız takım yarıçapı R'lik daire kompanze edilir; profil "
+                                           "burnu bu daireye uymuyorsa eğik / yay bölgelerde ürün konturdan ayrılır.")
                 pl_legend = gr.Markdown(plane_legend(DEFAULT_PLANE))
-            plane_comps = [pl_hl, pl_vl, pl_gdir, pl_gside, pl_tip]
+            plane_comps = [pl_hl, pl_vl, pl_gdir, pl_gside, pl_tip, pl_prof]
             cfg_comps += plane_comps
 
             with gr.Accordion("Grafik eksen adları", open=False):
@@ -6402,7 +6664,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                             "ön formun eksen yönündeki kalınlığı t₀ okunur, malzeme aynı yarıçapta kalıba sıvanır ve "
                             "ideal et kalınlığı **t₀·sin α** olur (α: kalıp yüzeyi ile dönme ekseni arası açı). Gerçek et "
                             "kalınlığı takım boşluğudur; fark aşırı / eksik inceltme olarak gösterilir. "
-                            "Okunan nesneler: LINE, POLYLINE, LWPOLYLINE, ARC, CIRCLE, ELLIPSE, SPLINE (bloklar için EXPLODE).")
+                            "Okunan nesneler: LINE, POLYLINE, LWPOLYLINE, ARC, CIRCLE, ELLIPSE, SPLINE (bloklar için EXPLODE).  \n"
+                            + '⚠️ **Yarıçap çizin:** kesiti dönme ekseninin yalnız **bir tarafında** (yarım kesit) ve **yarıçap** değerleriyle çizin — dönme ekseni = yarıçap ekseninin 0 çizgisi. Çap değerleriyle veya eksenin iki tarafına uzanan tam kesit çizilirse kalıp / hacim / kalınlık yanlış çıkar.')
                 pf_file = gr.File(label="Ön form DXF yükle", file_types=[".dxf"], file_count="single")
                 pf_layers = gr.CheckboxGroup(choices=[], value=[], label="Kullanılacak DXF katmanları")
                 pf_model = gr.Dropdown(PF_MODEL_CHOICES, value='strip', label="Ön form modeli")
