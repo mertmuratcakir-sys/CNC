@@ -817,7 +817,7 @@ DIA_AXIS_CHOICES = [('Yatay eksen', 'X'), ('Dikey eksen', 'Y'), ('İkisi de', 'X
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1 + 1 + 6  # 37: kalıp(5) + çizilen yol modu + G0 hızı + eksenler(6: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon)
+N_CFG = MOLD_START + 5 + 1 + 1 + 8  # 39: kalıp(5) + çizilen yol modu + G0 hızı + eksenler(8: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon, köşe kesişim açısı, küçük iç yayı atla)
 N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
                                     # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
@@ -858,7 +858,9 @@ def cfg_from_values(v):
     g0 = _num(v[m + 6], DEFAULT_G0_FEED)
     return {'channels': channels, 'mold': mold, 'contact_mode': mode, 'g0_feed': g0,
             'plane': plane_cfg(v[m + 7], v[m + 8], v[m + 9], v[m + 10], tip=v[m + 11],
-                               prof_comp=v[m + 12] if len(v) > m + 12 else None)}
+                               prof_comp=v[m + 12] if len(v) > m + 12 else None,
+                               ins_limit=v[m + 13] if len(v) > m + 13 else None,
+                               skip_arcs=v[m + 14] if len(v) > m + 14 else None)}
 
 
 def opts_from_values(v):
@@ -989,8 +991,16 @@ def _side_for(pc, flip, dir_letter):
     return f"{other}-"
 
 
+def _num_or(x, default):
+    try:
+        x = float(x)
+        return x if np.isfinite(x) and x >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def plane_cfg(hl=None, vl=None, g42_dir=None, g42_side=None, tip=None, hneg=None, vneg=None,
-              plane=None, mirror=None, prof_comp=None):
+              plane=None, mirror=None, prof_comp=None, ins_limit=None, skip_arcs=None):
     """hl / vl: DXF X (ekranda yatay) ve DXF Y (dikey) eksenlerinin programdaki karşılığı: 'X', '-X', 'Z' …
     g42_dir / g42_side: G42 kuralı, ör. 'Z+' yönünde ilerlerken takım 'X-' tarafında.
     plane / mirror / hneg / vneg yalnızca eski kayıtları okumak içindir (G42 kuralı verilmemişse onlardan hesaplanır)."""
@@ -1000,7 +1010,9 @@ def plane_cfg(hl=None, vl=None, g42_dir=None, g42_side=None, tip=None, hneg=None
         vl = 'Y' if hl != 'Y' else 'X'
     pc = {'hl': hl, 'vl': vl, 'hneg': bool(hn or hneg), 'vneg': bool(vn or vneg),
           'tip': tip if tip in TIP_VALUES else 'center',
-          'prof_comp': True if prof_comp is None else bool(prof_comp)}
+          'prof_comp': True if prof_comp is None else bool(prof_comp),
+          'ins_limit': _num_or(ins_limit, 10.0),
+          'skip_arcs': True if skip_arcs is None else bool(skip_arcs)}
     pc['hsel'] = ('-' if pc['hneg'] else '') + hl
     pc['vsel'] = ('-' if pc['vneg'] else '') + vl
     if _dir_sel(g42_dir) is None or _dir_sel(g42_side) is None:
@@ -1025,7 +1037,8 @@ def plane_cfg_from_dict(d):
     hl = d.get('hsel') or (('-' if d.get('hneg') else '') + str(d.get('hl') or 'X').lstrip('-'))
     vl = d.get('vsel') or (('-' if d.get('vneg') else '') + str(d.get('vl') or 'Y').lstrip('-'))
     return plane_cfg(hl, vl, d.get('g42_dir'), d.get('g42_side'), d.get('tip'),
-                     plane=d.get('plane'), mirror=d.get('mirror'), prof_comp=d.get('prof_comp'))
+                     plane=d.get('plane'), mirror=d.get('mirror'), prof_comp=d.get('prof_comp'),
+                     ins_limit=d.get('ins_limit'), skip_arcs=d.get('skip_arcs'))
 
 
 DEFAULT_PLANE = plane_cfg('X', 'Y', 'X+', 'Y-', 'center')
@@ -1270,6 +1283,8 @@ def build_channels_cfg(cfg):
         tr = ToolR(ch['tr'], ch.get('shape'))           # yarıçap (kompanzasyon) + varsa DXF makara profili
         segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
         segs = apply_corner_compensation(segs, float(tr))
+        segs, cn = apply_sinumerik_corners(segs, float(tr), pc.get('ins_limit', 10.0), pc.get('skip_arcs', True))
+        notes.extend(f"Kanal {ci + 1}: {t_}" for t_ in cn)
         if tool_shape(tr) is not None and pc.get('prof_comp', True):
             segs, pn = apply_profile_compensation(segs, tool_shape(tr), float(tr))
             if pn:
@@ -1510,6 +1525,161 @@ def apply_profile_compensation(segs, shape, R):
             note += (" ⚠️ Profil burnu bu R ile dairesel değil: makinede takım tablosundaki R / kesici konumu "
                      "profile uymuyorsa gerçek parça bu simülasyondan farklı olur (eski yorum için seçeneği kapatın).")
     return segs, note
+
+
+# -------------------------------------------------------------
+# SİNUMERİK KÖŞE KURALLARI (seçmeli)
+# 1) Dış köşe açısı sınırın altındaysa (MD 20230 $MC_CUTCOM_CURVE_INSERT_LIMIT, genelde 10°) geçiş yayı eklenmez;
+#    iki kompanzeli yolun kesişim noktasına gidilir.
+# 2) İç yayın yarıçapı takım yarıçapından küçükse (takım sığmıyor) blok atlanır; önceki ve sonraki kompanzeli
+#    yollar kesişim noktasında birleştirilir (kontur ihlali denetimi / CDON benzeri).
+# -------------------------------------------------------------
+def _prim(seg):
+    if seg.get('kind') == 'arc' and seg.get('center') is not None and float(seg.get('radius') or 0) > 0.02:
+        return ('c', np.asarray(seg['center'], float), float(seg['radius']))
+    P = np.asarray(seg['points'], float)
+    return ('l', P[0], P[-1])
+
+
+def _isect(A, B):
+    out = []
+    if A[0] == 'l' and B[0] == 'l':
+        X = _line_x(A[1], A[2], B[1], B[2])
+        return [] if X is None else [X]
+    if A[0] == 'c' and B[0] == 'l':
+        A, B = B, A
+    if A[0] == 'l' and B[0] == 'c':
+        p, d = A[1], A[2] - A[1]
+        L = np.hypot(*d)
+        if L < 1e-12:
+            return []
+        d = d / L
+        f = p - B[1]
+        b_, c_ = f @ d, f @ f - B[2] ** 2
+        disc = b_ * b_ - c_
+        if disc < 0:
+            return []
+        for t in (-b_ - np.sqrt(disc), -b_ + np.sqrt(disc)):
+            out.append(p + d * t)
+        return out
+    c1, r1, c2, r2 = A[1], A[2], B[1], B[2]
+    dv = c2 - c1
+    D = np.hypot(*dv)
+    if D < 1e-12 or D > r1 + r2 or D < abs(r1 - r2):
+        return []
+    a = (r1 * r1 - r2 * r2 + D * D) / (2 * D)
+    h = np.sqrt(max(r1 * r1 - a * a, 0.0))
+    m = c1 + dv * (a / D)
+    n = np.array([-dv[1], dv[0]]) / D
+    return [m + n * h, m - n * h]
+
+
+def _seg_len(P):
+    P = np.asarray(P, float)
+    return float(np.hypot(*np.diff(P, axis=0).T).sum()) if len(P) > 1 else 0.0
+
+
+def _retime(seg):
+    f = float(seg.get('feed') or 0)
+    if f > 0 and not seg.get('g0'):
+        seg['duration'] = _seg_len(seg['points']) / f * 60.0
+
+
+def _set_end(seg, X, at_end=True):
+    """Bloğun kompanzeli yolunu X'te bitir (at_end) ya da X'ten başlat."""
+    X = np.asarray(X, float)
+    if seg.get('kind') == 'arc' and seg.get('center') is not None and float(seg.get('radius') or 0) > 0.02:
+        c, rr = np.asarray(seg['center'], float), float(seg['radius'])
+        a0, a1 = float(seg['start_ang']), float(seg['end_ang'])
+        ax = float(np.arctan2(X[1] - c[1], X[0] - c[0]))
+        ref = a1 if at_end else a0
+        ax = ref + (ax - ref + np.pi) % (2 * np.pi) - np.pi
+        if at_end:
+            a1 = ax
+        else:
+            a0 = ax
+        seg['start_ang'], seg['end_ang'] = a0, a1
+        pts = _resample_arc(tuple(c), rr, a0, a1)
+        pts[0 if not at_end else -1] = tuple(map(float, X))
+        seg['points'] = pts
+    else:
+        P = list(seg['points'])
+        if at_end:
+            P[-1] = tuple(map(float, X))
+        else:
+            P[0] = tuple(map(float, X))
+        seg['points'] = P
+    _retime(seg)
+
+
+def _join_at(A, B, ref, maxd):
+    """A ile B'nin kompanzeli yollarını ref'e en yakın kesişim noktasında birleştirir; başarılıysa True."""
+    cand = [X for X in _isect(_prim(A), _prim(B)) if np.all(np.isfinite(X))]
+    if not cand:
+        return False
+    X = min(cand, key=lambda q: np.hypot(*(q - ref)))
+    if np.hypot(*(X - ref)) > maxd:
+        return False
+    _set_end(A, X, True)
+    _set_end(B, X, False)
+    return True
+
+
+def _corner_deg(A, B):
+    ta, tb = np.asarray(A['tangent_end'], float), np.asarray(B['tangent_start'], float)
+    return abs(float(np.degrees(np.arctan2(ta[0] * tb[1] - ta[1] * tb[0], ta @ tb))))
+
+
+def apply_sinumerik_corners(segs, R, ins_limit=10.0, skip_arcs=True):
+    notes = []
+    comp = lambda s_: s_['type'] == 'move' and s_.get('comp_mode') in ('G41', 'G42')
+    # 2) takımın sığmadığı iç yaylar
+    if skip_arcs and R > 0:
+        i = 0
+        while i < len(segs):
+            s_ = segs[i]
+            if comp(s_) and s_.get('kind') == 'arc' and float(s_.get('orig_radius') or 1e9) < R - 1e-9 \
+                    and float(s_.get('radius') or 0) <= 0.02:
+                ia = next((j for j in range(i - 1, -1, -1) if segs[j]['type'] == 'move' and segs[j].get('kind') != 'fillet'), None)
+                ib = next((j for j in range(i + 1, len(segs)) if segs[j]['type'] == 'move' and segs[j].get('kind') != 'fillet'), None)
+                ok = False
+                if ia is not None and ib is not None and comp(segs[ia]) and comp(segs[ib]) \
+                        and not segs[ia].get('approach'):
+                    ref = np.asarray(s_['center'], float)
+                    ok = _join_at(segs[ia], segs[ib], ref, 3 * R + float(s_.get('orig_radius') or 0))
+                if ok:
+                    ln = (s_.get('line') or 0) + 1
+                    drop = {i} | {j for j in range(ia + 1, ib) if segs[j]['type'] == 'move' and segs[j].get('kind') == 'fillet'}
+                    segs[ia].pop('comp_warn', None)
+                    notes.append(f"satır {ln}: iç yayın yarıçapı ({float(s_['orig_radius']):g}) takım yarıçapından ({R:g}) küçük — "
+                                 f"blok atlandı, önceki ve sonraki blok kesişim noktasında birleştirildi (makinedeki gibi).")
+                    segs = [x for j, x in enumerate(segs) if j not in drop]
+                    i = ia + 1
+                    continue
+            i += 1
+    # 1) küçük açılı dış köşelerde geçiş yayı yerine kesişim noktası
+    if ins_limit and ins_limit > 0:
+        out, i = [], 0
+        while i < len(segs):
+            s_ = segs[i]
+            if s_['type'] == 'move' and s_.get('kind') == 'fillet' and comp(s_) and out:
+                ia = next((j for j in range(len(out) - 1, -1, -1) if out[j]['type'] == 'move'), None)
+                ib = next((j for j in range(i + 1, len(segs)) if segs[j]['type'] == 'move'), None)
+                if ia is not None and ib is not None and comp(out[ia]) and comp(segs[ib]) and not out[ia].get('approach'):
+                    A, B = out[ia], segs[ib]
+                    th = _corner_deg(A, B)
+                    if th < ins_limit:
+                        ref = np.asarray(A['points'][-1], float)
+                        maxd = R * np.tan(np.radians(min(th, 89.0)) / 2) * 3 + 0.05
+                        if th < 1e-3 or _join_at(A, B, ref, maxd):
+                            if th < 1e-3:
+                                _set_end(B, A['points'][-1], False)
+                            i += 1
+                            continue                       # geçiş yayı çıkarıldı
+            out.append(s_)
+            i += 1
+        segs = out
+    return segs, notes
 
 
 # ===== Hücre 14 =====
@@ -5087,10 +5257,10 @@ def json_dict_to_updates(data, gr_update):
     plc = st.get('plane') if isinstance(st.get('plane'), dict) else (data.get('plane') if isinstance(data.get('plane'), dict) else {})
     if plc:
         _pc = plane_cfg_from_dict(plc)            # eski (düzlem + ayna) kayıtlar aynı yön kuralına çevrilir
-        for key in ('hsel', 'vsel', 'g42_dir', 'g42_side', 'tip', 'prof_comp'):
+        for key in ('hsel', 'vsel', 'g42_dir', 'g42_side', 'tip', 'prof_comp', 'ins_limit', 'skip_arcs'):
             ups.append(gr_update(value=_pc[key]))
     else:
-        ups += [gr_update()] * 6
+        ups += [gr_update()] * 8
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
     ac = data.get('autocad', {}) or {}
@@ -6639,8 +6809,16 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                       info="Açık: makara profili konturu her yerde teğet izler (bitmiş ürün = kontur). "
                                            "Kapalı: makine gibi yalnız takım yarıçapı R'lik daire kompanze edilir; profil "
                                            "burnu bu daireye uymuyorsa eğik / yay bölgelerde ürün konturdan ayrılır.")
+                with gr.Row():
+                    pl_ins = gr.Number(value=10, minimum=0, maximum=90, label="Dış köşe kesişim sınırı (°)",
+                                       info="Dış köşe açısı bu değerden küçükse geçiş yayı eklenmez, iki kompanzeli yolun "
+                                            "kesişim noktasına gidilir (Sinumerik MD 20230 CUTCOM_CURVE_INSERT_LIMIT, genelde 10°). "
+                                            "0 = kapalı (her dış köşede geçiş yayı).")
+                    pl_skip = gr.Checkbox(value=True, label="Takımın sığmadığı iç yayı atla",
+                                          info="İç yayın yarıçapı takım yarıçapından küçükse blok atlanır, önceki ve sonraki "
+                                               "blok kesişim noktasında birleşir (makinedeki gibi). Kapalı: yayda ilmek oluşur.")
                 pl_legend = gr.Markdown(plane_legend(DEFAULT_PLANE))
-            plane_comps = [pl_hl, pl_vl, pl_gdir, pl_gside, pl_tip, pl_prof]
+            plane_comps = [pl_hl, pl_vl, pl_gdir, pl_gside, pl_tip, pl_prof, pl_ins, pl_skip]
             cfg_comps += plane_comps
 
             with gr.Accordion("Grafik eksen adları", open=False):
