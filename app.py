@@ -1010,7 +1010,7 @@ def plane_cfg(hl=None, vl=None, g42_dir=None, g42_side=None, tip=None, hneg=None
         vl = 'Y' if hl != 'Y' else 'X'
     pc = {'hl': hl, 'vl': vl, 'hneg': bool(hn or hneg), 'vneg': bool(vn or vneg),
           'tip': tip if tip in TIP_VALUES else 'center',
-          'prof_comp': True if prof_comp is None else bool(prof_comp),
+          'profile_contact': bool(prof_comp) if prof_comp is not None else False,
           'ins_limit': _num_or(ins_limit, 10.0),
           'skip_arcs': True if skip_arcs is None else bool(skip_arcs)}
     pc['hsel'] = ('-' if pc['hneg'] else '') + hl
@@ -1037,7 +1037,7 @@ def plane_cfg_from_dict(d):
     hl = d.get('hsel') or (('-' if d.get('hneg') else '') + str(d.get('hl') or 'X').lstrip('-'))
     vl = d.get('vsel') or (('-' if d.get('vneg') else '') + str(d.get('vl') or 'Y').lstrip('-'))
     return plane_cfg(hl, vl, d.get('g42_dir'), d.get('g42_side'), d.get('tip'),
-                     plane=d.get('plane'), mirror=d.get('mirror'), prof_comp=d.get('prof_comp'),
+                     plane=d.get('plane'), mirror=d.get('mirror'), prof_comp=d.get('profile_contact'),   # eski 'prof_comp' anahtarı yok sayılır
                      ins_limit=d.get('ins_limit'), skip_arcs=d.get('skip_arcs'))
 
 
@@ -1285,8 +1285,12 @@ def build_channels_cfg(cfg):
         segs = apply_corner_compensation(segs, float(tr))
         segs, cn = apply_sinumerik_corners(segs, float(tr), pc.get('ins_limit', 10.0), pc.get('skip_arcs', True))
         notes.extend(f"Kanal {ci + 1}: {t_}" for t_ in cn)
-        if tool_shape(tr) is not None and pc.get('prof_comp', True):
+        if tool_shape(tr) is not None and pc.get('profile_contact', False):
             segs, pn = apply_profile_compensation(segs, tool_shape(tr), float(tr))
+            if pn:
+                notes.append(f"Kanal {ci + 1}: {pn}")
+        elif tool_shape(tr) is not None:
+            pn = profile_fit_note(segs, tool_shape(tr), float(tr))
             if pn:
                 notes.append(f"Kanal {ci + 1}: {pn}")
         tv = tip_vector(pc, float(tr))
@@ -1680,6 +1684,36 @@ def apply_sinumerik_corners(segs, R, ins_limit=10.0, skip_arcs=True):
             i += 1
         segs = out
     return segs, notes
+
+
+def profile_fit_note(segs, shape, R):
+    """Makine gibi R kompanzasyonunda DXF profilinin bu yolda R dairesine ne kadar uyduğunu raporlar."""
+    H = _hull(shape)
+    if len(H) < 3 or R <= 0:
+        return ''
+    hs = []
+    for s_ in segs:
+        if s_['type'] != 'move' or s_.get('comp_mode') not in ('G41', 'G42') or s_.get('approach'):
+            continue
+        P, O = np.asarray(s_['points'], float), np.asarray(s_.get('orig_points') or [], float)
+        if len(O) < 2:
+            continue
+        for c in P:
+            q = _nearest_on(O[:-1], O[1:], c)
+            d = float(np.hypot(*(c - q)))
+            if d < 1e-9 or abs(d - R) > 0.02 * R + 1e-3:
+                continue
+            n = (c - q) / d
+            hs.append(float(np.max(H @ (-n))))
+    if not hs:
+        return ''
+    lo, hi = min(hs), max(hs)
+    if hi - lo <= 0.05 * R and abs(hi - R) <= 0.05 * R and abs(lo - R) <= 0.05 * R:
+        return ''
+    return (f"kompanzasyon makine gibi takım yarıçapı R={R:g} ile yola dik yapıldı. ⚠️ DXF makara profili bu yolda "
+            f"merkezden {lo:.2f}–{hi:.2f} mm uzanıyor (R dairesi değil): profil konturdan {max(hi - R, 0):.2f} mm fazla "
+            f"ezebilir / {max(R - lo, 0):.2f} mm boşluk bırakabilir. Gerçek makaranın burnu R yarıçaplı değilse makinede de "
+            f"aynı sapma olur.")
 
 
 # ===== Hücre 14 =====
@@ -5257,7 +5291,7 @@ def json_dict_to_updates(data, gr_update):
     plc = st.get('plane') if isinstance(st.get('plane'), dict) else (data.get('plane') if isinstance(data.get('plane'), dict) else {})
     if plc:
         _pc = plane_cfg_from_dict(plc)            # eski (düzlem + ayna) kayıtlar aynı yön kuralına çevrilir
-        for key in ('hsel', 'vsel', 'g42_dir', 'g42_side', 'tip', 'prof_comp', 'ins_limit', 'skip_arcs'):
+        for key in ('hsel', 'vsel', 'g42_dir', 'g42_side', 'tip', 'profile_contact', 'ins_limit', 'skip_arcs'):
             ups.append(gr_update(value=_pc[key]))
     else:
         ups += [gr_update()] * 8
@@ -6805,10 +6839,10 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                      label="G40'ta programlanan nokta (takım referansı / kesici uç konumu)",
                                      info="Sinumerik'te makara çoğu zaman kenarından ölçülür: G40 ile X700'e giderken "
                                           "merkez X ekseninde R kadar dışarıdadır. G41/G42 açıkken etkisi yoktur.")
-                pl_prof = gr.Checkbox(value=True, label="Kompanzasyonu DXF makara profiline göre yap",
-                                      info="Açık: makara profili konturu her yerde teğet izler (bitmiş ürün = kontur). "
-                                           "Kapalı: makine gibi yalnız takım yarıçapı R'lik daire kompanze edilir; profil "
-                                           "burnu bu daireye uymuyorsa eğik / yay bölgelerde ürün konturdan ayrılır.")
+                pl_prof = gr.Checkbox(value=False, label="İdeal profil teması (makine davranışı DEĞİL)",
+                                      info="Kapalı (önerilen, makine gibi): makara merkezi yola dik olarak takım yarıçapı R kadar "
+                                           "kaydırılır — X ve Z birlikte. Açık: DXF profilinin en uç noktası konturun üstüne konur; "
+                                           "sivri burunlu profilde merkez yalnız yatayda kayar ve makineyle uyuşmaz.")
                 with gr.Row():
                     pl_ins = gr.Number(value=10, minimum=0, maximum=90, label="Dış köşe kesişim sınırı (°)",
                                        info="Dış köşe açısı bu değerden küçükse geçiş yayı eklenmez, iki kompanzeli yolun "
