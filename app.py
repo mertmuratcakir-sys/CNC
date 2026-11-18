@@ -1310,6 +1310,8 @@ def build_channels_cfg(cfg):
         channels_segments.append(segs)
         start_points.append((x0, y0))
         radii.append(tr)
+    for segs_ in channels_segments:
+        attach_prog_points(segs_)
     _tl, _T, sync_notes = synchronize_marks(channels_segments)
     notes.extend(sync_notes)
     return channels_segments, start_points, radii, mold_points, "\n".join(notes)
@@ -1655,6 +1657,7 @@ def apply_sinumerik_corners(segs, R, ins_limit=10.0, skip_arcs=True):
                     ln = (s_.get('line') or 0) + 1
                     drop = {i} | {j for j in range(ia + 1, ib) if segs[j]['type'] == 'move' and segs[j].get('kind') == 'fillet'}
                     segs[ia].pop('comp_warn', None)
+                    segs[ib]['_prog_prefix'] = list(segs[ib].get('_prog_prefix') or []) + _prog_pts(s_)
                     notes.append(f"satır {ln}: iç yayın yarıçapı ({float(s_['orig_radius']):g}) takım yarıçapından ({R:g}) küçük — "
                                  f"blok atlandı, önceki ve sonraki blok kesişim noktasında birleştirildi (makinedeki gibi).")
                     segs = [x for j, x in enumerate(segs) if j not in drop]
@@ -1714,6 +1717,39 @@ def profile_fit_note(segs, shape, R):
             f"merkezden {lo:.2f}–{hi:.2f} mm uzanıyor (R dairesi değil): profil konturdan {max(hi - R, 0):.2f} mm fazla "
             f"ezebilir / {max(R - lo, 0):.2f} mm boşluk bırakabilir. Gerçek makaranın burnu R yarıçaplı değilse makinede de "
             f"aynı sapma olur.")
+
+
+# -------------------------------------------------------------
+# PROGRAMLANAN YOL (oynatıcıda çizilen kontur): kompanzasyonun iç köşelerde kırptığı 'orig_points' yerine
+# programdaki gerçek geometri; atlanan bloklar (takımın sığmadığı iç yay) da çizilir.
+# -------------------------------------------------------------
+def _prog_pts(s_, step=0.5):
+    if s_.get('prog_arc'):
+        cx, cy, rr, a0, a1 = s_['prog_arc']
+        nn = max(int(abs(a1 - a0) * rr / step), 2)
+        return [(float(cx + rr * np.cos(a)), float(cy + rr * np.sin(a))) for a in np.linspace(a0, a1, nn)]
+    if s_.get('prog_start') is not None and s_.get('prog_end') is not None:
+        return [tuple(map(float, s_['prog_start'])), tuple(map(float, s_['prog_end']))]
+    return list(s_.get('orig_points') or s_.get('points') or [])
+
+
+def attach_prog_points(segs):
+    for s_ in segs:
+        if s_['type'] == 'move':
+            pts = list(s_.pop('_prog_prefix', None) or []) + _prog_pts(s_)
+            s_['prog_points'] = pts if len(pts) >= 2 else (pts * 2 if pts else list(s_['orig_points']))
+        elif s_['type'] == 'dwell':
+            s_['prog_point'] = s_.get('orig_point', s_.get('point'))
+    return segs
+
+
+def _dwell_point(seg, key):
+    """G4 (bekleme) segmentinde konum: merkez 'point', temas 'orig_point', programlanan yol 'prog_point'."""
+    if key == 'orig_points':
+        return seg.get('orig_point', seg['point'])
+    if key == 'prog_points':
+        return seg.get('prog_point', seg.get('orig_point', seg['point']))
+    return seg['point']
 
 
 # ===== Hücre 14 =====
@@ -5864,6 +5900,8 @@ function draw(){
     else ctx.arc(X(cx),Y(cy),D.r[i]*sc,0,6.2832);
     ctx.fillStyle=hex2rgba(col,0.22); ctx.fill();
     ctx.strokeStyle=col; ctx.lineWidth=1.8; ctx.stroke();
+    if(D.shp && D.shp[i]){ ctx.save(); ctx.setLineDash([5,4]); ctx.lineWidth=1.3; ctx.beginPath();
+      ctx.arc(X(cx),Y(cy),D.r[i]*sc,0,6.2832); ctx.stroke(); ctx.restore(); }   // kompanzasyon dairesi (R)
     ctx.lineWidth=1.2; ctx.beginPath(); ctx.moveTo(X(cx),Y(cy)); ctx.lineTo(X(px),Y(py)); ctx.stroke();
     ctx.lineWidth=1.6; ctx.beginPath(); ctx.moveTo(X(cx)-6,Y(cy)); ctx.lineTo(X(cx)+6,Y(cy)); ctx.moveTo(X(cx),Y(cy)-6); ctx.lineTo(X(cx),Y(cy)+6); ctx.stroke();
     ctx.fillStyle=col; ctx.beginPath(); ctx.arc(X(px),Y(py),4,0,6.2832); ctx.fill();
@@ -6056,6 +6094,28 @@ def player_env_data(timelines, radii, mold_points, limits, show, max_samples=200
     return out
 
 
+def _prog_path_pts(segs, step=0.1):
+    """Kompanzasyonlu (G41/G42) blokların programlanan yolu — yoğun nokta dizisi."""
+    Q, seen = [], set()
+    for s in segs or []:
+        if s.get('type') != 'move' or s.get('kind') == 'fillet' or s.get('comp_mode') not in ('G41', 'G42'):
+            continue
+        key = (s.get('line'), s.get('prog_start'), s.get('prog_end'))
+        if key in seen or s.get('prog_start') is None:
+            continue
+        seen.add(key)
+        if s.get('prog_arc'):
+            cx, cy, rr, a0, a1 = s['prog_arc']
+            nn = max(int(abs(a1 - a0) * rr / step), 2)
+            ang = np.linspace(a0, a1, nn)
+            Q.append(np.c_[cx + rr * np.cos(ang), cy + rr * np.sin(ang)])
+        else:
+            p0, p1 = np.asarray(s['prog_start'], float), np.asarray(s['prog_end'], float)
+            nn = max(int(np.hypot(*(p1 - p0)) / step), 1)
+            Q.append(p0 + (p1 - p0) * np.linspace(0, 1, nn + 1)[:, None])
+    return np.vstack(Q) if Q else None
+
+
 def build_player_data(channels_segments, start_points, radii, mold_points, timelines, total_time,
                       speed0=1.0, rate=30, xname='X', yname='Y', env=None, cnc=None, extra=None):
     xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points, extra)
@@ -6065,22 +6125,30 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
     chans = []
     for i in range(N_CH):
         tl = timelines[i]
-        full = get_trail(tl, total_time + 1.0, 'orig_points')
+        Qp = _prog_path_pts(channels_segments[i]) if i < len(channels_segments) else None
+        Ri = float(radii[i]) if i < len(radii) else 0.0
+        pk = 'prog_points' if tl and all('prog_points' in sg for _a, _b, sg in tl if sg['type'] == 'move') else 'orig_points'
+        full = get_trail(tl, total_time + 1.0, pk)
         F = [None if np.isnan(p[0]) else [r3(p[0]), r3(p[1])] for p in full]
         c = {'F': F, 'cx': [], 'cy': [], 'px': [], 'py': [], 'm': [], 'hx': [], 'hy': []}
         for k in range(n + 1):
             t = k * dt
             if tl:
                 cp = get_position(tl, t, 'points')
-                pp = get_position(tl, t, 'orig_points')
+                pp = get_position(tl, t, pk)
             else:                                   # hareketsiz kanal: başlangıç noktasında dursun
                 cp = pp = start_points[i]
-            tr = get_trail(tl, t, 'orig_points')
+            tr = get_trail(tl, t, pk)
             m, head = len(tr), None
             if m > 0 and (m > len(full) or not _same_pt(tr[-1], full[m - 1])):
                 head = tr[-1]
                 m -= 1
             c['cx'].append(r3(cp[0])); c['cy'].append(r3(cp[1]))
+            if Qp is not None and len(Qp) and Ri > 0 and np.all(np.isfinite(cp)):
+                dq = np.hypot(Qp[:, 0] - cp[0], Qp[:, 1] - cp[1])
+                jq = int(np.argmin(dq))
+                if abs(dq[jq] - Ri) < 0.08 * Ri:          # G41/G42: temas = programlanan yolda merkeze en yakın nokta (R uzakta)
+                    pp = (Qp[jq, 0], Qp[jq, 1])
             c['px'].append(r3(pp[0])); c['py'].append(r3(pp[1]))
             c['m'].append(m)
             c['hx'].append(None if head is None or np.isnan(head[0]) else r3(head[0]))
@@ -6765,7 +6833,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
         with gr.Column(scale=4, min_width=380):
             cfg_comps = []
             dia_pairs = []
-            tool_files, tool_prevs, tool_trs = [], [], []
+            tool_files, tool_prevs, tool_trs, tool_dels = [], [], [], []
             with gr.Tabs():
                 for k in range(N_CH):
                     d = DEFAULT_CHANNELS[k]
@@ -6789,7 +6857,9 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                         "ve çizimler bu profille yapılır; G41/G42 kompanzasyonu yukarıdaki takım yarıçapıyla yapılır.")
                             tool_file = gr.File(label=f"Kanal {k+1} makara DXF", file_types=[".dxf"], file_count="single")
                             tool_prev = gr.HTML()
+                            tool_del = gr.Button(f"Kanal {k+1} makara profilini kaldır", size="sm", variant="secondary")
                         tool_files.append(tool_file); tool_prevs.append(tool_prev); tool_trs.append(tr)
+                        tool_dels.append(tool_del)
 
             with gr.Accordion("Kalıp (Sabit Path)", open=True):
                 m_x0 = gr.Number(value=DEFAULT_MOLD['x0'], label="Kalıp Başlangıç X")
@@ -7087,6 +7157,9 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                               outputs=[tool_state, tool_prevs[_k], status])
         tool_files[_k].clear(lambda st, tr, _k=_k: make_upload_tool(_k)(None, st, tr),
                              inputs=[tool_state, tool_trs[_k]], outputs=[tool_state, tool_prevs[_k], status])
+        tool_dels[_k].click(lambda st, tr, _k=_k: make_upload_tool(_k)(None, st, tr) + (None,),
+                            inputs=[tool_state, tool_trs[_k]],
+                            outputs=[tool_state, tool_prevs[_k], status, tool_files[_k]])
 
     # kalıp DXF → G-kodu, kalıp JSON
     mold_file.upload(upload_mold_dxf, inputs=[mold_file, mold_face, mold_radial, mold_rev] + cfg_comps + [pf_radial],
