@@ -1310,8 +1310,14 @@ def build_channels_cfg(cfg):
         channels_segments.append(segs)
         start_points.append((x0, y0))
         radii.append(tr)
-    for segs_ in channels_segments:
+    for ci_, segs_ in enumerate(channels_segments):
         attach_prog_points(segs_)
+        mv_ = [x for x in segs_ if x['type'] == 'move']
+        if len(mv_) > 2 and not any(x.get('comp_mode') in ('G41', 'G42') for x in mv_):
+            notes.append(f"⚠️ Kanal {ci_ + 1}: programda G41 / G42 yok — takım yarıçapı kompanzasyonu KAPALI. Programlanan "
+                         f"noktalar G40 takım referansına göre yorumlanıyor (merkez yalnız referans yönünde R kaydırılır); "
+                         f"eğik ve yay bölgelerde makara yola girer / yoldan ayrılır. Konturdan önce bir yaklaşma "
+                         f"satırına G42 (veya G41) yazın, örn. 'G42 G0 Z.. X..'.")
     _tl, _T, sync_notes = synchronize_marks(channels_segments)
     notes.extend(sync_notes)
     return channels_segments, start_points, radii, mold_points, "\n".join(notes)
@@ -2481,8 +2487,40 @@ def _split_nan(pts):
     return out
 
 
+def block_circle_points(timeline, t_from=0.0, t_to=0.0):
+    """Her program bloğunun (G1/G2/G3; G0 ve geçiş yayları hariç) başı, ortası ve sonundaki takım merkezi.
+    t_to > t_from ise yalnız bu zaman aralığında çalışan bloklar. Art arda aynı noktalar bir kez yazılır."""
+    groups = []
+    for t0, t1, seg in timeline:
+        if seg.get('type') != 'move' or _is_g0(seg) or seg.get('kind') == 'fillet':
+            continue
+        if t_to > t_from and (t1 < t_from - 1e-9 or t0 > t_to + 1e-9):
+            continue
+        P = np.asarray(seg['points'], float)
+        if len(P) < 2 or not np.all(np.isfinite(P)):
+            continue
+        if groups and groups[-1][0] == seg.get('line'):
+            groups[-1][1].append(P)
+        else:
+            groups.append([seg.get('line'), [P]])
+    out = []
+    for _ln, parts in groups:
+        P = np.vstack(parts)
+        L = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(P, axis=0).T))])
+        if L[-1] < 1e-9:
+            continue
+        h = L[-1] / 2
+        j = min(int(np.searchsorted(L, h)), len(P) - 1)
+        f = 0.0 if L[j] == L[j - 1] else (h - L[j - 1]) / (L[j] - L[j - 1])
+        mid = P[j - 1] + (P[j] - P[j - 1]) * f
+        for q in (P[0], mid, P[-1]):
+            if not out or np.hypot(*(q - out[-1])) > 1e-3:
+                out.append(np.asarray(q, float))
+    return out
+
+
 def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, total_time,
-                   circ_start, circ_end, circ_step, envelopes=None):
+                   circ_start, circ_end, circ_step, envelopes=None, circ_mode='time'):
     """Seçilen katmanlarla DXF metnini üretir. Döndürür: (dxf_metni, özet_satırları)"""
     layers = set(layers or [])
     w = _DxfWriter()
@@ -2491,7 +2529,9 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
         w.layer('KALIP', 7)
         w.polyline('KALIP', mold_points)
         summary.append('KALIP: kalıp konturu')
-    if 'circles' in layers:
+    if 'circles' in layers and circ_mode == 'blocks':
+        n = 0
+    elif 'circles' in layers:
         if circ_end <= circ_start or circ_step <= 0:
             raise ValueError("Çemberler için geçersiz zaman aralığı (Bitiş > Başlangıç ve Adım > 0 olmalı).")
         n = int(np.floor((circ_end - circ_start) / circ_step + 1e-9)) + 1
@@ -2523,13 +2563,15 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
         if 'circles' in layers:
             name = f"K{i+1}_{_DXF_NAME['circles']}"
             w.layer(name, _DXF_ACI['circles'][i])
-            for t in circ_start + circ_step * np.arange(n):
-                t_c = max(0.0, min(float(t), total_time))
-                _c = np.asarray(get_position(timelines[i], t_c, 'points'), float)
+            if circ_mode == 'blocks':
+                pts_c = block_circle_points(timelines[i], circ_start, circ_end)
+            else:
+                pts_c = [np.asarray(get_position(timelines[i], max(0.0, min(float(t), total_time)), 'points'), float)
+                         for t in circ_start + circ_step * np.arange(n)]
+            for _c in pts_c:
                 if tool_shape(radii[i]) is not None:
-                    w.polyline(name, tool_shape(radii[i]) + _c)
-                else:
-                    w.circle(name, _c, radii[i])
+                    w.polyline(name, tool_shape(radii[i]) + _c)     # makara profili
+                w.circle(name, _c, radii[i])                         # kompanzasyon dairesi (R)
     if envelopes and envelopes.get('pf_chains') and 'preform' in layers:
         w.layer('ON_FORM', 8)
         for A, cl in envelopes['pf_chains']:
@@ -5594,9 +5636,43 @@ function moldPenMin(P){ var L=NM-1, mn=Infinity;   // Python _mold_pen_all(...).
 function polyVol(P){ var ri=SM.ri, A=0, cx=0, cy=0, n=P.length;   // Python poly_volume (kapalı poligon)
   for(var i=0;i<n-1;i++){ var cr=P[i][0]*P[i+1][1]-P[i+1][0]*P[i][1]; A+=cr; cx+=(P[i][0]+P[i+1][0])*cr; cy+=(P[i][1]+P[i+1][1])*cr; }
   A*=0.5; if(Math.abs(A)<1e-12) return 0; cx/=(6*A); cy/=(6*A); return 2*Math.PI*Math.abs(A)*Math.abs(ri===1?cy:cx); }
-function bendTail(cc, useLo, src, outer, tgt, Vtarget, remP, outP){   // Python _bend_tail
+var OBST=[];   // o anki makara profilleri (dünya koordinatı) — kuyruk bunların içine bükülmez
+function rollerObst(){ var q=kf(), k=q[0], f=q[1], out=[];
+  for(var c=0;c<NC;c++){ var cx=lerp(D.ch[c].cx,k,f), cy=lerp(D.ch[c].cy,k,f), P=[];
+    if(!isFinite(cx)||!isFinite(cy)) continue;
+    if(D.shp && D.shp[c]){ var S=D.shp[c]; for(var e=0;e<S.length;e+=2) P.push([cx+S[e],cy+S[e+1]]); }
+    else { var R=D.r[c]; if(!(R>0)) continue; for(var a=0;a<48;a++){ var th=a*2*Math.PI/48; P.push([cx+R*Math.cos(th),cy+R*Math.sin(th)]); } }
+    var x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity; P.forEach(function(p){x0=Math.min(x0,p[0]);x1=Math.max(x1,p[0]);y0=Math.min(y0,p[1]);y1=Math.max(y1,p[1]);});
+    out.push({P:P,b:[x0,x1,y0,y1]}); }
+  return out; }
+function rollPen(p){   // makara profiline giriş: [-derinlik, dışa birim normal] ya da [Infinity]
+  var best=[Infinity,0,0];
+  for(var o=0;o<OBST.length;o++){ var ob=OBST[o], b=ob.b;
+    if(p[0]<b[0]||p[0]>b[1]||p[1]<b[2]||p[1]>b[3]) continue;
+    var P=ob.P, n=P.length, ins=false, dm=Infinity, qx=0, qy=0;
+    for(var i=0,j=n-1;i<n;j=i++){ var xi=P[i][0], yi=P[i][1], xj=P[j][0], yj=P[j][1];
+      if(((yi>p[1])!==(yj>p[1])) && (p[0]<(xj-xi)*(p[1]-yi)/((yj-yi)||1e-12)+xi)) ins=!ins;
+      var ex=xi-xj, ey=yi-yj, L2=ex*ex+ey*ey, t=L2>0?((p[0]-xj)*ex+(p[1]-yj)*ey)/L2:0; t=Math.max(0,Math.min(1,t));
+      var fx=xj+ex*t, fy=yj+ey*t, d=Math.hypot(fx-p[0],fy-p[1]); if(d<dm){dm=d; qx=fx; qy=fy;} }
+    if(ins && -dm<best[0]){ var L=Math.max(dm,1e-9); best=[-dm,(qx-p[0])/L,(qy-p[1])/L]; } }
+  return best; }
+function segHit(A,B){   // A→B doğrusunun makara profillerine ilk girdiği oran (0..1); girmiyorsa 1
+  var best=1, x0=Math.min(A[0],B[0]), x1=Math.max(A[0],B[0]), y0=Math.min(A[1],B[1]), y1=Math.max(A[1],B[1]);
+  for(var o=0;o<OBST.length;o++){ var ob=OBST[o], b=ob.b; if(x1<b[0]||x0>b[1]||y1<b[2]||y0>b[3]) continue;
+    var P=ob.P, n=P.length, rx=B[0]-A[0], ry=B[1]-A[1];
+    for(var i=0,j=n-1;i<n;j=i++){ var sx=P[i][0]-P[j][0], sy=P[i][1]-P[j][1], den=rx*sy-ry*sx; if(Math.abs(den)<1e-12) continue;
+      var qx=P[j][0]-A[0], qy=P[j][1]-A[1], t=(qx*sy-qy*sx)/den, u=(qx*ry-qy*rx)/den;
+      if(t>=0 && t<=1 && u>=0 && u<=1 && t<best) best=t; } }
+  return best>=1?1:Math.max(0,best-1e-4); }
+function penAll(p){   // kalıp + makaralar: [giriş (negatif=içeride), itme yönü x, y]
+  var mk=moldPen(p), out=[Infinity,0,0];
+  if(mk[0]<0){ var k=mk[1]; out=[mk[0],Nx[k]*SDS[k],Ny[k]*SDS[k]]; }
+  var rp=rollPen(p); if(rp[0]<out[0]) out=rp;
+  return out; }
+function rollPenMin(P){ var mn=Infinity; if(!OBST.length) return mn; for(var q=0;q<P.length;q++){ var v=rollPen(P[q])[0]; if(v<mn) mn=v; } return mn; }
+function bendTail(cc, useLo, src, outer, tgt, Vtarget, remP, outP){   // Python _bend_tail (+ makara profilleri)
   if(!remP || remP.length<3) return [remP,outP];
-  if(moldPenMin(remP)>=-0.01) return [remP,outP];
+  if(moldPenMin(remP)>=-0.01 && rollPenMin(remP)>=-0.01) return [remP,outP];
   var cs=SM.c, d=SM.dir, Is=[], Os=[];
   for(var j=0;j<cs.length;j++) if(d*cs[j]>d*cc){ var lo=[SM.lox[j],SM.loy[j]], hi=[SM.hix[j],SM.hiy[j]]; if(useLo){Is.push(lo);Os.push(hi);} else {Is.push(hi);Os.push(lo);} }
   if(Is.length<2) return [remP,outP];
@@ -5604,19 +5680,22 @@ function bendTail(cc, useLo, src, outer, tgt, Vtarget, remP, outP){   // Python 
   var n=I.length, In=[I[0].slice()], th=[0], t=0, Rb=SM.Rb||20;
   for(var j2=1;j2<n;j2++){ var sx=I[j2][0]-I[j2-1][0], sy=I[j2][1]-I[j2-1][1], L=Math.hypot(sx,sy), pv=In[j2-1];
     if(L<1e-12){ In.push(pv.slice()); th.push(t); continue; }
-    var ct=Math.cos(t), st=Math.sin(t), rs=[ct*sx-st*sy, st*sx+ct*sy], cand=[pv[0]+rs[0],pv[1]+rs[1]], pk=moldPen(cand);
-    if(pk[0]<0){ var k=pk[1], nx=Nx[k]*SDS[k], ny=Ny[k]*SDS[k], pr=[cand[0]-pk[0]*nx,cand[1]-pk[0]*ny], dx=pr[0]-pv[0], dy=pr[1]-pv[1];
+    var ct=Math.cos(t), st=Math.sin(t), rs=[ct*sx-st*sy, st*sx+ct*sy], cand=[pv[0]+rs[0],pv[1]+rs[1]], pk=penAll(cand);
+    if(pk[0]<0){ var nx=pk[1], ny=pk[2], pr=[cand[0]-pk[0]*nx,cand[1]-pk[0]*ny], dx=pr[0]-pv[0], dy=pr[1]-pv[1];
       var need=Math.atan2(rs[0]*dy-rs[1]*dx, rs[0]*dx+rs[1]*dy), lim=L/Rb, use=Math.min(Math.max(need,-lim),lim);
       t+=use; var cu=Math.cos(use), su=Math.sin(use); cand=[pv[0]+cu*rs[0]-su*rs[1], pv[1]+su*rs[0]+cu*rs[1]];
-      var p2=moldPen(cand); if(p2[0]<0){ var k2=p2[1]; cand=[cand[0]-p2[0]*Nx[k2]*SDS[k2], cand[1]-p2[0]*Ny[k2]*SDS[k2]]; } }
+      var p2=penAll(cand); if(p2[0]<0){ cand=[cand[0]-p2[0]*p2[1], cand[1]-p2[0]*p2[2]]; } }
     In.push(cand); th.push(t); }
   var Wr=[], ri=SM.ri;
   for(var q=0;q<n;q++){ var wx=O[q][0]-I[q][0], wy=O[q][1]-I[q][1], c0=Math.cos(th[q]), s0=Math.sin(th[q]), sc=Math.abs(I[q][ri])/Math.max(Math.abs(In[q][ri]),1e-6);
     Wr.push([(c0*wx-s0*wy)*sc,(s0*wx+c0*wy)*sc]); }
-  var build=function(fv){ var On=[], P=[]; for(var q=0;q<n;q++) On.push([In[q][0]+Wr[q][0]*fv, In[q][1]+Wr[q][1]*fv]);
+  var build=function(fv){ var On=[], P=[]; for(var q=0;q<n;q++){ var o=[In[q][0]+Wr[q][0]*fv, In[q][1]+Wr[q][1]*fv];
+      if(OBST.length && !(rollPen(In[q])[0]<-1e-3)){   // makara önünde sıkışma: kesit makaraya ilk girdiği yerde durur
+        var sh=segHit(In[q],o); if(sh<1) o=[In[q][0]+(o[0]-In[q][0])*sh, In[q][1]+(o[1]-In[q][1])*sh]; }
+      On.push(o); }
     for(var a=0;a<n;a++) P.push(In[a]); for(var b=n-1;b>=0;b--) P.push(On[b]); P.push(In[0]); return [P,On]; };
   var fa=1.0, fb=1.02, va=polyVol(build(fa)[0])-Vtarget, vb=polyVol(build(fb)[0])-Vtarget;
-  for(var it=0;it<6;it++){ if(Math.abs(vb)<1e-9*Math.max(Vtarget,1)||vb===va) break; var fn=fb-vb*(fb-fa)/(vb-va); fa=fb; va=vb; fb=fn; vb=polyVol(build(fb)[0])-Vtarget; }
+  for(var it=0;it<(OBST.length?12:6);it++){ if(Math.abs(vb)<1e-9*Math.max(Vtarget,1)||vb===va) break; var fn=fb-vb*(fb-fa)/(vb-va); fn=Math.min(Math.max(fn,0.2),6); fa=fb; va=vb; fb=fn; vb=polyVol(build(fb)[0])-Vtarget; }
   var r=build(fb); return [r[0],[r[1][0]]]; }
 function simState(SS){
   var front=-1, a0=-1, U=new Float64Array(NM);
@@ -5735,7 +5814,7 @@ function drawSim(X,Y,st){
     '<br>Yerinde kalan (makara değmedi): '+fm(st.V0)+' mm³'+
     '<br>Kalıba sıvanan duvar: '+fm(st.Vc)+' mm³ (%'+(st.Vc/SM.Vtot*100).toFixed(1)+')'+
     '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+xyLines([st.fixed,wall,st.bridge,st.rem])+
-    (st.bent?'<br><span style="color:#b9770e">Kalan ön form kalıba değdi — dışa doğru büküldü.</span>':'')+
+    (st.bent?'<br><span style="color:#b9770e">Kalan ön form kalıba / makaraya değdi — içine girmeden dışa doğru büküldü.</span>':'')+
     (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
@@ -5745,6 +5824,7 @@ function drawEnv(X,Y){
     ctx.strokeStyle='#9a9a9a'; ctx.lineWidth=1.0; ctx.setLineDash([8,3,2,3]);
     (EV.pf||[]).forEach(function(pl){ ctx.beginPath(); for(var q=0;q<pl.length;q+=2){ if(q) ctx.lineTo(X(pl[q]),Y(pl[q+1])); else ctx.moveTo(X(pl[q]),Y(pl[q+1])); } ctx.stroke(); });
     ctx.setLineDash([]);
+    OBST=(window.__NOROLLOBST?[]:rollerObst());
     if(STS){ var __st=stripState(SS); window.__ST=__st; drawStrip(X,Y,__st); } else drawSim(X,Y,simState(SS));
     if(SHEAR && !STS){ ctx.strokeStyle='#6a3d9a'; ctx.lineWidth=1.4; ctx.setLineDash([4,2]);
       var ixs=function(i){return Mx[i]+Nx[i]*SDS[i]*TI[i];}, iys=function(i){return My[i]+Ny[i]*SDS[i]*TI[i];};
@@ -6489,12 +6569,13 @@ def make_mp4(*vals):
 # -------------------------------------------------------------
 @_trim
 def make_dxf(*vals):
-    """vals = all_inputs + [seçili DXF katmanları]"""
+    """vals = all_inputs + [seçili DXF katmanları, çember konumu]"""
     try:
-        layers = vals[-1] or []
+        layers = vals[-2] or []
+        cmode = 'blocks' if vals[-1] == 'blocks' else 'time'
         if not layers:
             return None, "DXF için en az bir katman seç."
-        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-1])
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-2])
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
@@ -6503,14 +6584,16 @@ def make_dxf(*vals):
                 if {'envelope', 'preform', 'final'} & set(layers) else None)
         end_used = ac_e if ac_e > ac_s else total_time
         txt, summary = build_dxf_text(layers, segs, radii, mold_pts, timelines, total_time,
-                                      ac_s, end_used, ac_st, envs)
+                                      ac_s, end_used, ac_st, envs, circ_mode=cmode)
         out_dir = tempfile.mkdtemp(prefix='cnc_dxf_')
         path = os.path.join(out_dir, 'cnc_simulasyon.dxf')
         with open(path, 'w', encoding='ascii', newline='\r\n') as f:
             f.write(txt)
         msg = ((note + "\n") if note else "") + "DXF hazır: cnc_simulasyon.dxf (birim mm). Katmanlar: " + "; ".join(summary)
         if 'circles' in layers:
-            msg += f"\nÇemberler: {ac_s:g}–{end_used:.2f} sn, adım {ac_st:g} sn."
+            msg += (f"\nÇemberler: her program bloğunun başı, ortası ve sonu (G0 hariç)"
+                    + (f", {ac_s:g}–{ac_e:g} sn arası." if ac_e > ac_s else ".") if cmode == 'blocks'
+                    else f"\nÇemberler: {ac_s:g}–{end_used:.2f} sn, adım {ac_st:g} sn.")
         return path, msg
     except ValueError as ve:
         return None, f"Hata: {ve}"
@@ -7054,8 +7137,11 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                 "Her kanal ve her çizim türü ayrı katmandadır (örn. `K1_KONTUR`, `K2_RADUS_IZI`, "
                                 "`K3_CEMBER`, `KALIP`); AutoCAD'de katmanları ayrı ayrı açıp kapatabilirsin.")
                     dxf_layers = gr.CheckboxGroup(DXF_LAYER_CHOICES, value=DXF_DEFAULT_LAYERS, label="Katmanlar")
-                    gr.Markdown("**Zaman adımlı takım çemberleri:** seçilen aralıkta her adımda takım merkezine "
-                                "takım yarıçapında çember. Bitiş 0 (veya Başlangıç'tan küçük) ise toplam süre kullanılır.")
+                    gr.Markdown("**Takım çemberleri:** takım merkezine takım yarıçapında çember (profil yüklüyse profil). "
+                                "Zaman adımlı: seçilen aralıkta her adımda. Program adımları: her bloğun (G1/G2/G3) başı, "
+                                "ortası ve sonu — zaman aralığı girilirse yalnız o aralıktaki bloklar. Bitiş 0 = toplam süre.")
+                    ac_mode = gr.Radio([("Zaman adımlı", 'time'), ("Program adımlarının başı – ortası – sonu", 'blocks')],
+                                       value='time', label="Çember konumları")
                     with gr.Row():
                         ac_start = gr.Number(value=0.0, label="Başlangıç Zamanı (s)")
                         ac_end = gr.Number(value=0.0, label="Bitiş Zamanı (s)  [0 = otomatik]")
@@ -7144,7 +7230,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                   outputs=[video_out, mp4_file, status])
 
     # DXF
-    dxf_btn.click(make_dxf, inputs=all_inputs + [dxf_layers], outputs=[dxf_file, status])
+    dxf_btn.click(make_dxf, inputs=all_inputs + [dxf_layers, ac_mode], outputs=[dxf_file, status])
 
     # JSON
     json_btn.click(export_json, inputs=all_inputs, outputs=[json_file_out, status])
