@@ -5864,7 +5864,10 @@ function flangeClear(remP, outP, piv, wallOut){
     // malzeme makara dairesine sıvanarak bükülür: temas noktasından makaranın en ön noktasına kadar,
     // sonra flanş eksene dik devam eder. Bükülen kısmın hacmi flanşın kökünden düşülür (hacim sabit).
     var C=best.c, R=best.R, sgn=(piv[ri]<0)?-1:1;
-    var Pc=wallOut||outP[0], thC=Math.atan2(Pc[1]-C[1],Pc[0]-C[0]), uE=[0,0]; uE[ax]=fd;
+    var Pc=wallOut||outP[0], uE=[0,0]; uE[ax]=fd;
+    // büküm, makara merkezinden kalıba inen dikmenin açısından başlar (gerisi makaraya sıvanmaz)
+    var bf=Infinity, Fm=Pc; for(var im=0;im<NM;im++){ var dm=(Mx[im]-C[0])*(Mx[im]-C[0])+(My[im]-C[1])*(My[im]-C[1]); if(dm<bf){bf=dm; Fm=[Mx[im],My[im]];} }
+    var thC=Math.atan2(Fm[1]-C[1],Fm[0]-C[0]);
     var thE=Math.atan2(uE[1],uE[0]), dth=thE-thC; while(dth>Math.PI) dth-=2*Math.PI; while(dth<-Math.PI) dth+=2*Math.PI;
     var tEnd=Math.max(Math.hypot(Pc[0]-piv[0],Pc[1]-piv[1]),0.05), t0=thick;
     // flanş kökü: arka yüz (makaraya bakan) / ön yüz
@@ -5875,7 +5878,8 @@ function flangeClear(remP, outP, piv, wallOut){
       if(moldPen(op)[0]<0){ var lo2=0, hi2=tt; for(var b3=0;b3<14;b3++){ var m3=(lo2+hi2)/2; if(moldPen([C[0]+(R+m3)*ux, C[1]+(R+m3)*uy])[0]<0) hi2=m3; else lo2=m3; }
         tt=lo2; op=[C[0]+(R+tt)*ux, C[1]+(R+tt)*uy]; }       // bükülen kısım kalıba girmez: makara ile kalıp arasında sıkışır
       Inn.push([C[0]+R*ux, C[1]+R*uy]); Out.push(op); }
-    var bend=Inn.concat(Out.slice().reverse()); bend.push(Inn[0]);
+    var head=[piv, Pc];                                  // duvar ucu → büküm başı arası (makara ile kalıp arasındaki malzeme)
+    var bend=head.concat(Inn).concat(Out.slice().reverse()); bend.push(piv);
     var Vb=Math.abs(polyVol(bend)), rr0=Math.abs(back[ri]), rc2=rr0*rr0+Vb/(Math.PI*Math.max(t0,1e-6));
     var rcut=sgn*Math.sqrt(rc2), Rem=clipHalf(remP,ri,rcut,sgn);
     if(!Rem){ return [null, [Out[nb]], 0, 0, bend]; }
@@ -5887,7 +5891,7 @@ function flangeClear(remP, outP, piv, wallOut){
     var sh=function(P,d){ return P.map(function(p){ var q=p.slice(); q[ax]+=fd*d; return q; }); };
     for(var dd=0; dd<=40; dd+=0.25){ var Rs=sh(R1,dd); if(!polyHitsRoll(Rs,tg,1.0)){
         var fb=sh([tg],dd)[0], ff=fb.slice(); ff[ax]+=fd*t0;
-        var bend2=Inn.concat([fb,ff]).concat(Out.slice().reverse()); bend2.push(Inn[0]);
+        var bend2=head.concat(Inn).concat([fb,ff]).concat(Out.slice().reverse()); bend2.push(piv);
         return [Rs, [Out[nb]], 0, Math.abs(tg[ax]-piv[ax])+dd, bend2]; } }
     remP=R1; outP=[Out[nb]]; piv=tg; }
   var d0=Math.max(thick,1)*1.5;
