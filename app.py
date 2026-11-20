@@ -5785,12 +5785,13 @@ function polyVol(P){ var ri=SM.ri, A=0, cx=0, cy=0, n=P.length;   // Python poly
   A*=0.5; if(Math.abs(A)<1e-12) return 0; cx/=(6*A); cy/=(6*A); return 2*Math.PI*Math.abs(A)*Math.abs(ri===1?cy:cx); }
 var OBST=[];   // o anki makara profilleri (dünya koordinatı) — kuyruk bunların içine bükülmez
 function rollerObst(){ var q=kf(), k=q[0], f=q[1], out=[];
-  for(var c=0;c<NC;c++){ var cx=lerp(D.ch[c].cx,k,f), cy=lerp(D.ch[c].cy,k,f), P=[];
+  for(var c=0;c<NC;c++){ if(D.act && !D.act[c]) continue;   // programı olmayan kanalın makarası engel sayılmaz
+    var cx=lerp(D.ch[c].cx,k,f), cy=lerp(D.ch[c].cy,k,f), P=[];
     if(!isFinite(cx)||!isFinite(cy)) continue;
     if(D.shp && D.shp[c]){ var S=D.shp[c]; for(var e=0;e<S.length;e+=2) P.push([cx+S[e],cy+S[e+1]]); }
     else { var R=D.r[c]; if(!(R>0)) continue; for(var a=0;a<48;a++){ var th=a*2*Math.PI/48; P.push([cx+R*Math.cos(th),cy+R*Math.sin(th)]); } }
     var x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity; P.forEach(function(p){x0=Math.min(x0,p[0]);x1=Math.max(x1,p[0]);y0=Math.min(y0,p[1]);y1=Math.max(y1,p[1]);});
-    out.push({P:P,b:[x0,x1,y0,y1]}); }
+    out.push({P:P,b:[x0,x1,y0,y1],c:[cx,cy],R:D.r[c]}); }
   return out; }
 function rollPen(p){   // makara profiline giriş: [-derinlik, dışa birim normal] ya da [Infinity]
   var best=[Infinity,0,0];
@@ -5852,25 +5853,43 @@ function polyHitsRoll(P, piv, d0){   // flanş kenarı (kökteki d0 yarıçaplı
       if(Math.hypot(p[0]-piv[0],p[1]-piv[1])<d0) continue;
       if(rollPen(p)[0]<-0.05) return true; } }
   return false; }
-function flangeClear(remP, outP, piv){
+function flangeClear(remP, outP, piv, wallOut){
   if(!OBST.length) return [remP,outP,0];
   var ax=1-SM.ri, ri=SM.ri, fd=(ax===0?(Mx[NM-1]-Mx[0]):(My[NM-1]-My[0]))>=0?1:-1;
   // temas eden makara: duvar ucuna en yakın profil
   var best=null, bd=Infinity;
   OBST.forEach(function(ob){ ob.P.forEach(function(p){ var d=Math.hypot(p[0]-piv[0],p[1]-piv[1]); if(d<bd){bd=d; best=ob;} }); });
   var thick=Math.max(Math.hypot(outP[0][0]-piv[0],outP[0][1]-piv[1]),1);
-  if(best && bd<3*thick+2){
-    // malzeme makara burnunu sarar; flanş makaranın en öndeki noktasından (şekillendirme yönünde) eksene dik çıkar
-    var E=best.P.reduce(function(b,p){ return (fd*p[ax]>fd*b[ax])?p:b; }, best.P[0]);   // en öndeki nokta
-    var sgn=(piv[ri]<0)?-1:1, r0=Math.max(Math.abs(piv[ri]),Math.abs(E[ri]))*sgn;
-    var tg=[0,0]; tg[ax]=E[ax]; tg[ri]=r0;
-    var mv=function(P){ return P.map(function(p){ var o=[p[0],p[1]]; o[ax]+=tg[ax]-piv[ax]; var d=tg[ri]*tg[ri]-piv[ri]*piv[ri], r=o[ri], s=(r<0)?-1:1;
+  if(best && bd<3*thick+2 && best.R>0){
+    // malzeme makara dairesine sıvanarak bükülür: temas noktasından makaranın en ön noktasına kadar,
+    // sonra flanş eksene dik devam eder. Bükülen kısmın hacmi flanşın kökünden düşülür (hacim sabit).
+    var C=best.c, R=best.R, sgn=(piv[ri]<0)?-1:1;
+    var Pc=wallOut||outP[0], thC=Math.atan2(Pc[1]-C[1],Pc[0]-C[0]), uE=[0,0]; uE[ax]=fd;
+    var thE=Math.atan2(uE[1],uE[0]), dth=thE-thC; while(dth>Math.PI) dth-=2*Math.PI; while(dth<-Math.PI) dth+=2*Math.PI;
+    var tEnd=Math.max(Math.hypot(Pc[0]-piv[0],Pc[1]-piv[1]),0.05), t0=thick;
+    // flanş kökü: arka yüz (makaraya bakan) / ön yüz
+    var A0=piv, B0=outP[0], back=(fd*A0[ax]<=fd*B0[ax])?A0:B0;
+    var nb=Math.max(6,Math.ceil(Math.abs(dth)*(R+t0)/0.8)), Inn=[], Out=[];
+    for(var q=0;q<=nb;q++){ var th=thC+dth*q/nb, tt=tEnd+(t0-tEnd)*q/nb, ux=Math.cos(th), uy=Math.sin(th);
+      var op=[C[0]+(R+tt)*ux, C[1]+(R+tt)*uy];
+      if(moldPen(op)[0]<0){ var lo2=0, hi2=tt; for(var b3=0;b3<14;b3++){ var m3=(lo2+hi2)/2; if(moldPen([C[0]+(R+m3)*ux, C[1]+(R+m3)*uy])[0]<0) hi2=m3; else lo2=m3; }
+        tt=lo2; op=[C[0]+(R+tt)*ux, C[1]+(R+tt)*uy]; }       // bükülen kısım kalıba girmez: makara ile kalıp arasında sıkışır
+      Inn.push([C[0]+R*ux, C[1]+R*uy]); Out.push(op); }
+    var bend=Inn.concat(Out.slice().reverse()); bend.push(Inn[0]);
+    var Vb=Math.abs(polyVol(bend)), rr0=Math.abs(back[ri]), rc2=rr0*rr0+Vb/(Math.PI*Math.max(t0,1e-6));
+    var rcut=sgn*Math.sqrt(rc2), Rem=clipHalf(remP,ri,rcut,sgn);
+    if(!Rem){ return [null, [Out[nb]], 0, 0, bend]; }
+    var Ek=Inn[nb], tg=[0,0]; tg[ax]=Ek[ax]; tg[ri]=Ek[ri];
+    var bk=[0,0]; bk[ax]=back[ax]; bk[ri]=rcut;
+    var mv=function(P){ return P.map(function(p){ var o=[p[0],p[1]]; o[ax]+=tg[ax]-bk[ax]; var d=tg[ri]*tg[ri]-bk[ri]*bk[ri], r=o[ri], s=(r<0)?-1:1;
       o[ri]=s*Math.sqrt(Math.max(r*r+d,0)); return o; }); };   // hacmi koruyan taşıma (r² kaydırma)
-    var R1=mv(remP), O1=mv(outP);
-    // flanş makaranın önünde kalsın: gerekiyorsa ileri kaydır (kökte 1 mm temas payı)
+    var R1=mv(Rem);
     var sh=function(P,d){ return P.map(function(p){ var q=p.slice(); q[ax]+=fd*d; return q; }); };
-    for(var dd=0; dd<=40; dd+=0.25){ var Rs=sh(R1,dd); if(!polyHitsRoll(Rs,tg,1.0)) return [Rs, sh(O1,dd), 0, Math.abs(tg[ax]-piv[ax])+dd]; }
-    remP=R1; outP=O1; piv=tg; }
+    for(var dd=0; dd<=40; dd+=0.25){ var Rs=sh(R1,dd); if(!polyHitsRoll(Rs,tg,1.0)){
+        var fb=sh([tg],dd)[0], ff=fb.slice(); ff[ax]+=fd*t0;
+        var bend2=Inn.concat([fb,ff]).concat(Out.slice().reverse()); bend2.push(Inn[0]);
+        return [Rs, [Out[nb]], 0, Math.abs(tg[ax]-piv[ax])+dd, bend2]; } }
+    remP=R1; outP=[Out[nb]]; piv=tg; }
   var d0=Math.max(thick,1)*1.5;
   if(!polyHitsRoll(remP,piv,d0)) return [remP,outP,0];
   var far=remP.reduce(function(b,p){ var d=Math.hypot(p[0]-piv[0],p[1]-piv[1]); return d>b[0]?[d,p]:b; },[-1,piv])[1];
@@ -5898,10 +5917,11 @@ function simState(SS){
   var rem=clipHalf(SIMP,SM.k,cc,SM.dir);
   var remP=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null, outP=[remapV(outer,inner,tgt)];
   if(remP && SM.k===SM.ri){   // sıvama (shear): flanş düz kalır, makaraya değmeyecek en küçük açıyla öne eğilir
-    var fl=flangeClear(remP, outP, tgt); remP=fl[0]; outP=fl[1]; st.tilt=fl[2]; st.shift=fl[3]||0; }
+    var woE=W[end-a0], wallOut=[Mx[end]+Nx[end]*SDS[end]*woE, My[end]+Ny[end]*SDS[end]*woE];
+    var fl=flangeClear(remP, outP, tgt, wallOut); remP=fl[0]; outP=fl[1]; st.tilt=fl[2]; st.shift=fl[3]||0; st.bend=fl[4]||null; }
   else if(remP){ var bt=bendTail(cc, inner===lo, inner, outer, tgt, SM.Vtot-V0-cum, remP, outP); st.bent=(bt[0]!==remP); remP=bt[0]; outP=bt[1]; }
   st.rem=remP;
-  var wo=W[end-a0]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],outP[0]];
+  var wo=W[end-a0]; st.bridge=st.bend?st.bend:[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],outP[0]];
   st.T=[tgt[0]-inner[0],tgt[1]-inner[1]]; st.c=cc;
   return st; }
 function lerp1(xq,X,Yv){ var n=X.length; if(xq<=X[0]) return Yv[0]; if(xq>=X[n-1]) return Yv[n-1];
@@ -6000,7 +6020,8 @@ function drawSim(X,Y,st){
     '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+xyLines([st.fixed,wall,st.bridge,st.rem])+
     (st.bent?'<br><span style="color:#b9770e">Kalan ön form kalıba / makaraya değdi — içine girmeden dışa doğru büküldü.</span>':'')+
     (st.tilt?'<br><span style="color:#b9770e">Flanş makaranın önünde '+st.tilt+'° öne eğildi.</span>':'')+
-    (st.shift?'<br><span style="color:#b9770e">Flanş makara burnunu sarıp makaranın önünden eksene dik çıkıyor ('+st.shift.toFixed(1)+' mm ileride).</span>':'')+
+    (st.bend?'<br><span style="color:#b9770e">Malzeme makara yarıçapında bükülüp makaraya sıvanıyor; flanş makaranın önünden eksene dik devam ediyor.</span>':
+      (st.shift?'<br><span style="color:#b9770e">Flanş makaranın önünde '+st.shift.toFixed(1)+' mm ileride, eksene dik.</span>':''))+
     (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
