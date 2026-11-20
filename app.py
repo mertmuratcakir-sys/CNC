@@ -817,7 +817,7 @@ DIA_AXIS_CHOICES = [('Yatay eksen', 'X'), ('Dikey eksen', 'Y'), ('İkisi de', 'X
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1 + 1 + 8  # 39: kalıp(5) + çizilen yol modu + G0 hızı + eksenler(8: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon, köşe kesişim açısı, küçük iç yayı atla)
+N_CFG = MOLD_START + 5 + 1 + 1 + 8 + 4  # 43: … + malzeme esnemesi(4: E, akma, çap katsayısı, sabit uç); kalıp(5) + çizilen yol modu + G0 hızı + eksenler(8: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon, köşe kesişim açısı, küçük iç yayı atla)
 N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
                                     # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
@@ -860,7 +860,8 @@ def cfg_from_values(v):
             'plane': plane_cfg(v[m + 7], v[m + 8], v[m + 9], v[m + 10], tip=v[m + 11],
                                prof_comp=v[m + 12] if len(v) > m + 12 else None,
                                ins_limit=v[m + 13] if len(v) > m + 13 else None,
-                               skip_arcs=v[m + 14] if len(v) > m + 14 else None)}
+                               skip_arcs=v[m + 14] if len(v) > m + 14 else None),
+            'material': material_cfg(*[(v[m + 15 + q] if len(v) > m + 15 + q else None) for q in range(4)])}
 
 
 def opts_from_values(v):
@@ -997,6 +998,17 @@ def _num_or(x, default):
         return x if np.isfinite(x) and x >= 0 else default
     except (TypeError, ValueError):
         return default
+
+
+DEFAULT_MATERIAL = {'E': 210.0, 'sy': 300.0, 'kh': 1.0, 'clamp': 'start'}
+CLAMP_CHOICES = [('Başlangıç ucu (kalıbın ilk şekillenen kısmı / göbek)', 'start'), ('Bitiş ucu (son şekillenen kısım)', 'end')]
+
+
+def material_cfg(E=None, sy=None, kh=None, clamp=None):
+    """Geri esneme için malzeme: E [GPa], akma dayanımı σa [MPa], çap esneme katsayısı k, sabit (tutulan) uç."""
+    return {'E': _num_or(E, DEFAULT_MATERIAL['E']), 'sy': _num_or(sy, DEFAULT_MATERIAL['sy']),
+            'kh': float(kh) if isinstance(kh, (int, float)) and np.isfinite(kh) else DEFAULT_MATERIAL['kh'],
+            'clamp': clamp if clamp in ('start', 'end') else 'start'}
 
 
 def plane_cfg(hl=None, vl=None, g42_dir=None, g42_side=None, tip=None, hneg=None, vneg=None,
@@ -2410,6 +2422,7 @@ DXF_LAYER_CHOICES = [
     ('Ön form (DXF)', 'preform'),
     ('Son form yüzeyi (ön form ile)', 'final'),
     ('Ürün (simülasyon sonu, hacim sabit)', 'product'),
+    ('Esnemiş ürün (geri esneme sonrası — malzeme ayarlarından)', 'product_sb'),
 ]
 DXF_DEFAULT_LAYERS = ['mold', 'contour', 'envelope', 'circles', 'preform', 'final']
 _DXF_ACI = {'contour': [5, 30, 4], 'envelope': [3, 6, 1], 'center': [8, 8, 8], 'circles': [8, 8, 8], 'g0': [9, 9, 9]}
@@ -2520,7 +2533,7 @@ def block_circle_points(timeline, t_from=0.0, t_to=0.0):
 
 
 def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, total_time,
-                   circ_start, circ_end, circ_step, envelopes=None, circ_mode='time'):
+                   circ_start, circ_end, circ_step, envelopes=None, circ_mode='time', circ_chans=None, material=None):
     """Seçilen katmanlarla DXF metnini üretir. Döndürür: (dxf_metni, özet_satırları)"""
     layers = set(layers or [])
     w = _DxfWriter()
@@ -2560,7 +2573,7 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
             w.layer(name, _DXF_ACI['envelope'][i])
             for E, _Mk in envelopes['ch'][i]['chunks']:
                 w.polyline(name, E)
-        if 'circles' in layers:
+        if 'circles' in layers and (circ_chans is None or i in circ_chans):
             name = f"K{i+1}_{_DXF_NAME['circles']}"
             w.layer(name, _DXF_ACI['circles'][i])
             if circ_mode == 'blocks':
@@ -2596,6 +2609,15 @@ def build_dxf_text(layers, channels_segments, radii, mold_points, timelines, tot
                     w.polyline('URUN', P)
         else:
             summary.append('URUN: simülasyon modu kapalı / çalışmadı, atlandı')
+    if 'product_sb' in layers:
+        _sb = springback(_sm, _sm['final'], material) if (_sm and _sm.get('ok') and _sm.get('final') is not None) else None
+        if _sb:
+            w.layer('URUN_ESNEMIS', 30)
+            for P in _sb['polys']:
+                w.polyline('URUN_ESNEMIS', P)
+            summary.append('URUN_ESNEMIS: ' + _sb['info'])
+        else:
+            summary.append('URUN_ESNEMIS: simülasyon modu kapalı / malzeme (E, σa) girilmemiş, atlandı')
     if ('preform' in layers or 'final' in layers) and not (envelopes and envelopes.get('pf_chains')):
         summary.append('ON_FORM/SON_FORM: ön form yüklenmediği için atlandı')
     for name in w.layers:
@@ -3201,7 +3223,7 @@ def _chunks_from_mask(ok, pts, brk):
 
 PF_MODEL_CHOICES = [
     ('Sac ön form (sıvama + inceltme): kalınlık = sacın kendi kalınlığı (DXF), malzeme sac boyunca akar', 'strip'),
-    ('Shear forming (disk/koni ön form): sinüs kuralı  t = t₀·sin α', 'shear'),
+    ('Sıvama / shear forming (düz plaka, disk, koni): plaka göbekten dışa tükenir, flanş makaranın önünde ilerler', 'shear'),
     ('Kalıp üzerinde (flow forming): kalınlık = kalıptan ön form dış yüzeyine', 'flow'),
 ]
 PF_RADIAL_CHOICES = [
@@ -3215,9 +3237,14 @@ def resolve_radial(choice, cfg):
     """Radyal eksen: seçim 'auto' ise kalıbın / kanalların çap ayarından bulunur, yoksa X."""
     if choice in ('X', 'Y'):
         return choice, 'seçildi'
+    pc = cfg.get('plane') or {}
     for d in [cfg.get('mold', {})] + list(cfg.get('channels', [])):
         if d.get('dia_mode') == 'diameter':
-            ax = d.get('dia_axis', 'X')
+            ax = str(d.get('dia_axis', 'X')).lstrip('-')
+            if ax in ('Yatay', 'Dikey'):
+                return ('X' if ax == 'Yatay' else 'Y'), 'çap ayarından'
+            if pc.get('hl') and ax in (pc.get('hl'), pc.get('vl')):      # program ekseni → DXF/ekran ekseni
+                return ('X' if ax == pc['hl'] else 'Y'), 'çap ayarından'
             return ('Y' if ax == 'Y' else 'X'), 'çap ayarından'
     return 'Y', 'varsayılan (parça yarıçapı Y)'
 
@@ -3875,8 +3902,8 @@ def sim_setup(fin, chains, n=1200):
     shear = fin.get('mode') == 'shear'
     k = ri if shear else 1 - ri
     M = fin['M']
-    if shear:
-        dsgn = 1 if abs(M[-1, ri]) >= abs(M[0, ri]) else -1
+    if shear:                                        # malzeme göbekten dışa tükenir: ham koordinatta kalıbın ilerleme yönü
+        dsgn = 1 if M[-1, ri] >= M[0, ri] else -1
     else:
         dsgn = 1 if M[-1, k] >= M[0, k] else -1
     lo, hi = float(poly[:, k].min()), float(poly[:, k].max())
@@ -4335,6 +4362,107 @@ def thickness_profile(form, step_mm=1.0):
         df = pd.DataFrame({cols[0]: r(arc, 3), cols[1]: r(p['x'], 3), cols[2]: r(p['y'], 3),
                            cols[3]: r(T), cols[4]: r(F), cols[5]: np.round(np.nan_to_num(dev[keep]), 2)})
     return fig_to_svg_card(fig), "  \n".join(lines), df
+
+
+# -------------------------------------------------------------
+# GERİ ESNEME (yaklaşık) — simülasyon sonundaki bitmiş ürün için
+#  1) Profil boyunca (meridyen) bükülme esnemesi: duvar orta hattının her eğriliği Gardiner bağıntısıyla gevşer
+#     Ri/Rf = 4x³ − 3x + 1,  x = Ri·σa / (E·t)   (x ≥ 0.5 → bükülme tamamen elastik, düzleşir)
+#     Orta hat sabit (tutulan) uçtan yeniden kurulur; öbür uçtaki parçalar (köprü, kuyruk) rijit olarak taşınır.
+#  2) Çap esnemesi: yarıçap × (1 + k·σa/E)  (k > 0 çap büyür, k < 0 küçülür, k = 0 yok).
+#  Düzlem birim şekil değiştirme yaklaşımıdır; dönel kabuğun çevresel rijitliği bükülme esnemesini gerçekte azaltır.
+# -------------------------------------------------------------
+def _rot(v, a):
+    c, s_ = np.cos(a), np.sin(a)
+    v = np.asarray(v, float)
+    return np.c_[c * v[..., 0] - s_ * v[..., 1], s_ * v[..., 0] + c * v[..., 1]] if v.ndim > 1 else \
+        np.array([c * v[0] - s_ * v[1], s_ * v[0] + c * v[1]])
+
+
+def springback(sim, st, mat):
+    """Bitmiş ürün (sim_state sonucu) → esnemiş ürün. Döndürür: {'polys', 'orig', 'info', 'dmax', 'dD', 'dphi'} ya da None"""
+    if not sim or not st or not mat:
+        return None
+    E, sy = float(mat.get('E', 0)) * 1000.0, float(mat.get('sy', 0))
+    if E <= 0 or sy <= 0:
+        return None
+    kh, clamp, ri = float(mat.get('kh', 1.0)), mat.get('clamp', 'start'), int(sim.get('ri', 1))
+    eh = kh * sy / E
+    hoop = lambda P: None if P is None else np.c_[P[:, 0] * (1 + eh), P[:, 1]] if ri == 0 else np.c_[P[:, 0], P[:, 1] * (1 + eh)]
+    note = ''
+    if sim.get('kind') == 'strip':
+        orig = [np.asarray(P, float) for P in (st.get('polys') or st.get('pieces') or []) if P is not None and len(P)]
+        polys = [hoop(P) for P in orig]
+        dphi, dmax = 0.0, max([float(np.max(np.hypot(*(a - b).T))) for a, b in zip(polys, orig)] or [0.0])
+        note = " (sac modelinde yalnız çap esnemesi)"
+    else:
+        W = st.get('wall')
+        if W is None or len(W) < 5:
+            return None
+        W = np.asarray(W, float)
+        n = (len(W) - 1) // 2
+        Po, Mf = W[:n], W[n:2 * n][::-1]
+        d = Po - Mf
+        w = np.hypot(*d.T)
+        a0 = int(st.get('start', 0))
+        fin_N = sim.get('_N')
+        v = np.where(w[:, None] > 1e-9, d / np.maximum(w, 1e-12)[:, None], 0.0)
+        if fin_N is not None and len(fin_N) >= a0 + n:
+            vn = fin_N[a0:a0 + n] * np.asarray(sim['side'], float)[a0:a0 + n, None]
+            v = np.where(w[:, None] > 1e-9, v, vn)
+        m = Mf + v * (w / 2)[:, None]
+        seg = np.diff(m, axis=0)
+        L = np.hypot(*seg.T)
+        ph = np.arctan2(seg[:, 1], seg[:, 0])
+        for j in range(1, len(ph)):                       # sıfır boylu parçalar önceki yönü alır
+            if L[j] < 1e-9:
+                ph[j] = ph[j - 1]
+        ph = np.unwrap(ph)
+        th = (np.diff(ph) + np.pi) % (2 * np.pi) - np.pi   # iç düğümlerde dönüş açıları
+        t_in = np.maximum(w[1:-1], 1e-6)
+        rho = np.maximum((L[:-1] + L[1:]) / 2, 1e-9) / np.maximum(np.abs(th), 1e-12)
+        Ri = np.maximum(rho - t_in / 2, 0.05 * t_in)
+        x = Ri * sy / (E * t_in)
+        ratio = np.where(x < 0.5, 4 * x ** 3 - 3 * x + 1, 0.0)
+        ratio = np.where(w[1:-1] > 1e-6, ratio, 1.0)
+        th2 = th * ratio
+        if clamp == 'end':
+            ph2 = np.empty_like(ph)
+            ph2[-1] = ph[-1]
+            for j in range(len(ph) - 2, -1, -1):
+                ph2[j] = ph2[j + 1] - th2[j]
+            m2 = np.empty_like(m)
+            m2[-1] = m[-1]
+            for j in range(len(ph) - 1, -1, -1):
+                m2[j] = m2[j + 1] - L[j] * np.array([np.cos(ph2[j]), np.sin(ph2[j])])
+        else:
+            ph2 = np.empty_like(ph)
+            ph2[0] = ph[0]
+            for j in range(1, len(ph)):
+                ph2[j] = ph2[j - 1] + th2[j - 1]
+            m2 = np.empty_like(m)
+            m2[0] = m[0]
+            for j in range(len(ph)):
+                m2[j + 1] = m2[j] + L[j] * np.array([np.cos(ph2[j]), np.sin(ph2[j])])
+        dph = ph2 - ph
+        dv = np.r_[dph[:1], (dph[:-1] + dph[1:]) / 2, dph[-1:]]
+        v2 = np.array([_rot(v[i], dv[i]) for i in range(n)])
+        Mf2, Po2 = m2 - v2 * (w / 2)[:, None], m2 + v2 * (w / 2)[:, None]
+        W2 = np.vstack([Po2, Mf2[::-1], Po2[:1]])
+        T0 = lambda P: None if P is None else m2[0] + _rot(np.asarray(P, float) - m[0], dv[0])
+        T1 = lambda P: None if P is None else m2[-1] + _rot(np.asarray(P, float) - m[-1], dv[-1])
+        orig = [np.asarray(P, float) for P in (st.get('fixed'), W, st.get('bridge'), st.get('rem')) if P is not None and len(P)]
+        moved = [T0(st.get('fixed')), W2, T1(st.get('bridge')), T1(st.get('rem'))]
+        polys = [hoop(P) for P in moved if P is not None and len(P)]
+        Wh = hoop(W2)
+        dmax = float(np.max(np.hypot(*(Wh - W).T)))
+        dphi = float(np.degrees(dv[-1] if clamp != 'end' else dv[0]))
+    rr = np.abs(np.vstack(orig)[:, ri]) if orig else np.zeros(1)
+    dD = 2 * float(np.max(rr)) * eh
+    info = (f"Geri esneme (yaklaşık){note}: E = {E / 1000:g} GPa, σa = {sy:g} MPa → çap {eh * 100:+.3f} % "
+            f"(en büyük çapta {dD:+.3f} mm), profil ucunda açı değişimi {dphi:+.3f}°, en büyük yer değiştirme {dmax:.3f} mm. "
+            f"Sabit uç: {'başlangıç' if clamp != 'end' else 'bitiş'}.")
+    return {'polys': polys, 'orig': orig, 'info': info, 'dmax': dmax, 'dD': dD, 'dphi': dphi, 'eh': eh}
 
 
 # ===== Hücre 18 =====
@@ -5328,7 +5456,8 @@ def mp4_generator(channels_segments, start_points, radii, mold_points, timelines
 def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, preform=None, tools=None):
     data = {'channels': [], 'mold': dict(cfg['mold']),
             'settings': {'contact_mode': cfg['contact_mode'], 'g0_feed': cfg['g0_feed'], 'fps': fps, 'speed': speed,
-                         'plane': dict(cfg.get('plane') or DEFAULT_PLANE)},
+                         'plane': dict(cfg.get('plane') or DEFAULT_PLANE),
+                         'material': dict(cfg.get('material') or DEFAULT_MATERIAL)},
             'autocad': {'start': ac_start, 'end': ac_end, 'step': ac_step},
             'plot': {'label_font': opts['label_font'], 'label_shift': opts['label_shift'],
                      'xname': opts['xname'], 'yname': opts['yname'],
@@ -5373,6 +5502,9 @@ def json_dict_to_updates(data, gr_update):
             ups.append(gr_update(value=_pc[key]))
     else:
         ups += [gr_update()] * 8
+    mat = st.get('material') if isinstance(st.get('material'), dict) else {}
+    for key in ('E', 'sy', 'kh', 'clamp'):
+        ups.append(gr_update(value=mat[key]) if key in mat else gr_update())
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
     ac = data.get('autocad', {}) or {}
@@ -5462,6 +5594,7 @@ input[type=range]{vertical-align:middle}
  <span id="presets"></span>
  <label><input type="checkbox" id="loop" checked> Döngü</label>
  <label><input type="checkbox" id="envc"> Radüs izi</label>
+ <label id="sbl" style="display:none" title="Simülasyon sonunda bitmiş ürünün geri esnemiş hali (malzeme ayarlarından)"><input type="checkbox" id="sbc"> Esneme</label><select id="sbx" style="display:none" title="Çizimde esneme yer değiştirmesini büyüt (sayılar gerçek değerdir)"><option value="1">×1</option><option value="10" selected>×10</option><option value="50">×50</option><option value="100">×100</option></select>
  <button id="fs">⛶ Tam Ekran</button>
 </div>
 <div class="bar"><input id="tm" type="range" min="0" max="10000" value="0"><b id="tv"></b></div>
@@ -5553,6 +5686,20 @@ if(EV){
   for(var q0=0;q0<NM;q0++){Mx[q0]=EV.M[2*q0];My[q0]=EV.M[2*q0+1];Nx[q0]=EV.N[2*q0];Ny[q0]=EV.N[2*q0+1];}
 } else { envC.checked=false; envC.parentNode.style.display='none'; }
 envC.onchange=function(){draw();};
+var sbC=document.getElementById('sbc');
+var sbX=document.getElementById('sbx');
+if(EV&&EV.sb){ document.getElementById('sbl').style.display=''; sbX.style.display=''; sbC.onchange=function(){draw();}; sbX.onchange=function(){ sbC.checked=true; draw(); }; }
+function drawSB(X,Y){   // simülasyon sonunda: geri esnemiş ürün (turuncu) — bitmiş ürünün üstüne
+  var sb=EV&&EV.sb; if(!sb||!sbC.checked) return;
+  var q=kf(); if(q[0]+q[1] < D.n-1.5) return;
+  ctx.save();
+  var fx=parseFloat(sbX.value)||1;
+  sb.polys.forEach(function(P,pi){ if(!P||P.length<6) return; var O=(sb.orig&&sb.orig[pi]&&sb.orig[pi].length===P.length)?sb.orig[pi]:P; ctx.beginPath();
+    for(var e=0;e<P.length;e+=2){ var px=O[e]+(P[e]-O[e])*fx, py=O[e+1]+(P[e+1]-O[e+1])*fx; if(e) ctx.lineTo(X(px),Y(py)); else ctx.moveTo(X(px),Y(py)); } ctx.closePath();
+    ctx.fillStyle='rgba(230,126,34,0.28)'; ctx.fill(); ctx.setLineDash([5,3]); ctx.strokeStyle='#d35400'; ctx.lineWidth=1.4; ctx.stroke(); });
+  ctx.restore();
+  var box=document.getElementById('simstat'); if(box){ box.style.display='block';
+    box.innerHTML+='<br><span style="color:#d35400"><b>Esneme açık</b> — turuncu kesikli: geri esnemiş ürün'+(fx!==1?' (çizimde yer değiştirmeler ×'+fx+' büyütüldü)':'')+'.<br>'+sb.info+'</span>'; } }
 function polyRayS(ox,oy,nx,ny,P){   // Python _poly_ray_s: içerideyse 0, değilse doğrultudaki en yakın kesişim
   var best=Infinity, cnt=0, n=P.length/2-1;
   for(var e=0;e<n;e++){ var ax=P[2*e]-ox, ay=P[2*e+1]-oy, dx=P[2*e+2]-P[2*e], dy=P[2*e+3]-P[2*e+1], den=nx*dy-ny*dx;
@@ -5697,6 +5844,25 @@ function bendTail(cc, useLo, src, outer, tgt, Vtarget, remP, outP){   // Python 
   var fa=1.0, fb=1.02, va=polyVol(build(fa)[0])-Vtarget, vb=polyVol(build(fb)[0])-Vtarget;
   for(var it=0;it<(OBST.length?12:6);it++){ if(Math.abs(vb)<1e-9*Math.max(Vtarget,1)||vb===va) break; var fn=fb-vb*(fb-fa)/(vb-va); fn=Math.min(Math.max(fn,0.2),6); fa=fb; va=vb; fb=fn; vb=polyVol(build(fb)[0])-Vtarget; }
   var r=build(fb); return [r[0],[r[1][0]]]; }
+function inPoly(p,P){ var ins=false; for(var i=0,j=P.length-1;i<P.length;j=i++){ var xi=P[i][0], yi=P[i][1], xj=P[j][0], yj=P[j][1];
+    if(((yi>p[1])!==(yj>p[1])) && (p[0]<(xj-xi)*(p[1]-yi)/((yj-yi)||1e-12)+xi)) ins=!ins; } return ins; }
+function polyHitsRoll(P, piv, d0){   // flanş kenarı (kökteki d0 yarıçaplı temas bölgesi hariç) makara profiline giriyor mu
+  for(var e=0;e+1<P.length;e++){ var A=P[e], B=P[e+1], L=Math.hypot(B[0]-A[0],B[1]-A[1]), m=Math.max(1,Math.ceil(L/1.5));
+    for(var s=0;s<=m;s++){ var p=[A[0]+(B[0]-A[0])*s/m, A[1]+(B[1]-A[1])*s/m];
+      if(Math.hypot(p[0]-piv[0],p[1]-piv[1])<d0) continue;
+      if(rollPen(p)[0]<-0.05) return true; } }
+  return false; }
+function flangeClear(remP, outP, piv){
+  if(!OBST.length) return [remP,outP,0];
+  var ax=1-SM.ri, fd=(ax===0?(Mx[NM-1]-Mx[0]):(My[NM-1]-My[0]))>=0?1:-1;
+  var far=remP.reduce(function(b,p){ var d=Math.hypot(p[0]-piv[0],p[1]-piv[1]); return d>b[0]?[d,p]:b; },[-1,piv])[1];
+  var rot=function(P,a){ var c=Math.cos(a), s=Math.sin(a); return P.map(function(p){ var dx=p[0]-piv[0], dy=p[1]-piv[1]; return [piv[0]+c*dx-s*dy, piv[1]+s*dx+c*dy]; }); };
+  var t1=rot([far],0.05)[0], sg=((t1[ax]-far[ax])*fd>=0)?1:-1;   // dönüş yönü: uç ileri (şekillendirme yönüne) gitsin
+  var d0=Math.max(Math.hypot(outP[0][0]-piv[0],outP[0][1]-piv[1]), 1)*1.5;   // kök: makara burnunun flanşa bindiği bölge
+  if(!polyHitsRoll(remP,piv,d0)) return [remP,outP,0];
+  for(var deg=1;deg<=80;deg+=1){ var a=sg*deg*Math.PI/180, R=rot(remP,a);
+    if(!polyHitsRoll(R,piv,d0)) return [R, rot(outP,a), deg]; }
+  var a8=sg*80*Math.PI/180; return [rot(remP,a8), rot(outP,a8), 80]; }
 function simState(SS){
   var front=-1, a0=-1, U=new Float64Array(NM);
   for(var i=0;i<NM;i++){ var u=Infinity; for(var c=0;c<NC;c++){ var v=SS[c][i]; if(okv(i,v,0)) u=Math.min(u,Math.abs(v)); } U[i]=u; if(isFinite(u)){ front=i; if(a0<0) a0=i; } }
@@ -5715,7 +5881,9 @@ function simState(SS){
   var inner=(lo[0]*nx+lo[1]*ny<=hi[0]*nx+hi[1]*ny)?lo:hi, outer=(inner===lo)?hi:lo, tgt=[Mx[end],My[end]];
   var rem=clipHalf(SIMP,SM.k,cc,SM.dir);
   var remP=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null, outP=[remapV(outer,inner,tgt)];
-  if(remP){ var bt=bendTail(cc, inner===lo, inner, outer, tgt, SM.Vtot-V0-cum, remP, outP); st.bent=(bt[0]!==remP); remP=bt[0]; outP=bt[1]; }
+  if(remP && SM.k===SM.ri){   // sıvama (shear): flanş düz kalır, makaraya değmeyecek en küçük açıyla öne eğilir
+    var fl=flangeClear(remP, outP, tgt); remP=fl[0]; outP=fl[1]; st.tilt=fl[2]; }
+  else if(remP){ var bt=bendTail(cc, inner===lo, inner, outer, tgt, SM.Vtot-V0-cum, remP, outP); st.bent=(bt[0]!==remP); remP=bt[0]; outP=bt[1]; }
   st.rem=remP;
   var wo=W[end-a0]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],outP[0]];
   st.T=[tgt[0]-inner[0],tgt[1]-inner[1]]; st.c=cc;
@@ -5815,6 +5983,7 @@ function drawSim(X,Y,st){
     '<br>Kalıba sıvanan duvar: '+fm(st.Vc)+' mm³ (%'+(st.Vc/SM.Vtot*100).toFixed(1)+')'+
     '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+xyLines([st.fixed,wall,st.bridge,st.rem])+
     (st.bent?'<br><span style="color:#b9770e">Kalan ön form kalıba / makaraya değdi — içine girmeden dışa doğru büküldü.</span>':'')+
+    (st.tilt?'<br><span style="color:#b9770e">Flanş makaranın önünde '+st.tilt+'° öne eğildi.</span>':'')+
     (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
@@ -5826,6 +5995,7 @@ function drawEnv(X,Y){
     ctx.setLineDash([]);
     OBST=(window.__NOROLLOBST?[]:rollerObst());
     if(STS){ var __st=stripState(SS); window.__ST=__st; drawStrip(X,Y,__st); } else drawSim(X,Y,simState(SS));
+    drawSB(X,Y);
     if(SHEAR && !STS){ ctx.strokeStyle='#6a3d9a'; ctx.lineWidth=1.4; ctx.setLineDash([4,2]);
       var ixs=function(i){return Mx[i]+Nx[i]*SDS[i]*TI[i];}, iys=function(i){return My[i]+Ny[i]*SDS[i]*TI[i];};
       runs(function(i){return Ta[i]>0 && TI[i]>1e-6;},ixs,iys,BRK).forEach(function(r){ctx.beginPath(); polyPath(r,ixs,iys,X,Y,null); ctx.stroke();});
@@ -6316,6 +6486,43 @@ def _plot_kw(opts):
                 label_font=opts['label_font'], label_shift=opts['label_shift'])
 
 
+_SIDE_CACHE = {}
+
+
+def _pf_side(chains, radial, cfg):
+    """Ön form dönme ekseninin kalıba göre öbür tarafına çizilmişse (ör. kalıp −X'te, plaka +X'te) kalıp tarafına aynalar."""
+    if not cfg or not cfg.get('mold') or not str(cfg['mold'].get('code') or '').strip():
+        return chains, ''
+    ri = 0 if radial == 'X' else 1
+    key = (str(cfg['mold'].get('code')), cfg['mold'].get('x0'), cfg['mold'].get('y0'), cfg['mold'].get('dia_mode'),
+           repr(cfg.get('plane')))
+    if key not in _SIDE_CACHE:
+        try:
+            M = np.asarray(get_mold_points_cfg(cfg['mold'], cfg.get('g0_feed', DEFAULT_G0_FEED), cfg.get('plane'), []), float)
+        except Exception:
+            M = np.zeros((0, 2))
+        _SIDE_CACHE.clear()
+        _SIDE_CACHE[key] = M
+    M = _SIDE_CACHE[key]
+    if len(M) < 2:
+        return chains, ''
+    mv = M[:, ri][np.abs(M[:, ri]) > 0.5]
+    P = np.vstack([A for A, _c in chains if len(A)])
+    pv = P[:, ri][np.abs(P[:, ri]) > 0.5]
+    if not len(mv) or not len(pv):
+        return chains, ''
+    ms = np.sign(np.median(mv))
+    if np.mean(np.sign(mv) == ms) < 0.9 or np.mean(np.sign(pv) == -ms) < 0.95:
+        return chains, ''
+    out = []
+    for A, cl in chains:
+        B = np.array(A, float, copy=True)
+        B[:, ri] *= -1.0
+        out.append((B, cl))
+    return out, (f"Ön form dönme ekseninin öbür tarafına çizilmiş (kalıp DXF {radial} {'−' if ms < 0 else '+'} tarafında) — "
+                 f"kalıp tarafına aynalandı.")
+
+
 def _preform(opts, cfg=None):
     """Kullanılacak ön form (yüklü ve 'kullan' işaretliyse): zincirler + model + radyal eksen."""
     st = opts.get('pf_state')
@@ -6326,9 +6533,19 @@ def _preform(opts, cfg=None):
     if not chains:
         return None
     radial, why = resolve_radial(opts.get('pf_radial', 'auto'), cfg or {})
+    side_note = ''
+    auto_ax, auto_why = resolve_radial('auto', cfg or {})
+    if auto_why == 'çap ayarından' and radial != auto_ax:
+        # dönme ekseni makine eksenidir: ön formun yarıçap ekseni kalıp / program çap ekseniyle aynı olmalı
+        side_note = (f"Ön form 'Parça yarıçapı ekseni' DXF {radial} seçiliydi ama program / kalıp çapı DXF {auto_ax} "
+                     f"ekseninde — dönme ekseni aynı olmalı, DXF {auto_ax} kullanıldı.")
+        radial, why = auto_ax, 'çap ayarından (seçim düzeltildi)'
     radial, warn = radial_guard(chains, radial)
     if warn:
         why = 'otomatik düzeltildi'
+    chains, mnote = _pf_side(chains, radial, cfg)
+    if side_note or mnote:
+        rnote = "\n".join(x for x in (rnote, side_note, mnote) if x)
     return {'chains': chains, 'model': opts.get('pf_model', 'strip'), 'radial': radial, 'radial_why': why,
             'radial_warn': warn, 'repair_note': rnote, 'sim': bool(opts.get('pf_sim'))}
 
@@ -6412,6 +6629,13 @@ def run_all(*vals):
         frame0 = render_frame_image(token, 0)
 
         form = _envelopes(timelines, radii, mold_pts, opts, cfg=cfg)
+        sb_res = None
+        try:
+            _smf = ((form or {}).get('final') or {}).get('sim') if form else None
+            if _smf and _smf.get('ok') and _smf.get('final') is not None:
+                sb_res = springback(_smf, _smf['final'], cfg.get('material'))
+        except Exception:
+            sb_res = None
         comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, form)
         table = distance_table(segs, mold_pts)
         th_html, th_md, th_df = thickness_profile(form)
@@ -6419,6 +6643,10 @@ def run_all(*vals):
         try:
             env_d = (player_env_data(timelines, radii, mold_pts, [opts['env_limit']] * N_CH, opts['show_env'],
                                      form=form) if len(mold_pts) > 1 else None)
+            if env_d is not None and sb_res is not None:
+                env_d['sb'] = {'polys': [[round(float(q), 4) for q in np.asarray(P).ravel()] for P in sb_res['polys']],
+                               'orig': [[round(float(q), 4) for q in np.asarray(P).ravel()] for P in sb_res['orig']],
+                               'info': sb_res['info']}
             cnc_d = player_cnc_data(cfg, segs, timelines, total_time, starts)
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
@@ -6443,6 +6671,8 @@ def run_all(*vals):
                            + "\nEksenlere göre uzama: " + sim_xy_text(_sm, _sm['final'], (opts['xname'], opts['yname'])))
             else:
                 status += "\nSimülasyon çalışmadı: " + _sm.get('why', '')
+        if sb_res is not None:
+            status += "\n" + sb_res['info'] + " Hızlı Oynatıcıda 'Esneme' kutusuyla sonda göster."
         return (frame0,
                 gr.update(minimum=0, maximum=n_frames, value=0),
                 gr.update(value=playback_interval(fps, speed), active=False),
@@ -6569,22 +6799,27 @@ def make_mp4(*vals):
 # -------------------------------------------------------------
 @_trim
 def make_dxf(*vals):
-    """vals = all_inputs + [seçili DXF katmanları, çember konumu]"""
+    """vals = all_inputs + [seçili DXF katmanları, çember konumu, çember kanalları]"""
     try:
-        layers = vals[-2] or []
-        cmode = 'blocks' if vals[-1] == 'blocks' else 'time'
+        layers = vals[-3] or []
+        cmode = 'blocks' if vals[-2] == 'blocks' else 'time'
+        cch = vals[-1]
+        cch = None if cch is None else {int(c) for c in cch}
         if not layers:
             return None, "DXF için en az bir katman seç."
-        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-2])
+        if 'circles' in layers and cch is not None and not cch:
+            return None, "Çemberler için en az bir kanal seç (ya da 'Takım çemberleri' katmanını kapat)."
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-3])
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if total_time <= 0:
             total_time = 1.0
         envs = (_envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg)
-                if {'envelope', 'preform', 'final'} & set(layers) else None)
+                if {'envelope', 'preform', 'final', 'product', 'product_sb'} & set(layers) else None)
         end_used = ac_e if ac_e > ac_s else total_time
         txt, summary = build_dxf_text(layers, segs, radii, mold_pts, timelines, total_time,
-                                      ac_s, end_used, ac_st, envs, circ_mode=cmode)
+                                      ac_s, end_used, ac_st, envs, circ_mode=cmode, circ_chans=cch,
+                                      material=cfg.get('material'))
         out_dir = tempfile.mkdtemp(prefix='cnc_dxf_')
         path = os.path.join(out_dir, 'cnc_simulasyon.dxf')
         with open(path, 'w', encoding='ascii', newline='\r\n') as f:
@@ -7039,6 +7274,23 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                 pf_sim = gr.Checkbox(value=False, label="Simülasyon modu: ön form adım adım şekillensin (hacim sabit)",
                                      info="Makaranın geçtiği yer kalıba sıvanıp takım boşluğu kalınlığına iner; artan hacim "
                                           "kalan malzemeyi ileri iterek uçta uzama olarak görünür. Hızlı Oynatıcıda canlı izlenir.")
+                with gr.Accordion("Malzeme esnemesi (geri esneme) — simülasyon sonunda", open=False):
+                    gr.Markdown("Bitmiş ürünün kalıptan çıkınca **geri esnemesi** (yaklaşık). Hızlı Oynatıcıda **Esneme** "
+                                "kutusuyla açılıp kapanır; simülasyonun sonunda turuncu kesikli olarak çizilir. "
+                                "Profil boyunca: duvar orta hattındaki her eğrilik Gardiner bağıntısıyla gevşer "
+                                "(Ri/Rf = 4x³ − 3x + 1, x = Ri·σa/(E·t)); çap: yarıçap × (1 + k·σa/E). "
+                                "Simülasyon modu açık bir ön form gerekir.")
+                    with gr.Row():
+                        mat_E = gr.Number(value=DEFAULT_MATERIAL['E'], label="Elastisite modülü E (GPa)", minimum=0)
+                        mat_sy = gr.Number(value=DEFAULT_MATERIAL['sy'], label="Akma dayanımı σa (MPa)", minimum=0,
+                                           info="Şekillendirme sonrası (pekleşmiş) akma dayanımı girilirse daha gerçekçi olur.")
+                    with gr.Row():
+                        mat_kh = gr.Number(value=DEFAULT_MATERIAL['kh'], label="Çap esneme katsayısı k",
+                                           info="Çap değişimi = k·σa/E. 1: çap büyür (kalıptan boşalma), 0: çap değişmez, "
+                                                "eksi: çap küçülür. Ölçülmüş bir parçayla ayarlanabilir.")
+                        mat_clamp = gr.Dropdown(CLAMP_CHOICES, value='start', label="Sabit (tutulan) uç")
+                    mat_comps = [mat_E, mat_sy, mat_kh, mat_clamp]
+                    cfg_comps += mat_comps
                 with gr.Row():
                     pf_use = gr.Checkbox(value=True, label="Ön formu kullan")
                     pf_dx = gr.Number(value=0.0, label="Ön form kaydırma X (mm)")
@@ -7142,6 +7394,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                 "ortası ve sonu — zaman aralığı girilirse yalnız o aralıktaki bloklar. Bitiş 0 = toplam süre.")
                     ac_mode = gr.Radio([("Zaman adımlı", 'time'), ("Program adımlarının başı – ortası – sonu", 'blocks')],
                                        value='time', label="Çember konumları")
+                    ac_chans = gr.CheckboxGroup([(f"Kanal {k + 1}", k) for k in range(N_CH)], value=list(range(N_CH)),
+                                                label="Çember çizilecek kanallar")
                     with gr.Row():
                         ac_start = gr.Number(value=0.0, label="Başlangıç Zamanı (s)")
                         ac_end = gr.Number(value=0.0, label="Bitiş Zamanı (s)  [0 = otomatik]")
@@ -7230,7 +7484,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                   outputs=[video_out, mp4_file, status])
 
     # DXF
-    dxf_btn.click(make_dxf, inputs=all_inputs + [dxf_layers, ac_mode], outputs=[dxf_file, status])
+    dxf_btn.click(make_dxf, inputs=all_inputs + [dxf_layers, ac_mode, ac_chans], outputs=[dxf_file, status])
 
     # JSON
     json_btn.click(export_json, inputs=all_inputs, outputs=[json_file_out, status])
