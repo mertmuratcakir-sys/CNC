@@ -5854,12 +5854,28 @@ function polyHitsRoll(P, piv, d0){   // flanş kenarı (kökteki d0 yarıçaplı
   return false; }
 function flangeClear(remP, outP, piv){
   if(!OBST.length) return [remP,outP,0];
-  var ax=1-SM.ri, fd=(ax===0?(Mx[NM-1]-Mx[0]):(My[NM-1]-My[0]))>=0?1:-1;
+  var ax=1-SM.ri, ri=SM.ri, fd=(ax===0?(Mx[NM-1]-Mx[0]):(My[NM-1]-My[0]))>=0?1:-1;
+  // temas eden makara: duvar ucuna en yakın profil
+  var best=null, bd=Infinity;
+  OBST.forEach(function(ob){ ob.P.forEach(function(p){ var d=Math.hypot(p[0]-piv[0],p[1]-piv[1]); if(d<bd){bd=d; best=ob;} }); });
+  var thick=Math.max(Math.hypot(outP[0][0]-piv[0],outP[0][1]-piv[1]),1);
+  if(best && bd<3*thick+2){
+    // malzeme makara burnunu sarar; flanş makaranın en öndeki noktasından (şekillendirme yönünde) eksene dik çıkar
+    var E=best.P.reduce(function(b,p){ return (fd*p[ax]>fd*b[ax])?p:b; }, best.P[0]);   // en öndeki nokta
+    var sgn=(piv[ri]<0)?-1:1, r0=Math.max(Math.abs(piv[ri]),Math.abs(E[ri]))*sgn;
+    var tg=[0,0]; tg[ax]=E[ax]; tg[ri]=r0;
+    var mv=function(P){ return P.map(function(p){ var o=[p[0],p[1]]; o[ax]+=tg[ax]-piv[ax]; var d=tg[ri]*tg[ri]-piv[ri]*piv[ri], r=o[ri], s=(r<0)?-1:1;
+      o[ri]=s*Math.sqrt(Math.max(r*r+d,0)); return o; }); };   // hacmi koruyan taşıma (r² kaydırma)
+    var R1=mv(remP), O1=mv(outP);
+    // flanş makaranın önünde kalsın: gerekiyorsa ileri kaydır (kökte 1 mm temas payı)
+    var sh=function(P,d){ return P.map(function(p){ var q=p.slice(); q[ax]+=fd*d; return q; }); };
+    for(var dd=0; dd<=40; dd+=0.25){ var Rs=sh(R1,dd); if(!polyHitsRoll(Rs,tg,1.0)) return [Rs, sh(O1,dd), 0, Math.abs(tg[ax]-piv[ax])+dd]; }
+    remP=R1; outP=O1; piv=tg; }
+  var d0=Math.max(thick,1)*1.5;
+  if(!polyHitsRoll(remP,piv,d0)) return [remP,outP,0];
   var far=remP.reduce(function(b,p){ var d=Math.hypot(p[0]-piv[0],p[1]-piv[1]); return d>b[0]?[d,p]:b; },[-1,piv])[1];
   var rot=function(P,a){ var c=Math.cos(a), s=Math.sin(a); return P.map(function(p){ var dx=p[0]-piv[0], dy=p[1]-piv[1]; return [piv[0]+c*dx-s*dy, piv[1]+s*dx+c*dy]; }); };
-  var t1=rot([far],0.05)[0], sg=((t1[ax]-far[ax])*fd>=0)?1:-1;   // dönüş yönü: uç ileri (şekillendirme yönüne) gitsin
-  var d0=Math.max(Math.hypot(outP[0][0]-piv[0],outP[0][1]-piv[1]), 1)*1.5;   // kök: makara burnunun flanşa bindiği bölge
-  if(!polyHitsRoll(remP,piv,d0)) return [remP,outP,0];
+  var t1=rot([far],0.05)[0], sg=((t1[ax]-far[ax])*fd>=0)?1:-1;
   for(var deg=1;deg<=80;deg+=1){ var a=sg*deg*Math.PI/180, R=rot(remP,a);
     if(!polyHitsRoll(R,piv,d0)) return [R, rot(outP,a), deg]; }
   var a8=sg*80*Math.PI/180; return [rot(remP,a8), rot(outP,a8), 80]; }
@@ -5882,7 +5898,7 @@ function simState(SS){
   var rem=clipHalf(SIMP,SM.k,cc,SM.dir);
   var remP=rem?rem.map(function(p){return remapV(p,inner,tgt);}):null, outP=[remapV(outer,inner,tgt)];
   if(remP && SM.k===SM.ri){   // sıvama (shear): flanş düz kalır, makaraya değmeyecek en küçük açıyla öne eğilir
-    var fl=flangeClear(remP, outP, tgt); remP=fl[0]; outP=fl[1]; st.tilt=fl[2]; }
+    var fl=flangeClear(remP, outP, tgt); remP=fl[0]; outP=fl[1]; st.tilt=fl[2]; st.shift=fl[3]||0; }
   else if(remP){ var bt=bendTail(cc, inner===lo, inner, outer, tgt, SM.Vtot-V0-cum, remP, outP); st.bent=(bt[0]!==remP); remP=bt[0]; outP=bt[1]; }
   st.rem=remP;
   var wo=W[end-a0]; st.bridge=[tgt,[Mx[end]+Nx[end]*SDS[end]*wo,My[end]+Ny[end]*SDS[end]*wo],outP[0]];
@@ -5984,6 +6000,7 @@ function drawSim(X,Y,st){
     '<br>Uç uzaması ('+kn+' yönünde): <b>'+el.toFixed(2)+' mm</b>'+xyLines([st.fixed,wall,st.bridge,st.rem])+
     (st.bent?'<br><span style="color:#b9770e">Kalan ön form kalıba / makaraya değdi — içine girmeden dışa doğru büküldü.</span>':'')+
     (st.tilt?'<br><span style="color:#b9770e">Flanş makaranın önünde '+st.tilt+'° öne eğildi.</span>':'')+
+    (st.shift?'<br><span style="color:#b9770e">Flanş makara burnunu sarıp makaranın önünden eksene dik çıkıyor ('+st.shift.toFixed(1)+' mm ileride).</span>':'')+
     (st.exh?'<br><span style="color:#c0392b;font-weight:bold">Malzeme bitti — duvar burada sona eriyor.</span>':''); }
 function drawEnv(X,Y){
   if(!EV||!envC.checked) return;
@@ -6543,6 +6560,17 @@ def _preform(opts, cfg=None):
     radial, warn = radial_guard(chains, radial)
     if warn:
         why = 'otomatik düzeltildi'
+    if opts.get('pf_model') == 'shear':
+        # sıvama: plaka / diskin yarıçapı uzun kenarı, kalınlığı (eksen yönü) kısa kenarıdır
+        _P = np.vstack([A for A, _c in chains if len(A)])
+        _ext = _P.max(0) - _P.min(0)
+        _k = 0 if radial == 'X' else 1
+        if _ext[_k] < 0.25 * _ext[1 - _k]:
+            _other = 'Y' if radial == 'X' else 'X'
+            side_note = ((side_note + "\n") if side_note else "") + (
+                f"Sıvama ön formu DXF {radial} yönünde yalnız {_ext[_k]:.1f} mm, DXF {_other} yönünde {_ext[1 - _k]:.1f} mm — "
+                f"bu bir plaka/disk: yarıçap ekseni DXF {_other} olarak düzeltildi (dönme ekseni = DXF {radial}).")
+            radial, why = _other, 'plaka şeklinden düzeltildi'
     chains, mnote = _pf_side(chains, radial, cfg)
     if side_note or mnote:
         rnote = "\n".join(x for x in (rnote, side_note, mnote) if x)
