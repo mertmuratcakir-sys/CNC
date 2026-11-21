@@ -817,7 +817,7 @@ DIA_AXIS_CHOICES = [('Yatay eksen', 'X'), ('Dikey eksen', 'Y'), ('İkisi de', 'X
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1 + 1 + 8 + 4  # 43: … + malzeme esnemesi(4: E, akma, çap katsayısı, sabit uç); kalıp(5) + çizilen yol modu + G0 hızı + eksenler(8: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon, köşe kesişim açısı, küçük iç yayı atla)
+N_CFG = MOLD_START + 5 + 1 + 1 + 8 + 4 + 9  # 52: … + malzeme esnemesi(4: E, akma, çap katsayısı, sabit uç) + kuvvet(9: devir, k_f0, C, n, η, makara çapı, makara sayısı, β, rijitlik); kalıp(5) + çizilen yol modu + G0 hızı + eksenler(8: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon, köşe kesişim açısı, küçük iç yayı atla)
 N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
                                     # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
@@ -861,7 +861,7 @@ def cfg_from_values(v):
                                prof_comp=v[m + 12] if len(v) > m + 12 else None,
                                ins_limit=v[m + 13] if len(v) > m + 13 else None,
                                skip_arcs=v[m + 14] if len(v) > m + 14 else None),
-            'material': material_cfg(*[(v[m + 15 + q] if len(v) > m + 15 + q else None) for q in range(4)])}
+            'material': material_cfg(*[(v[m + 15 + q] if len(v) > m + 15 + q else None) for q in range(13)])}
 
 
 def opts_from_values(v):
@@ -1000,15 +1000,52 @@ def _num_or(x, default):
         return default
 
 
-DEFAULT_MATERIAL = {'E': 210.0, 'sy': 300.0, 'kh': 1.0, 'clamp': 'start'}
+DEFAULT_MATERIAL = {'E': 210.0, 'sy': 300.0, 'kh': 1.0, 'clamp': 'start',
+                    # şekillendirme kuvvetleri (Thamasett): iş mili devri, akış eğrisi k_f = C·(ε0+φ)ⁿ (k_f(0) = k_f0),
+                    # verim η, makara çapı, kanal başına makara sayısı, β (0: α), makine rijitliği (0: rijit)
+                    'rpm': 300.0, 'kf0': 300.0, 'C': 0.0, 'nh': 0.2, 'eta': 0.15, 'Dr': 250.0, 'z': 1,
+                    'beta': 0.0, 'cst': 0.0}
+MATERIAL_KEYS = ('E', 'sy', 'kh', 'clamp', 'rpm', 'kf0', 'C', 'nh', 'eta', 'Dr', 'z', 'beta', 'cst')
 CLAMP_CHOICES = [('Başlangıç ucu (kalıbın ilk şekillenen kısmı / göbek)', 'start'), ('Bitiş ucu (son şekillenen kısım)', 'end')]
 
 
-def material_cfg(E=None, sy=None, kh=None, clamp=None):
-    """Geri esneme için malzeme: E [GPa], akma dayanımı σa [MPa], çap esneme katsayısı k, sabit (tutulan) uç."""
-    return {'E': _num_or(E, DEFAULT_MATERIAL['E']), 'sy': _num_or(sy, DEFAULT_MATERIAL['sy']),
-            'kh': float(kh) if isinstance(kh, (int, float)) and np.isfinite(kh) else DEFAULT_MATERIAL['kh'],
-            'clamp': clamp if clamp in ('start', 'end') else 'start'}
+def material_cfg(E=None, sy=None, kh=None, clamp=None, rpm=None, kf0=None, C=None, nh=None, eta=None,
+                 Dr=None, z=None, beta=None, cst=None):
+    """Malzeme: geri esneme (E [GPa], σa [MPa], çap esneme katsayısı k, sabit uç) +
+    şekillendirme kuvvetleri (devir [dev/dk], k_f0 [MPa], C [MPa], n, η, makara çapı [mm], z, β [°], c [kN/mm])."""
+    D = DEFAULT_MATERIAL
+    eta_v = _num_or(eta, D['eta'])
+    return {'E': _num_or(E, D['E']), 'sy': _num_or(sy, D['sy']),
+            'kh': float(kh) if isinstance(kh, (int, float)) and np.isfinite(kh) else D['kh'],
+            'clamp': clamp if clamp in ('start', 'end') else 'start',
+            'rpm': _num_or(rpm, D['rpm']), 'kf0': _num_or(kf0, D['kf0']), 'C': _num_or(C, D['C']),
+            'nh': _num_or(nh, D['nh']), 'eta': eta_v if 0 < eta_v <= 1 else D['eta'],
+            'Dr': _num_or(Dr, D['Dr']), 'z': int(max(round(_num_or(z, D['z'])), 1)),
+            'beta': _num_or(beta, D['beta']), 'cst': _num_or(cst, D['cst'])}
+
+
+def flow_stress(phi, mat):
+    """Akış eğrisi k_f(φ) [MPa]: C > 0 ise Swift k_f = C·(ε0 + φ)ⁿ, ε0 = (k_f0 / C)^(1/n) (φ = 0'da k_f0); değilse sabit k_f0."""
+    phi = np.clip(np.asarray(phi, float), 0.0, None)
+    kf0, C, n = float(mat.get('kf0', 300.0)), float(mat.get('C', 0.0)), float(mat.get('nh', 0.2))
+    if C <= 0 or n <= 0:
+        return np.full_like(phi, kf0)
+    e0 = (kf0 / C) ** (1.0 / n) if kf0 > 0 else 0.0
+    return C * (e0 + phi) ** n
+
+
+def flow_stress_mean(phi_a, phi_b, mat):
+    """[φa, φb] aralığında ortalama akma gerilmesi k_fm (Thamasett bağıntılarındaki k_fm)."""
+    a = np.clip(np.asarray(phi_a, float), 0.0, None)
+    b = np.maximum(np.clip(np.asarray(phi_b, float), 0.0, None), a)
+    kf0, C, n = float(mat.get('kf0', 300.0)), float(mat.get('C', 0.0)), float(mat.get('nh', 0.2))
+    if C <= 0 or n <= 0:
+        return np.full_like(a, kf0)
+    e0 = (kf0 / C) ** (1.0 / n) if kf0 > 0 else 0.0
+    d = b - a
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mean = C / (n + 1.0) * ((e0 + b) ** (n + 1.0) - (e0 + a) ** (n + 1.0)) / np.where(d > 1e-9, d, 1.0)
+    return np.where(d > 1e-9, mean, C * (e0 + a) ** n)
 
 
 def plane_cfg(hl=None, vl=None, g42_dir=None, g42_side=None, tip=None, hneg=None, vneg=None,
@@ -4862,15 +4899,27 @@ def _engage_setup(timelines, radii, mold_points, fin=None, env_limit=0.0):
     samples = [(_wear_samples(timelines[i], radii[i]) if act[i] else None) for i in range(N_CH)]
     # malzeme tarafı (ışın başına): ön form varsa ondan, yoksa takımın bulunduğu taraf
     if fin is not None and len(fin.get('side', [])) == len(M):
-        sd = np.asarray(fin['side'], int)
+        sd = np.asarray(fin['side'], int).copy()       # ön formun ulaşmadığı ışınlarda 0 → doldurulur
+        _sm = fin.get('sim') or {}
+        if len(_sm.get('side', [])) == len(M):
+            sd = np.where(sd != 0, sd, np.asarray(_sm['side'], int))
+        nz = np.where(sd != 0)[0]
+        if 0 < len(nz) < len(M):                       # malzeme tarafı kontur boyunca süreklidir: en yakın komşu
+            idx = np.arange(len(M))
+            p = np.clip(np.searchsorted(nz, idx), 1, len(nz) - 1) if len(nz) > 1 else np.zeros(len(M), int)
+            lo, hi = nz[np.maximum(p - 1, 0)], nz[p]
+            sd = np.where(sd != 0, sd, np.where(np.abs(idx - lo) <= np.abs(hi - idx), sd[lo], sd[hi]))
     else:
         sd = np.zeros(len(M), int)
+    if np.any(sd == 0):
         for i in range(N_CH):
             if samples[i] is not None:
                 s_env = radius_envelope(M, N, samples[i]['C'], radii[i])
                 m = (sd == 0) & np.isfinite(s_env) & (s_env != 0)
                 sd[m] = np.sign(s_env[m]).astype(int)
-        sd[sd == 0] = 1
+        if np.any(sd == 0):
+            glob = 1 if sd.sum() >= 0 else -1
+            sd[sd == 0] = glob
     # başlangıç malzeme yüzeyi (kalıptan uzaklık)
     if fin is not None and len(fin.get('T', [])) == len(M) and np.isfinite(fin['T']).any():
         T0 = np.asarray(fin['T'], float)
@@ -5171,7 +5220,7 @@ def _roll_med(x, w=7):
 
 
 def compute_process(timelines, radii, mold_points, fin, env_limit, ri, n_rpm, kfm, eta, D_tool, z=1,
-                    beta_deg=0.0, c_stiff=0.0, shear=False):
+                    beta_deg=0.0, c_stiff=0.0, shear=False, mat=None):
     """Takım yolu boyunca kuvvet / güç / akış yönü / esneme. ri: parça yarıçapı ekseni indeksi (0 = X, 1 = Y).
     Döndürür: (kanal sonuçları, gelen yüzey kaynağı, E)"""
     E = _engage_setup(timelines, radii, mold_points, fin, env_limit)
@@ -5203,14 +5252,21 @@ def compute_process(timelines, radii, mold_points, fin, env_limit, ri, n_rpm, kf
         ds = np.clip(np.nan_to_num(s0 - s1), 0.0, None)
         eng = (ds > 1e-3) & (bw > 1e-3) & np.isfinite(s1)
         f = smp['v'] / max(float(n_rpm) * max(int(z), 1), 1e-9)          # mm / devir (makara başına)
+        # akış eğrisi: makaranın altındaki toplam şekil değiştirme ön formdan ölçülür (pekleşme birikir)
+        S0r = np.asarray(E['S0'], float)[tipray]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ph0 = np.where(eng & (S0r > 1e-6) & (s0 > 1e-6), np.log(np.maximum(S0r, 1e-9) / np.maximum(s0, 1e-9)), 0.0)
+            ph1 = np.where(eng & (S0r > 1e-6) & (s1 > 1e-6), np.log(np.maximum(S0r, 1e-9) / np.maximum(s1, 1e-9)), 0.0)
+        ph0 = np.clip(np.nan_to_num(ph0), 0.0, None); ph1 = np.maximum(np.clip(np.nan_to_num(ph1), 0.0, None), ph0)
+        kfa = flow_stress_mean(ph0, ph1, mat) if mat else np.full(Kn, float(kfm))
         rM = np.abs(M[tipray, ri])
         rmCD = 2.0 * rT * rM / np.maximum(rT + rM, 1e-9)
         rmLD = 2.0 * float(radii[i])
         with np.errstate(divide='ignore', invalid='ignore'):
             dh = np.where(eng, f * ds / np.maximum(bw, 1e-9), 0.0)
             ld = np.sqrt(rmCD * dh)
-            Fr = np.where(eng, bw * ld * kfm / eta, 0.0)
-            Ft = np.where(eng, f * ds * kfm / eta, 0.0)
+            Fr = np.where(eng, bw * ld * kfa / eta, 0.0)
+            Ft = np.where(eng, f * ds * kfa / eta, 0.0)
             alpha = np.where(eng, np.arctan2(ds, np.maximum(bw, 1e-9)), 0.0)
             beta = np.radians(beta_deg) if beta_deg and beta_deg > 0 else np.minimum(alpha, np.pi / 4)
             Fa = Fr * np.tan(beta)
@@ -5224,13 +5280,14 @@ def compute_process(timelines, radii, mold_points, fin, env_limit, ri, n_rpm, kf
         r = {'t': smp['T'], 'line': smp['line'], 'eng': eng, 's0': s0, 's1': s1, 'ds': ds, 'b': bw, 'f': f,
              'Fr': _roll_med(Fr), 'Fa': _roll_med(Fa), 'Ft': _roll_med(Ft), 'P': _roll_med(P), 'dlt': _roll_med(dlt),
              'alpha': alpha, 'eps': eps, 'phi': phi, 'flow': rmCD / max(rmLD, 1e-9), 'rM': rM, 'tipray': tipray,
-             'Mt': _roll_med(Ft * rc / 1000.0), 'z': max(int(z), 1)}
+             'Mt': _roll_med(Ft * rc / 1000.0), 'z': max(int(z), 1), 'kfm': kfa, 'phiT': ph1, 'C': smp['C'],
+             'u': smp['u'], 'Mtip': M[tipray]}
         if shear and fin is not None and len(fin.get('T', [])) == len(M):
             sinA = np.abs(N[tipray, 1 - ri]); cosA = np.abs(N[tipray, ri])
             t0 = np.nan_to_num(np.asarray(fin['T'], float)[tipray])
             with np.errstate(divide='ignore', invalid='ignore'):
                 r['sine'] = np.where(eng & (t0 * sinA > 1e-6), s1 / (t0 * sinA), np.nan)     # 1 = sinüs kuralı
-                r['FtK'] = np.where(eng, kfm / np.sqrt(3.0) * f * t0 * cosA, 0.0)
+                r['FtK'] = np.where(eng, kfa / np.sqrt(3.0) * f * t0 * cosA, 0.0)
                 r['phiV'] = np.where(eng & (sinA > 1e-6), cosA / (np.sqrt(3.0) * sinA), np.nan)
         out.append(r)
     return out, E['src'], E
@@ -5503,7 +5560,7 @@ def json_dict_to_updates(data, gr_update):
     else:
         ups += [gr_update()] * 8
     mat = st.get('material') if isinstance(st.get('material'), dict) else {}
-    for key in ('E', 'sy', 'kh', 'clamp'):
+    for key in MATERIAL_KEYS:
         ups.append(gr_update(value=mat[key]) if key in mat else gr_update())
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
@@ -5584,6 +5641,12 @@ input[type=range]{vertical-align:middle}
 .cnc td{padding:1px 5px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .cnc td.k{text-align:left;color:#8b949e}
 .cnc td.big{font-size:15px;font-weight:bold;color:#e6edf3}
+.cnc .frc{border-top:1px solid #2d333b;margin-top:4px;padding-top:3px}
+.cnc .frc .fh{color:#8b949e;font-size:11px;margin-bottom:1px;display:flex;justify-content:space-between;gap:6px}
+.cnc .frc table{width:100%}
+.cnc .frc td.fr{color:#6cb6ff}.cnc .frc td.fa{color:#ff9e64}.cnc .frc td.ft{color:#56d4a0}
+.cnc .frc .fx{color:#8b949e;font-size:11px;white-space:normal;line-height:1.35;min-height:30px}
+.cnc .frc svg{display:block;width:100%;height:40px;margin-top:2px}
 @media (max-width:760px){#cncrow{flex-direction:column}.cnc{min-width:0}}
 @media (max-width:760px){#main{flex-direction:column}#side{width:auto;flex:0 0 auto;max-height:46%;border-left:0;border-top:1px solid #ddd}}
 </style></head><body>
@@ -5595,6 +5658,7 @@ input[type=range]{vertical-align:middle}
  <label><input type="checkbox" id="loop" checked> Döngü</label>
  <label><input type="checkbox" id="envc"> Radüs izi</label>
  <label id="sbl" style="display:none" title="Simülasyon sonunda bitmiş ürünün geri esnemiş hali (malzeme ayarlarından)"><input type="checkbox" id="sbc"> Esneme</label><select id="sbx" style="display:none" title="Çizimde esneme yer değiştirmesini büyüt (sayılar gerçek değerdir)"><option value="1">×1</option><option value="10" selected>×10</option><option value="50">×50</option><option value="100">×100</option></select>
+ <label id="frcl" style="display:none" title="Makaraya etkiyen şekillendirme kuvveti okları (Thamasett, malzeme ayarlarından)"><input type="checkbox" id="frcc" checked> Kuvvet</label>
  <button id="fs">⛶ Tam Ekran</button>
  <button id="vidb" class="rec" title="Hızlı görünümün birebir videosu: tek döngü (Radüs izi açık) + 5 sn Esneme ×10 + 5 sn aktif kanalların kalınlıkları">🎥 Video (MP4)</button><span id="vids" style="font-size:12px;color:#555"></span>
 </div>
@@ -6087,6 +6151,42 @@ function drawEnv(X,Y){
       .forEach(function(r){ ctx.beginPath(); polyPath(r,function(i){return Mx[i]+Nx[i]*SD[i]*F[i];},function(i){return My[i]+Ny[i]*SD[i]*F[i];},X,Y,null); ctx.stroke(); }); }
 }
 
+// ---- ŞEKİLLENDİRME KUVVETLERİ (Thamasett): makaraya etkiyen tepki, kN ----
+var FRC=D.frc||null, frcC=document.getElementById('frcc');
+if(FRC){ document.getElementById('frcl').style.display=''; frcC.onchange=function(){draw();}; }
+var FCOL={r:'#2a78d6',a:'#eb6834'};
+function arrow(x0,y0,x1,y1,col,txt){
+  var L=Math.hypot(x1-x0,y1-y0); if(L<3) return;
+  var ux=(x1-x0)/L, uy=(y1-y0)/L, hs=Math.min(9,L*0.45);
+  ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=3; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1-ux*hs*0.8,y1-uy*hs*0.8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x1-ux*hs-uy*hs*0.5,y1-uy*hs+ux*hs*0.5); ctx.lineTo(x1-ux*hs+uy*hs*0.5,y1-uy*hs-ux*hs*0.5); ctx.closePath(); ctx.fill();
+  ctx.font='bold 11px Arial'; ctx.textAlign=(ux>0.3)?'left':(ux<-0.3)?'right':'center';
+  var tx=x1+ux*6, ty=y1+uy*6+(Math.abs(uy)>0.3?(uy>0?9:-2):4);
+  ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.85)'; ctx.strokeText(txt,tx,ty); ctx.fillText(txt,tx,ty);
+}
+function drawForce(fc,k,f,x0,y0){
+  var h=lerp(fc.h,k,f), v=lerp(fc.v,k,f); if(Math.abs(h)<1e-3&&Math.abs(v)<1e-3) return;
+  var s=80/Math.max(FRC.mx,1e-6), rH=(FRC.ri===0);
+  ctx.save();
+  arrow(x0,y0,x0+h*s,y0,rH?FCOL.r:FCOL.a,Math.abs(h).toFixed(1)+' kN');
+  arrow(x0,y0,x0,y0-v*s,rH?FCOL.a:FCOL.r,Math.abs(v).toFixed(1)+' kN');
+  ctx.restore();
+}
+function fmtF(v,d){ return (Math.abs(v)<5e-4?0:v).toFixed(d===undefined?2:d); }
+function spark(fc,W,H){   // kuvvet–zaman eğrisi (radyal + eksenel), imleç ile
+  var NS='http://www.w3.org/2000/svg', sv=document.createElementNS(NS,'svg');
+  sv.setAttribute('viewBox','0 0 '+W+' '+H); sv.setAttribute('preserveAspectRatio','none');
+  var rk=(FRC.ri===0)?'h':'v', ak=(FRC.ri===0)?'v':'h', mx=Math.max(fc.mr,fc.ma,1e-6), n=fc.h.length, st=Math.max(1,Math.floor(n/W));
+  [[rk,FCOL.r],[ak,FCOL.a]].forEach(function(q){
+    var pts=[]; for(var j=0;j<n;j+=st){ var m=0; for(var e=j;e<Math.min(n,j+st);e++) m=Math.max(m,Math.abs(fc[q[0]][e])); pts.push((j/(n-1)*W).toFixed(1)+','+(H-1-m/mx*(H-4)).toFixed(1)); }
+    var pl=document.createElementNS(NS,'polyline'); pl.setAttribute('points',pts.join(' ')); pl.setAttribute('fill','none');
+    pl.setAttribute('stroke',q[1]); pl.setAttribute('stroke-width','1.6'); pl.setAttribute('vector-effect','non-scaling-stroke'); sv.appendChild(pl); });
+  var cur=document.createElementNS(NS,'line'); cur.setAttribute('y1','0'); cur.setAttribute('y2',H); cur.setAttribute('stroke','#f2b600');
+  cur.setAttribute('stroke-width','1.2'); cur.setAttribute('vector-effect','non-scaling-stroke'); sv.appendChild(cur);
+  return [sv,cur];
+}
+
 // ---- CNC EKRANI: program satırları, eksen konumu, kalan mesafe ----
 var CN=D.cnc||null, cncRow=document.getElementById('cncrow'), cards=[];
 var MODE=['G0','G1','G2','G3','G4','WAIT','G1'];
@@ -6111,7 +6211,23 @@ if(!CN){ cncRow.style.display='none'; } else {
     var rl=el('tr'), lk=el('td','k','Yol'), lv=el('td','',''), lv2=el('td','','');
     rl.appendChild(lk); rl.appendChild(lv); rl.appendChild(lv2); tb.appendChild(rl);
     pos.appendChild(tb); body.appendChild(prog); body.appendChild(pos); card.appendChild(hdr); card.appendChild(body); cncRow.appendChild(card);
-    cards.push({st:st, lines:lines, rx:rx, ry:ry, lk:lk, lv:lv, lv2:lv2, hd:tb.getElementsByTagName('th')[1]});
+    var fo=null, fc=FRC?FRC.ch[i]:null;
+    if(FRC){
+      var fd=el('div','frc'), fhh=el('div','fh'); fhh.appendChild(el('span','','Kuvvet — makaraya etkiyen (kN)'+(FRC.z>1?', makara başına':'')));
+      fhh.appendChild(el('span','','Anlık   Maks')); fd.appendChild(fhh);
+      if(!fc){ fd.appendChild(el('div','fx','Makara malzemeye girmiyor.')); fo={none:true}; }
+      else {
+        var ft=el('table'), rH=(FRC.ri===0);
+        function frow(lbl,cls){var r=el('tr'); var k=el('td','k',lbl), a=el('td','big '+cls,''), b=el('td',cls,''); r.appendChild(k); r.appendChild(a); r.appendChild(b); ft.appendChild(r); return [a,b];}
+        var fH=frow((c.hl||'X')+(rH?' radyal':' eksenel'), rH?'fr':'fa'), fV=frow((c.vl||'Y')+(rH?' eksenel':' radyal'), rH?'fa':'fr'), fT=frow('Teğet','ft');
+        fH[1].textContent=fmtF(rH?fc.mr:fc.ma,1); fV[1].textContent=fmtF(rH?fc.ma:fc.mr,1); fT[1].textContent=fmtF(fc.mt,2);
+        fd.appendChild(ft); var fx=el('div','fx',''); fd.appendChild(fx);
+        var sp=spark(fc,300,40); fd.appendChild(sp[0]);
+        fo={H:fH[0],V:fV[0],T:fT[0],x:fx,cur:sp[1],fc:fc};
+      }
+      card.appendChild(fd);
+    }
+    cards.push({st:st, lines:lines, rx:rx, ry:ry, lk:lk, lv:lv, lv2:lv2, hd:tb.getElementsByTagName('th')[1], fo:fo});
   });
 }
 function f3(v){return (Math.abs(v)<5e-4?0:v).toFixed(3);}
@@ -6149,7 +6265,16 @@ function updateCNC(){
     cd.rx[0].textContent=f3(px*c.fx); cd.ry[0].textContent=f3((py-c.yo)*c.fy);
     cd.rx[1].textContent=f3(rx); cd.ry[1].textContent=f3(ry);
     cd.lk.textContent=remLbl; cd.lv.textContent=''; cd.lv2.textContent=remTxt||f3(rem);
+    updForce(cd,c);
   });
+}
+function updForce(cd,c){
+  var fo=cd.fo; if(!fo||fo.none) return;
+  var q=kf(), k=q[0], f=q[1], fc=fo.fc, sx=(c.fx<0)?-1:1, sy=(c.fy<0)?-1:1;
+  fo.H.textContent=fmtF(lerp(fc.h,k,f)*sx,1); fo.V.textContent=fmtF(lerp(fc.v,k,f)*sy,1); fo.T.textContent=fmtF(lerp(fc.t,k,f),2);
+  var j=(f<0.5)?k:Math.min(k+1,fc.ds.length-1);
+  fo.x.textContent=(fc.ds[j]>0)?('Δs '+fc.ds[j].toFixed(2)+' mm · f '+fc.f[j].toFixed(2)+' mm/dev · k_fm '+fc.kf[j]+' MPa · tork '+fc.M[j].toFixed(0)+' N·m · güç '+fc.P[j].toFixed(1)+' kW'):'Temas yok';
+  var xx=(t/D.T*300).toFixed(1); fo.cur.setAttribute('x1',xx); fo.cur.setAttribute('x2',xx);
 }
 
 function setSpeed(v){speed=v; spd.value=v; spdv.textContent=v.toFixed(1)+'×';
@@ -6198,6 +6323,7 @@ function draw(){
     ctx.lineWidth=1.2; ctx.beginPath(); ctx.moveTo(X(cx),Y(cy)); ctx.lineTo(X(px),Y(py)); ctx.stroke();
     ctx.lineWidth=1.6; ctx.beginPath(); ctx.moveTo(X(cx)-6,Y(cy)); ctx.lineTo(X(cx)+6,Y(cy)); ctx.moveTo(X(cx),Y(cy)-6); ctx.lineTo(X(cx),Y(cy)+6); ctx.stroke();
     ctx.fillStyle=col; ctx.beginPath(); ctx.arc(X(px),Y(py),4,0,6.2832); ctx.fill();
+    if(FRC && frcC.checked && FRC.ch[i]) drawForce(FRC.ch[i],k,f,X(cx),Y(cy));
   });
   ctx.restore();
   ctx.strokeStyle='#444'; ctx.lineWidth=1; ctx.strokeRect(ox,oy,sc*(xmax-xmin),sc*(ymax-ymin));
@@ -6539,7 +6665,7 @@ def _prog_path_pts(segs, step=0.1):
 
 def build_player_data(channels_segments, start_points, radii, mold_points, timelines, total_time,
                       speed0=1.0, rate=30, xname='X', yname='Y', env=None, cnc=None, extra=None,
-                      fps=20, vid=None):
+                      fps=20, vid=None, frc=None):
     xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points, extra)
     n = int(min(max(np.ceil(total_time * rate), 2), 6000))
     dt = total_time / n
@@ -6582,7 +6708,52 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
             'rch': [r3(tool_reach(r)) for r in radii],
             'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans,
             'env': env, 'cnc': cnc, 'act': [bool(channel_active(s)) for s in channels_segments],
-            'fps': int(fps or 20), 'vid': vid}
+            'fps': int(fps or 20), 'vid': vid, 'frc': frc}
+
+
+def player_force_data(res, total_time, n, ri, mat, src=''):
+    """Hızlı oynatıcı için kare başına makara kuvvetleri (kN). Kuvvet makaraya etkiyen tepkidir:
+    radyal bileşen makarayı kalıptan uzaklaştırır, eksenel bileşen ilerlemenin tersinedir.
+    h / v: ekrandaki yatay / dikey eksen bileşenleri (işaretli), t: teğetsel, P: güç (kW, z makara)."""
+    dt = total_time / max(n, 1)
+    tf = np.arange(n + 1) * dt
+    out, mx = [], 0.0
+    r2 = lambda a, q=2: [round(float(x), q) for x in a]
+    for r in res:
+        if r is None or not np.any(r['eng']):
+            out.append(None)
+            continue
+        ts = np.asarray(r['t'], float)
+        o = np.argsort(ts, kind='stable'); ts = ts[o]
+        j = np.clip(np.searchsorted(ts, tf), 1, max(len(ts) - 1, 1))
+        jl = np.clip(j - 1, 0, len(ts) - 1); jr = np.clip(j, 0, len(ts) - 1)
+        k = np.where(np.abs(ts[jl] - tf) <= np.abs(ts[jr] - tf), jl, jr)
+        gap = np.abs(ts[k] - tf)
+        dts = np.diff(ts); step = float(np.median(dts[dts > 0])) if np.any(dts > 0) else dt
+        ok = gap <= max(3.0 * step, 1.5 * dt)
+        idx = o[k]
+        eng = ok & np.asarray(r['eng'])[idx]
+        sr = np.sign(r['C'][idx, ri] - r['Mtip'][idx, ri]); sr[sr == 0] = 1.0
+        sa = -np.sign(r['u'][idx, 1 - ri])
+        Fr = np.where(eng, r['Fr'][idx], 0.0) / 1000.0 * sr
+        Fa = np.where(eng, r['Fa'][idx], 0.0) / 1000.0 * sa
+        Ft = np.where(eng, r['Ft'][idx], 0.0) / 1000.0
+        h, v = (Fr, Fa) if ri == 0 else (Fa, Fr)
+        mx = max(mx, float(np.max(np.hypot(h, v))) if len(h) else 0.0)
+        out.append({'h': r2(h), 'v': r2(v), 't': r2(Ft, 3), 'ds': r2(np.where(eng, r['ds'][idx], 0.0), 3),
+                    'kf': [int(round(x)) for x in np.where(eng, r['kfm'][idx], 0.0)],
+                    'P': r2(np.where(eng, r['P'][idx], 0.0) / 1000.0),
+                    'M': r2(np.where(eng, r['Mt'][idx], 0.0) * r['z'], 0),
+                    'f': r2(np.where(eng, r['f'][idx], 0.0), 3),
+                    'mr': round(float(np.max(np.abs(r['Fr']))) / 1000.0, 2), 'ma': round(float(np.max(np.abs(r['Fa']))) / 1000.0, 2),
+                    'mt': round(float(np.max(np.abs(r['Ft']))) / 1000.0, 3)})
+    if not any(out):
+        return None
+    m = mat or {}
+    info = (f"n = {m.get('rpm', 0):g} dev/dk, η = {m.get('eta', 0):g}, D = {m.get('Dr', 0):g} mm, z = {m.get('z', 1)}; "
+            + (f"k_f = {m.get('C', 0):g}·(ε₀+φ)^{m.get('nh', 0):g}" if m.get('C', 0) > 0 and m.get('nh', 0) > 0
+               else f"k_f = {m.get('kf0', 0):g} MPa sabit") + (f"; gelen kalınlık: {src}" if src else ''))
+    return {'ri': int(ri), 'ch': out, 'mx': round(mx, 2), 'z': int(m.get('z', 1)), 'info': info}
 
 
 def build_player_html(data, height=960):
@@ -6809,6 +6980,33 @@ def _static_plots(segs, starts, radii, mold_pts, opts, form=None, png_out=None):
     return comp, ind
 
 
+def _live_forces(cfg, opts, form, timelines, radii, mold_pts, total_time, n):
+    """Hızlı oynatıcı için canlı makara kuvvetleri (malzeme ayarlarındaki Thamasett girdileriyle).
+    Ön form yoksa gelen kalınlık bilinmediği için hesaplanmaz. Döndürür: (veri veya None, durum notu)"""
+    try:
+        fin = (form or {}).get('final') if form else None
+        mat = cfg.get('material') or DEFAULT_MATERIAL
+        if fin is None or len(mold_pts) < 2:
+            return None, ''
+        if mat['rpm'] <= 0 or mat['kf0'] <= 0 or mat['Dr'] <= 0:
+            return None, "\nKuvvetler: malzeme ayarlarında devir, k_f0 ve makara çapı girilmeli."
+        radial = fin.get('radial') or resolve_radial(opts.get('pf_radial', 'auto'), cfg)[0]
+        ri = 0 if radial == 'X' else 1
+        res, src, _E = compute_process(timelines, radii, mold_pts, fin, opts['env_limit'], ri, mat['rpm'], mat['kf0'],
+                                       mat['eta'], mat['Dr'], mat['z'], mat['beta'], mat['cst'],
+                                       fin.get('mode') == 'shear', mat=mat)
+        d = player_force_data(res, total_time, n, ri, mat, src)
+        if d is None:
+            return None, "\nKuvvetler: makaralar malzemeye girmiyor."
+        parts = []
+        for i, r in enumerate(res):
+            if r is not None and np.any(r['eng']):
+                parts.append(f"K{i + 1} F_r {r['Fr'].max() / 1000:.1f} / F_a {r['Fa'].max() / 1000:.1f} / F_t {r['Ft'].max() / 1000:.2f} kN")
+        return d, "\nKuvvetler (en büyük, makara başına): " + "; ".join(parts) + " — Hızlı Oynatıcıda canlı."
+    except Exception:
+        return None, "\nKuvvetler hesaplanamadı: " + traceback.format_exc(limit=2).strip().splitlines()[-1]
+
+
 # -------------------------------------------------------------
 # 1) Ana çalıştırma: animasyon + analizler + hızlı oynatıcı
 # -------------------------------------------------------------
@@ -6837,6 +7035,7 @@ def run_all(*vals):
         comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, form, png_out=ind_png)
         table = distance_table(segs, mold_pts)
         th_html, th_md, th_df = thickness_profile(form)
+        frc_note = ''
 
         try:
             env_d = (player_env_data(timelines, radii, mold_pts, [opts['env_limit']] * N_CH, opts['show_env'],
@@ -6846,17 +7045,20 @@ def run_all(*vals):
                                'orig': [[round(float(q), 4) for q in np.asarray(P).ravel()] for P in sb_res['orig']],
                                'info': sb_res['info']}
             cnc_d = player_cnc_data(cfg, segs, timelines, total_time, starts)
+            n_pl = int(min(max(np.ceil(total_time * 30), 2), 6000))       # build_player_data ile aynı kare sayısı
+            frc_d, frc_note = _live_forces(cfg, opts, form, timelines, radii, mold_pts, total_time, n_pl)
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
                                                               xname=opts['xname'], yname=opts['yname'],
                                                               env=env_d, cnc=cnc_d, extra=_form_extra(form),
-                                                              fps=fps, vid={'ind': ind_png}))
+                                                              fps=fps, vid={'ind': ind_png}, frc=frc_d))
         except Exception:
             player_html = "<p>Hızlı oynatıcı hazırlanamadı:</p><pre>" + html.escape(traceback.format_exc()) + "</pre>"
 
         status = (note + "\n" if note else "") + \
                  (f"Simülasyon hazır. Toplam süre: {total_time:.2f} sn — animasyon kare sayısı: {n_frames}")
         status += _pf_note(opts, cfg, form)
+        status += frc_note
         _sm = ((form or {}).get('final') or {}).get('sim') if form else None
         if _sm is not None:
             if _sm.get('ok'):
@@ -7217,14 +7419,15 @@ def run_wear(*vals):
 
 @_trim
 def run_process(*vals):
-    """vals = all_inputs + [devir, k_fm, η, makara çapı, makara sayısı, β, makine rijitliği]"""
+    """vals = all_inputs (girdiler malzeme ayarlarından: cfg['material'])"""
     try:
-        n_rpm, kfm, eta, Dt = _num(vals[-7], 0.0), _num(vals[-6], 0.0), _num(vals[-5], 0.15), _num(vals[-4], 0.0)
-        z, beta, cst = int(max(_num(vals[-3], 1.0), 1)), _num(vals[-2], 0.0), max(_num(vals[-1], 0.0), 0.0)
+        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
+        mat = cfg.get('material') or DEFAULT_MATERIAL
+        n_rpm, kfm, eta, Dt = mat['rpm'], mat['kf0'], mat['eta'], mat['Dr']
+        z, beta, cst = int(mat['z']), mat['beta'], mat['cst']
         if n_rpm <= 0 or kfm <= 0 or Dt <= 0 or not (0 < eta <= 1):
-            return "", "Devir, akma gerilmesi ve makara çapı sıfırdan büyük; η 0 ile 1 arasında olmalı.", None, \
+            return "", "Malzeme ayarlarında devir, k_f0 ve makara çapı sıfırdan büyük; η 0 ile 1 arasında olmalı.", None, \
                 "Proses hesabı yapılamadı: girdileri kontrol et."
-        cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals[:-7])
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
         timelines, total_time = synchronize(segs)
         if len(mold_pts) < 2:
@@ -7236,8 +7439,10 @@ def run_process(*vals):
         ri = 0 if radial == 'X' else 1
         shear = bool(fin) and fin.get('mode') == 'shear'
         res, src, E = compute_process(timelines, radii, mold_pts, fin, opts['env_limit'], ri, n_rpm, kfm, eta, Dt,
-                                      z, beta, cst, shear)
-        md = [f"**Girdiler:** n = {n_rpm:g} dev/dk, k_fm = {kfm:g} MPa, η = {eta:g}, makara çapı {Dt:g} mm, "
+                                      z, beta, cst, shear, mat=mat)
+        kf_txt = (f"akış eğrisi k_f = {mat['C']:g}·(ε₀+φ)^{mat['nh']:g} (k_f0 = {kfm:g} MPa)" if mat['C'] > 0 and mat['nh'] > 0
+                  else f"k_f = {kfm:g} MPa sabit")
+        md = [f"**Girdiler:** n = {n_rpm:g} dev/dk, {kf_txt}, η = {eta:g}, makara çapı {Dt:g} mm, "
               f"kanal başına {z} makara, parça yarıçapı ekseni {radial}"
               + (f", makine rijitliği {cst:g} kN/mm" if cst > 0 else ", makine rijit kabul edildi")
               + f". Gelen kalınlık: {src}.",
@@ -7260,7 +7465,7 @@ def run_process(*vals):
             fl = r['flow'][e]
             line = (f"**Kanal {i + 1}:** en büyük F_r **{r['Fr'].max() / 1000:.1f} kN** (t = {r['t'][kF]:.1f} s, satır {int(r['line'][kF]) + 1}), "
                     f"F_a {r['Fa'].max() / 1000:.1f} kN, F_t {r['Ft'].max() / 1000:.2f} kN, "
-                    f"tork {r['Mt'].max():.0f} N·m, güç **{r['P'].max() / 1000:.1f} kW**. "
+                    f"tork {r['Mt'].max():.0f} N·m, güç **{r['P'].max() / 1000:.1f} kW**, k_fm {r['kfm'][e].min():.0f}–{r['kfm'][e].max():.0f} MPa. "
                     f"En büyük Δs {r['ds'][e].max():.2f} mm (ezme %{r['eps'][e].max() * 100:.0f}, φ = {r['phi'][e].max():.2f}), "
                     f"f = {r['f'][e].min():.2f}–{r['f'][e].max():.2f} mm/dev, etkin giriş açısı α ≈ {np.degrees(np.median(r['alpha'][e])):.0f}°.")
             if fl.min() < 1.0:
@@ -7286,7 +7491,7 @@ def run_process(*vals):
                        'F_r (kN)': round(float(r['Fr'][m].max()) / 1000, 2), 'F_a (kN)': round(float(r['Fa'][m].max()) / 1000, 2),
                        'F_t (kN)': round(float(r['Ft'][m].max()) / 1000, 3), 'Güç (kW)': round(float(r['P'][m].max()) / 1000, 2),
                        'f (mm/dev)': round(float(np.median(r['f'][m])), 3), 'Δs (mm)': round(float(r['ds'][m].max()), 2),
-                       'Ezme (%)': round(float(r['eps'][m].max()) * 100, 1), 'α (°)': round(float(np.degrees(np.median(r['alpha'][m]))), 1),
+                       'Ezme (%)': round(float(r['eps'][m].max()) * 100, 1), 'k_fm (MPa)': round(float(r['kfm'][m].max()), 0), 'α (°)': round(float(np.degrees(np.median(r['alpha'][m]))), 1),
                        'r_CD/r_LD': round(float(r['flow'][m].min()), 2)}
                 if cst > 0:
                     row['Esneme (mm)'] = round(float(r['dlt'][m].max()), 3)
@@ -7473,7 +7678,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                 pf_sim = gr.Checkbox(value=False, label="Simülasyon modu: ön form adım adım şekillensin (hacim sabit)",
                                      info="Makaranın geçtiği yer kalıba sıvanıp takım boşluğu kalınlığına iner; artan hacim "
                                           "kalan malzemeyi ileri iterek uçta uzama olarak görünür. Hızlı Oynatıcıda canlı izlenir.")
-                with gr.Accordion("Malzeme esnemesi (geri esneme) — simülasyon sonunda", open=False):
+                with gr.Accordion("Malzeme — geri esneme ve şekillendirme kuvvetleri", open=False):
                     gr.Markdown("Bitmiş ürünün kalıptan çıkınca **geri esnemesi** (yaklaşık). Hızlı Oynatıcıda **Esneme** "
                                 "kutusuyla açılıp kapanır; simülasyonun sonunda turuncu kesikli olarak çizilir. "
                                 "Profil boyunca: duvar orta hattındaki her eğrilik Gardiner bağıntısıyla gevşer "
@@ -7488,7 +7693,30 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                            info="Çap değişimi = k·σa/E. 1: çap büyür (kalıptan boşalma), 0: çap değişmez, "
                                                 "eksi: çap küçülür. Ölçülmüş bir parçayla ayarlanabilir.")
                         mat_clamp = gr.Dropdown(CLAMP_CHOICES, value='start', label="Sabit (tutulan) uç")
-                    mat_comps = [mat_E, mat_sy, mat_kh, mat_clamp]
+                    gr.Markdown("**Şekillendirme kuvvetleri (Thamasett)** — Hızlı Oynatıcıda her kanalın CNC ekranında "
+                                "eksen kuvvetleri canlı gösterilir; ana çizimde makaraya etkiyen kuvvet okları çizilir. "
+                                "📐 Proses Hesapları sekmesi de bu değerleri kullanır. "
+                                "Akış eğrisi: **k_f = C·(ε₀ + φ)ⁿ**, ε₀ = (k_f0 / C)^(1/n) — φ = ln(s_önform / s). "
+                                "C = 0 girilirse k_f = k_f0 sabit alınır. Her temas anında k_fm, makaranın altındaki "
+                                "φ₀ = ln(s_önform/s₀) → φ₁ = ln(s_önform/s₁) aralığının ortalamasıdır (pekleşme birikir).")
+                    with gr.Row():
+                        mat_rpm = gr.Number(value=DEFAULT_MATERIAL['rpm'], label="İş mili devri n (dev/dk)", minimum=0)
+                        mat_kf0 = gr.Number(value=DEFAULT_MATERIAL['kf0'], label="Başlangıç akma gerilmesi k_f0 (MPa)",
+                                            minimum=0, info="Ön formun (tavlı / şekillenmemiş) akma gerilmesi.")
+                        mat_C = gr.Number(value=DEFAULT_MATERIAL['C'], label="Akış eğrisi C (MPa) — 0: sabit k_f0",
+                                          minimum=0, info="Ör. St37 ≈ 730, AlMg3 ≈ 400, AISI 304 ≈ 1270 (çekme deneyinden).")
+                        mat_nh = gr.Number(value=DEFAULT_MATERIAL['nh'], label="Pekleşme üssü n", minimum=0,
+                                           info="Ör. St37 ≈ 0.20, AlMg3 ≈ 0.22, AISI 304 ≈ 0.45.")
+                    with gr.Row():
+                        mat_eta = gr.Number(value=DEFAULT_MATERIAL['eta'], label="Verim η (0,06 – 0,24)", minimum=0)
+                        mat_Dr = gr.Number(value=DEFAULT_MATERIAL['Dr'], label="Makara çapı D (mm)", minimum=0)
+                        mat_z = gr.Number(value=DEFAULT_MATERIAL['z'], precision=0, label="Kanal başına makara sayısı z",
+                                          minimum=1)
+                        mat_beta = gr.Number(value=DEFAULT_MATERIAL['beta'], label="β (°) — 0: giriş açısı α", minimum=0)
+                        mat_cst = gr.Number(value=DEFAULT_MATERIAL['cst'], label="Makine rijitliği c (kN/mm) — 0: rijit",
+                                            minimum=0)
+                    mat_comps = [mat_E, mat_sy, mat_kh, mat_clamp, mat_rpm, mat_kf0, mat_C, mat_nh, mat_eta, mat_Dr,
+                                 mat_z, mat_beta, mat_cst]
                     cfg_comps += mat_comps
                 with gr.Row():
                     pf_use = gr.Checkbox(value=True, label="Ön formu kullan")
@@ -7614,15 +7842,8 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                                 "Thamasett bağıntılarıyla (F_r ≈ b·l_d·k_fm/η, F_a ≈ F_r·tan β, F_t ≈ f·Δs·k_fm/η). "
                                 "Δs ve temas boyu simülasyondaki makara–malzeme temasından alınır. Makine rijitliği girilirse "
                                 "boşluğun F_r/c kadar açıldığı kabul edilir ve uzama buna göre yeniden hesaplanır.")
-                    with gr.Row():
-                        pr_n = gr.Number(value=300.0, label="İş mili devri n (dev/dk)")
-                        pr_kf = gr.Number(value=300.0, label="Ortalama akma gerilmesi k_fm (MPa)")
-                        pr_eta = gr.Number(value=0.15, label="Verim η (0,06 – 0,24)")
-                        pr_D = gr.Number(value=250.0, label="Makara çapı D (mm)")
-                    with gr.Row():
-                        pr_z = gr.Number(value=1, precision=0, label="Kanal başına makara sayısı z")
-                        pr_beta = gr.Number(value=0.0, label="β (°) — 0: giriş açısı α alınır")
-                        pr_c = gr.Number(value=0.0, label="Makine rijitliği c (kN/mm) — 0: rijit")
+                    gr.Markdown("Girdiler (devir, akış eğrisi, η, makara çapı, makara sayısı, β, rijitlik) "
+                                "**Ön form → Malzeme** bölümündedir ve JSON ile kaydedilir.")
                     pr_btn = gr.Button("📐 Proses hesaplarını yap", variant="primary")
                     pr_md = gr.Markdown()
                     pr_html = gr.HTML()
@@ -7729,7 +7950,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     # takım aşınması
     wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K],
                    outputs=[wear_html, wear_md, wear_df, status])
-    pr_btn.click(run_process, inputs=all_inputs + [pr_n, pr_kf, pr_eta, pr_D, pr_z, pr_beta, pr_c],
+    pr_btn.click(run_process, inputs=all_inputs,
                  outputs=[pr_html, pr_md, pr_df, status])
     wear_dxf_btn.click(run_wear_dxf, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K, wear_depth],
                        outputs=[wear_dxf_out, status])
