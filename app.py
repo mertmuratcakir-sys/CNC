@@ -5596,6 +5596,7 @@ input[type=range]{vertical-align:middle}
  <label><input type="checkbox" id="envc"> Radüs izi</label>
  <label id="sbl" style="display:none" title="Simülasyon sonunda bitmiş ürünün geri esnemiş hali (malzeme ayarlarından)"><input type="checkbox" id="sbc"> Esneme</label><select id="sbx" style="display:none" title="Çizimde esneme yer değiştirmesini büyüt (sayılar gerçek değerdir)"><option value="1">×1</option><option value="10" selected>×10</option><option value="50">×50</option><option value="100">×100</option></select>
  <button id="fs">⛶ Tam Ekran</button>
+ <button id="vidb" class="rec" title="Hızlı görünümün birebir videosu: tek döngü (Radüs izi açık) + 5 sn Esneme ×10 + 5 sn aktif kanalların kalınlıkları">🎥 Video (MP4)</button><span id="vids" style="font-size:12px;color:#555"></span>
 </div>
 <div class="bar"><input id="tm" type="range" min="0" max="10000" value="0"><b id="tv"></b></div>
 <div id="main">
@@ -6241,6 +6242,134 @@ tm.oninput=function(){setT(tm.value/10000*D.T);};
 fsB.onclick=function(){ if(!document.fullscreenElement){ document.documentElement.requestFullscreen().catch(function(e){alert('Tam ekran açılamadı: '+e.message);}); } else { document.exitFullscreen(); } };
 document.addEventListener('fullscreenchange',function(){setTimeout(resize,100);});
 if(window.ResizeObserver){new ResizeObserver(resize).observe(document.getElementById('cwrap'));} else {window.addEventListener('resize',resize);}
+
+// ---------- VİDEO KAYDI: hızlı görünümün birebir görüntüsü (tarayıcıda kodlanır, sunucuya yük yok) ----------
+// --- en küçük MP4 paketleyici (tek video izi, sabit kare hızı; H.264 'avc1' veya VP9 'vp09') ---
+function MP4Mux(w,h,fps,codec){ this.w=w; this.h=h; this.fps=fps; this.codec=codec; this.samples=[]; this.desc=null; }
+MP4Mux.prototype.add=function(chunk,meta){ var b=new Uint8Array(chunk.byteLength); chunk.copyTo(b);
+  if(meta&&meta.decoderConfig&&meta.decoderConfig.description&&!this.desc){ var d=meta.decoderConfig.description; this.desc=new Uint8Array(d.buffer?d.buffer.slice(d.byteOffset||0,(d.byteOffset||0)+d.byteLength):d); }
+  this.samples.push({d:b,key:chunk.type==='key'}); };
+MP4Mux.prototype.finish=function(){
+  var u32=function(v){return [(v>>>24)&255,(v>>>16)&255,(v>>>8)&255,v&255];}, u16=function(v){return [(v>>8)&255,v&255];};
+  var str=function(s){return Array.from(s).map(function(c){return c.charCodeAt(0);});};
+  var box=function(t,parts){ var body=[]; parts.forEach(function(p){ if(p instanceof Uint8Array) body.push(p); else body.push(new Uint8Array(p)); });
+    var n=8; body.forEach(function(b){n+=b.length;}); var out=new Uint8Array(n); out.set(u32(n),0); out.set(str(t),4); var o=8; body.forEach(function(b){out.set(b,o); o+=b.length;}); return out; };
+  var full=function(t,v,f,parts){ return box(t,[[v,(f>>16)&255,(f>>8)&255,f&255]].concat(parts)); };
+  var TS=this.fps*1000, DT=1000, n=this.samples.length, dur=n*DT, mvdur=Math.round(n*1000/this.fps);
+  var ftyp=box('ftyp',[str('isom'),u32(512),str('isomiso2avc1mp41')]);
+  var total=0; this.samples.forEach(function(s){total+=s.d.length;});
+  var mdat=new Uint8Array(8+total); mdat.set(u32(8+total),0); mdat.set(str('mdat'),4); var o=8; this.samples.forEach(function(s){mdat.set(s.d,o); o+=s.d.length;});
+  var M=[0,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 64,0,0,0];
+  var mvhd=full('mvhd',0,0,[u32(0),u32(0),u32(1000),u32(mvdur),u32(0x00010000),u16(0x0100),[0,0],u32(0),u32(0),M,new Array(24).fill(0),u32(2)]);
+  var tkhd=full('tkhd',0,3,[u32(0),u32(0),u32(1),u32(0),u32(mvdur),u32(0),u32(0),u16(0),u16(0),u16(0),u16(0),M,u32(this.w<<16),u32(this.h<<16)]);
+  var mdhd=full('mdhd',0,0,[u32(0),u32(0),u32(TS),u32(dur),u16(0x55c4),u16(0)]);
+  var hdlr=full('hdlr',0,0,[u32(0),str('vide'),u32(0),u32(0),u32(0),str('VideoHandler'),[0]]);
+  var vmhd=full('vmhd',0,1,[u16(0),u16(0),u16(0),u16(0)]);
+  var dinf=box('dinf',[full('dref',0,0,[u32(1),full('url ',0,1,[])])]);
+  var vse=[[0,0,0,0,0,0],u16(1),u16(0),u16(0),u32(0),u32(0),u32(0),u16(this.w),u16(this.h),u32(0x00480000),u32(0x00480000),u32(0),u16(1),new Array(32).fill(0),u16(0x18),u16(0xffff)];
+  var entry;
+  if(this.codec==='avc'){ entry=box('avc1',vse.concat([box('avcC',[this.desc||new Uint8Array(0)])])); }
+  else { entry=box('vp09',vse.concat([full('vpcC',1,0,[[0,10,0x80,1,1,1],u16(0)])])); }
+  var stsd=full('stsd',0,0,[u32(1),entry]);
+  var stts=full('stts',0,0,[u32(1),u32(n),u32(DT)]);
+  var keys=[]; this.samples.forEach(function(s,i){ if(s.key) keys.push(i+1); });
+  var stss=full('stss',0,0,[u32(keys.length)].concat(keys.map(u32)));
+  var stsc=full('stsc',0,0,[u32(1),u32(1),u32(n),u32(1)]);
+  var stsz=full('stsz',0,0,[u32(0),u32(n)].concat(this.samples.map(function(s){return u32(s.d.length);})));
+  var stco=full('stco',0,0,[u32(1),u32(ftyp.length+8)]);
+  var stbl=box('stbl',[stsd,stts,stss,stsc,stsz,stco]);
+  var moov=box('moov',[mvhd,box('trak',[tkhd,box('mdia',[mdhd,hdlr,box('minf',[vmhd,dinf,stbl])])])]);
+  return new Blob([ftyp,mdat,moov],{type:'video/mp4'}); };
+
+var vidB=document.getElementById('vidb'), vidS=document.getElementById('vids'), VIDBUSY=false;
+function vstat(s){ vidS.textContent=s; }
+function domImage(W,H,S){
+  var cl=document.body.cloneNode(true);
+  var sI=document.body.querySelectorAll('input,select'), dI=cl.querySelectorAll('input,select');
+  for(var i=0;i<sI.length;i++){ var s=sI[i], d=dI[i]; if(!d) continue;
+    if(s.type==='checkbox'){ if(s.checked) d.setAttribute('checked','checked'); else d.removeAttribute('checked'); }
+    else if(s.tagName==='SELECT'){ for(var j=0;j<d.options.length;j++){ if(j===s.selectedIndex) d.options[j].setAttribute('selected','selected'); else d.options[j].removeAttribute('selected'); } }
+    else d.setAttribute('value', s.value); }
+  cl.querySelectorAll('script').forEach(function(e){e.remove();});
+  ['vidb','vids'].forEach(function(id){ var e=cl.querySelector('#'+id); if(e) e.style.visibility='hidden'; });
+  cl.style.width=W+'px'; cl.style.height=H+'px'; cl.style.margin='0';
+  var css=Array.from(document.querySelectorAll('style')).map(function(s){return s.textContent;}).join('\n').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  var body=new XMLSerializer().serializeToString(cl);
+  var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+(W*S)+'" height="'+(H*S)+'" viewBox="0 0 '+W+' '+H+'"><foreignObject x="0" y="0" width="'+W+'" height="'+H+'">'+
+    '<html xmlns="http://www.w3.org/1999/xhtml"><head><style>'+css+'</style></head>'+body+'</html></foreignObject></svg>';
+  var img=new Image(); img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
+  return img.decode().then(function(){ return img; }); }
+async function composeFrame(vc,vx,W,H,S){
+  var img=await domImage(W,H,S);
+  vx.fillStyle='#fff'; vx.fillRect(0,0,vc.width,vc.height); vx.drawImage(img,0,0,vc.width,vc.height);
+  var r=cv.getBoundingClientRect(), kx=vc.width/W, ky=vc.height/H;
+  vx.drawImage(cv, r.left*kx, r.top*ky, r.width*kx, r.height*ky); }
+async function drawIndScreen(vc,vx){
+  var L=D.vid.ind, ims=[];
+  for(var i=0;i<L.length;i++){ var im=new Image(); im.src=L[i]; await im.decode(); ims.push(im); }
+  vx.fillStyle='#fff'; vx.fillRect(0,0,vc.width,vc.height);
+  var top=Math.round(vc.height*0.07), pad=Math.round(vc.width*0.015);
+  vx.fillStyle='#222'; vx.font='bold '+Math.round(vc.height*0.03)+'px Arial'; vx.textAlign='center';
+  vx.fillText('Bireysel kanal kalınlıkları', vc.width/2, top*0.7); vx.textAlign='left';
+  var n=ims.length, best=null;                       // ekranı en iyi dolduran ızgara
+  for(var cols=1;cols<=n;cols++){ var rows=Math.ceil(n/cols), cw=(vc.width-pad*(cols+1))/cols, ch=(vc.height-top-pad*rows)/rows, smin=Infinity;
+    ims.forEach(function(im){ smin=Math.min(smin, cw/im.width, ch/im.height); });
+    if(!best||smin>best.s) best={cols:cols,rows:rows,cw:cw,ch:ch,s:smin}; }
+  ims.forEach(function(im,i){ var c=i%best.cols, rw=Math.floor(i/best.cols), s=Math.min(best.cw/im.width, best.ch/im.height), w=im.width*s, h=im.height*s;
+    var inRow=Math.min(best.cols, n-rw*best.cols), x0=(vc.width-(inRow*best.cw+(inRow-1)*pad))/2;
+    vx.drawImage(im, x0+c*(best.cw+pad)+(best.cw-w)/2, top+rw*(best.ch+pad)+(best.ch-h)/2, w, h); }); }
+async function pickCodec(W,H,fps){
+  if(typeof VideoEncoder==='undefined') return null;
+  var C=[['avc1.640033','avc'],['avc1.640028','avc'],['avc1.4d0028','avc'],['avc1.42002a','avc'],['vp09.00.40.08','vp9'],['vp09.00.10.08','vp9']];
+  for(var i=0;i<C.length;i++){ var cfg={codec:C[i][0],width:W,height:H,bitrate:Math.round(Math.min(16e6,Math.max(4e6,W*H*fps*0.12))),framerate:fps};
+    if(C[i][1]==='avc') cfg.avc={format:'avc'};
+    try{ var s=await VideoEncoder.isConfigSupported(cfg); if(s.supported) return [cfg,C[i][1]]; }catch(e){} }
+  return null; }
+async function recordVideo(){
+  if(VIDBUSY) return; VIDBUSY=true; vidB.disabled=true;
+  var was={t:t,env:envC.checked,sb:sbC?sbC.checked:false,sbx:sbX?sbX.value:'10'};
+  setPlaying(false);
+  try{
+    var fps=Math.max(5,Math.min(60,Math.round(D.fps||20))), sp=Math.max(0.05,speed);
+    var W=document.body.clientWidth, H=document.body.clientHeight, S=Math.min(2,1920/W);
+    var W2=Math.round(W*S/2)*2, H2=Math.round(H*S/2)*2;
+    var vc=document.createElement('canvas'); vc.width=W2; vc.height=H2; var vx=vc.getContext('2d');
+    var pc=await pickCodec(W2,H2,fps), enc=null, mux=null, encErr=null, rec=null, chunks=[], stream=null, mime='';
+    if(pc){ mux=new MP4Mux(W2,H2,fps,pc[1]); enc=new VideoEncoder({output:function(c,m){mux.add(c,m);},error:function(e){encErr=e;}}); enc.configure(pc[0]); }
+    else { stream=vc.captureStream(0);
+      mime=['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp9','video/webm'].filter(function(m){return MediaRecorder.isTypeSupported(m);})[0]||'';
+      rec=new MediaRecorder(stream, mime?{mimeType:mime,videoBitsPerSecond:8e6}:{}); rec.ondataavailable=function(e){ if(e.data.size) chunks.push(e.data); }; rec.start(); }
+    var fi=0;
+    var emit=async function(){
+      if(enc){ var f=new VideoFrame(vc,{timestamp:Math.round(fi*1e6/fps),duration:Math.round(1e6/fps)}); enc.encode(f,{keyFrame:fi%(fps*2)===0}); f.close();
+        while(enc.encodeQueueSize>4) await new Promise(function(r){setTimeout(r,4);}); if(encErr) throw encErr; }
+      else { stream.getVideoTracks()[0].requestFrame(); await new Promise(function(r){setTimeout(r,1000/fps);}); }
+      fi++; };
+    // 1) tek döngü — Radüs izi açık, esneme kapalı
+    envC.checked=true; if(sbC) sbC.checked=false;
+    var n1=Math.max(1,Math.ceil(D.T/sp*fps));
+    for(var i=0;i<=n1;i++){ setT(Math.min(D.T,i*sp/fps)); await composeFrame(vc,vx,W,H,S); await emit();
+      if(i%4===0) vstat('Video kaydediliyor: döngü %'+Math.round(100*i/n1)); }
+    // 2) simülasyon sonu — Esneme ×10, 5 sn
+    if(EV&&EV.sb&&sbC){ sbC.checked=true; sbX.value='10'; setT(D.T); await composeFrame(vc,vx,W,H,S); vstat('Video kaydediliyor: esneme');
+      for(var j=0;j<5*fps;j++) await emit(); }
+    // 3) aktif kanalların kalınlıkları, 5 sn
+    if(D.vid&&D.vid.ind&&D.vid.ind.length){ await drawIndScreen(vc,vx); vstat('Video kaydediliyor: kanal kalınlıkları');
+      for(var j2=0;j2<5*fps;j2++) await emit(); }
+    var blob;
+    if(enc){ await enc.flush(); enc.close(); blob=mux.finish(); }
+    else { var done=new Promise(function(r){rec.onstop=r;}); rec.stop(); await done; blob=new Blob(chunks,{type:(mime||'video/webm').split(';')[0]}); }
+    var ext=(blob.type.indexOf('mp4')>=0)?'mp4':'webm';
+    window.__VIDBLOB=blob;
+    var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='cnc_simulasyon.'+ext; document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); },5000);
+    vstat('Video hazır: cnc_simulasyon.'+ext+' — '+(fi/fps).toFixed(1)+' sn, '+(blob.size/1e6).toFixed(1)+' MB'+
+      (ext==='webm'?' (bu tarayıcı MP4 kodlamıyor; WebM kaydedildi — Chrome/Edge MP4 verir)':''));
+  }catch(e){ vstat('Video hatası: '+(e&&e.message?e.message:e)); }
+  envC.checked=was.env; if(sbC){ sbC.checked=was.sb; sbX.value=was.sbx; } setT(was.t);
+  VIDBUSY=false; vidB.disabled=false; }
+vidB.onclick=recordVideo;
+window.addEventListener('message',function(ev){ if(ev.data&&ev.data.cmd==='cncvideo') recordVideo(); });
 setSpeed(speed); resize(); setCsys(CSYS); ui();
 })();
 </script></body></html>"""
@@ -6409,7 +6538,8 @@ def _prog_path_pts(segs, step=0.1):
 
 
 def build_player_data(channels_segments, start_points, radii, mold_points, timelines, total_time,
-                      speed0=1.0, rate=30, xname='X', yname='Y', env=None, cnc=None, extra=None):
+                      speed0=1.0, rate=30, xname='X', yname='Y', env=None, cnc=None, extra=None,
+                      fps=20, vid=None):
     xmin, xmax, ymin, ymax = _scene_bounds(channels_segments, start_points, radii, mold_points, extra)
     n = int(min(max(np.ceil(total_time * rate), 2), 6000))
     dt = total_time / n
@@ -6451,18 +6581,19 @@ def build_player_data(channels_segments, start_points, radii, mold_points, timel
             'shp': [([round(float(v), 4) for v in tool_shape(r).ravel()] if tool_shape(r) is not None else None) for r in radii],
             'rch': [r3(tool_reach(r)) for r in radii],
             'col': CHANNEL_COLORS[:N_CH], 'speed': float(speed0), 'xn': xname, 'yn': yname, 'ch': chans,
-            'env': env, 'cnc': cnc, 'act': [bool(channel_active(s)) for s in channels_segments]}
+            'env': env, 'cnc': cnc, 'act': [bool(channel_active(s)) for s in channels_segments],
+            'fps': int(fps or 20), 'vid': vid}
 
 
 def build_player_html(data, height=960):
     doc = PLAYER_TEMPLATE.replace('__DATA__', json.dumps(data, separators=(',', ':')))
-    return (f'<iframe srcdoc="{html.escape(doc, quote=True)}" sandbox="allow-scripts" allow="fullscreen" '
+    return (f'<iframe srcdoc="{html.escape(doc, quote=True)}" sandbox="allow-scripts allow-downloads" allow="fullscreen" '
             f'style="width:100%;height:{height}px;border:1px solid #ddd;border-radius:8px;background:#fff"></iframe>')
 
 
 # ===== Hücre 22 =====
 import gradio as gr
-import functools, gc, inspect
+import functools, gc, inspect, io, base64
 
 
 def free_memory():
@@ -6650,16 +6781,29 @@ def _envelopes(timelines, radii, mold_pts, opts, force=False, cfg=None):
     return compute_form(timelines, radii, mold_pts, opts['env_limit'], pf)
 
 
-def _static_plots(segs, starts, radii, mold_pts, opts, form=None):
+def fig_to_png_url(fig, dpi=110):
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', facecolor='white')
+    return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _static_plots(segs, starts, radii, mold_pts, opts, form=None, png_out=None):
     show = bool(form) and opts['show_env']
     comp = fig_to_svg_card(plot_comparison_fig(segs, starts, radii, mold_pts, opts['xname'], opts['yname'],
                                                envelopes=(form['ch'] if show else None),
                                                form=(form if form and form.get('final') else None)))
     if len(mold_pts) > 1:
-        ind = [fig_to_svg_card(plot_channel_fig(i, segs, starts, radii, mold_pts, **_plot_kw(opts),
-                                                envelope=(form['ch'][i] if show else None),
-                                                pf_chains=(form['pf_chains'] if form else None)))
-               for i in range(N_CH)]
+        ind = []
+        for i in range(N_CH):
+            fg = plot_channel_fig(i, segs, starts, radii, mold_pts, **_plot_kw(opts),
+                                  envelope=(form['ch'][i] if show else None),
+                                  pf_chains=(form['pf_chains'] if form else None))
+            ind.append(fig_to_svg_card(fg))
+            if png_out is not None and channel_active(segs[i]):      # video için: yalnız aktif kanallar
+                try:
+                    png_out.append(fig_to_png_url(fg))
+                except Exception:
+                    pass
     else:
         ind = ["<p>Kalıp noktası yetersiz.</p>"] * N_CH
     return comp, ind
@@ -6689,7 +6833,8 @@ def run_all(*vals):
                 sb_res = springback(_smf, _smf['final'], cfg.get('material'))
         except Exception:
             sb_res = None
-        comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, form)
+        ind_png = []
+        comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, form, png_out=ind_png)
         table = distance_table(segs, mold_pts)
         th_html, th_md, th_df = thickness_profile(form)
 
@@ -6704,7 +6849,8 @@ def run_all(*vals):
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
                                                               xname=opts['xname'], yname=opts['yname'],
-                                                              env=env_d, cnc=cnc_d, extra=_form_extra(form)))
+                                                              env=env_d, cnc=cnc_d, extra=_form_extra(form),
+                                                              fps=fps, vid={'ind': ind_png}))
         except Exception:
             player_html = "<p>Hızlı oynatıcı hazırlanamadı:</p><pre>" + html.escape(traceback.format_exc()) + "</pre>"
 
@@ -7401,11 +7547,18 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     player_out = gr.HTML()
 
                 with gr.Tab("🎥 MP4"):
-                    gr.Markdown("Simülasyonu MP4 video olarak üretir ve indirmeni sağlar.")
-                    mp4_fps = gr.Slider(5, 40, value=20, step=1, label="MP4 FPS")
-                    mp4_btn = gr.Button("🎥 Simülasyonu MP4 Olarak Kaydet", variant="primary")
-                    video_out = gr.Video(label="Simülasyon (MP4)", interactive=False)
-                    mp4_file = gr.File(label="MP4 indir", interactive=False)
+                    gr.Markdown("**Hızlı görünümün birebir videosu** — tarayıcında kodlanır, sunucuyu yormaz. "
+                                "Sırası: tek döngü (Radüs izi açık, oynatıcıdaki hızla) → simülasyon sonunda "
+                                "**Esneme ×10** (5 sn) → **aktif kanalların bireysel kalınlıkları** (5 sn). "
+                                "Kare hızı: üstteki FPS ayarı. Önce 'Çalıştır'a bas; video bitince "
+                                "**cnc_simulasyon.mp4** olarak iner (Chrome / Edge; MP4 kodlayamayan tarayıcıda WebM). "
+                                "Aynı düğme Hızlı Oynatıcının üst çubuğunda da var.")
+                    vid_btn = gr.Button("🎥 Hızlı görünümün videosunu kaydet (MP4)", variant="primary")
+                    with gr.Accordion("Sunucuda sade MP4 (eski yöntem, yavaş)", open=False):
+                        mp4_fps = gr.Slider(5, 40, value=20, step=1, label="MP4 FPS")
+                        mp4_btn = gr.Button("Sade MP4 üret (sunucu)")
+                        video_out = gr.Video(label="Simülasyon (MP4)", interactive=False)
+                        mp4_file = gr.File(label="MP4 indir", interactive=False)
 
                 with gr.Tab("🔍 Genel Karşılaştırma"):
                     comp_html = gr.HTML()
@@ -7533,6 +7686,11 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     speed_sl.release(anim_retune, inputs=[fps_sl, speed_sl, anim_token], outputs=[frame_sl, play_timer])
 
     # MP4
+    _VID_JS = ("() => { const fr = document.querySelectorAll('iframe'); let n = 0; "
+               "fr.forEach(f => { try { f.contentWindow.postMessage({cmd: 'cncvideo'}, '*'); n++; } catch (e) {} }); "
+               "if (!n) alert('Önce Çalıştır ile Hızlı Oynatıcıyı oluştur.'); }")
+    _vk = 'js' if 'js' in inspect.signature(vid_btn.click).parameters else '_js'
+    vid_btn.click(None, None, None, **{_vk: _VID_JS})
     mp4_btn.click(make_mp4, inputs=cfg_comps + [mp4_fps] + opt_comps + [tool_state],
                   outputs=[video_out, mp4_file, status])
 
