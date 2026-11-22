@@ -131,7 +131,8 @@ def _tangent_for(seg, ang):
     return _unit((-np.sin(ang), np.cos(ang)))
 
 
-def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.0, y_offset=0.0, g0_feed=15000.0):
+def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.0, y_offset=0.0, g0_feed=15000.0,
+                     x_offset=0.0):
     """
     Bir kanalın G-kodu komutlarını işleyip hareket segmentleri listesi üretir.
     y_offset: G-kodundaki tüm Y değerlerine eklenecek ofset miktarı.
@@ -181,7 +182,7 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
             _app({'type': 'dwell', 'point': (x, y), 'duration': dwell})
             continue
 
-        target_x = cmd.get('X', x)
+        target_x = cmd.get('X', x - x_offset) + x_offset     # X offset: programdaki tüm X değerleri kaydırılır
         # Hedef Y değerine kullanıcı tarafından girilen offset dinamik olarak ekleniyor
         target_y = cmd.get('Y', y - y_offset) + y_offset
 
@@ -788,11 +789,11 @@ DEMO_GCODE = [
 ]
 
 DEFAULT_CHANNELS = [
-    {'x0': -275.0,   'y0': -100.0, 'tr': 15.0, 'fd': 800.0, 'y_offset': 0.0, 'code': DEMO_GCODE[0],
+    {'x0': -275.0,   'y0': -100.0, 'tr': 15.0, 'fd': 800.0, 'x_offset': 0.0, 'y_offset': 0.0, 'code': DEMO_GCODE[0],
      'dia_mode': 'radius', 'dia_axis': 'X'},
-    {'x0': -286.075, 'y0': -99.5,  'tr': 15.0, 'fd': 800.0, 'y_offset': 0.0, 'code': DEMO_GCODE[1],
+    {'x0': -286.075, 'y0': -99.5,  'tr': 15.0, 'fd': 800.0, 'x_offset': 0.0, 'y_offset': 0.0, 'code': DEMO_GCODE[1],
      'dia_mode': 'radius', 'dia_axis': 'X'},
-    {'x0': -275.0,   'y0': -100.0, 'tr': 15.0, 'fd': 800.0, 'y_offset': 0.0, 'code': DEMO_GCODE[2],
+    {'x0': -275.0,   'y0': -100.0, 'tr': 15.0, 'fd': 800.0, 'x_offset': 0.0, 'y_offset': 0.0, 'code': DEMO_GCODE[2],
      'dia_mode': 'radius', 'dia_axis': 'X'},
 ]
 DEFAULT_MOLD = {
@@ -817,7 +818,8 @@ DIA_AXIS_CHOICES = [('Yatay eksen', 'X'), ('Dikey eksen', 'Y'), ('İkisi de', 'X
 
 CH_STRIDE = 8                       # kanal başına bileşen: x0,y0,tr,fd,y_offset,code,dia_mode,dia_axis
 MOLD_START = N_CH * CH_STRIDE       # 24: kalıp x0,y0,code,dia_mode,dia_axis
-N_CFG = MOLD_START + 5 + 1 + 1 + 8 + 4 + 9  # 52: … + malzeme esnemesi(4: E, akma, çap katsayısı, sabit uç) + kuvvet(9: devir, k_f0, C, n, η, makara çapı, makara sayısı, β, rijitlik); kalıp(5) + çizilen yol modu + G0 hızı + eksenler(8: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon, köşe kesişim açısı, küçük iç yayı atla)
+XOFF_START = MOLD_START + 5 + 1 + 1 + 8 + 4 + 9   # 52: kanal X offsetleri (sonradan eklendi, eski sıralar bozulmasın)
+N_CFG = XOFF_START + N_CH   # 55 = 52 + 3 X offset; 52: … + malzeme esnemesi(4: E, akma, çap katsayısı, sabit uç) + kuvvet(9: devir, k_f0, C, n, η, makara çapı, makara sayısı, β, rijitlik); kalıp(5) + çizilen yol modu + G0 hızı + eksenler(8: DXF X, DXF Y, G42 yönü, G42 tarafı, takım referansı, profile göre kompanzasyon, köşe kesişim açısı, küçük iç yayı atla)
 N_OPT = 13                          # grafik seçenekleri: yazı boyutu, kaydırma, yatay ad, dikey ad, radüs izi, iz sınırı,
                                     # ön form: kullan, kaydırma X, kaydırma Y, seçili katmanlar, model, radyal eksen, simülasyon
 
@@ -850,6 +852,7 @@ def cfg_from_values(v):
             'x0': _num(v[b]), 'y0': _num(v[b + 1]), 'tr': _num(v[b + 2], 10.0),
             'fd': _num(v[b + 3], 1000.0), 'y_offset': _num(v[b + 4]),
             'code': v[b + 5] or '', 'dia_mode': dm, 'dia_axis': da,
+            'x_offset': _num(v[XOFF_START + k]),
         })
     m = MOLD_START
     dm, da = _dia(v[m + 3], v[m + 4])
@@ -1330,7 +1333,8 @@ def build_channels_cfg(cfg):
         if n:
             notes.append(n)
         tr = ToolR(ch['tr'], ch.get('shape'))           # yarıçap (kompanzasyon) + varsa DXF makara profili
-        segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed)
+        segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed,
+                                x_offset=ch.get('x_offset', 0.0))
         segs = apply_corner_compensation(segs, float(tr))
         segs, cn = apply_sinumerik_corners(segs, float(tr), pc.get('ins_limit', 10.0), pc.get('skip_arcs', True))
         notes.extend(f"Kanal {ci + 1}: {t_}" for t_ in cn)
@@ -4507,6 +4511,7 @@ def springback(sim, st, mat):
 # MAKARA PROFİLİ (DXF), KALIP DXF → G-KODU, TAKIM AŞINMASI
 # =============================================================
 import matplotlib.colors as mcolors
+import matplotlib.ticker as mticker
 from matplotlib.collections import LineCollection
 
 WEAR_CMAP = mcolors.LinearSegmentedColormap.from_list(      # tek tonlu sıra: açık → koyu turuncu
@@ -5199,6 +5204,114 @@ def wear_dxf_files(res, radii, depth_mm, K):
 
 
 # -------------------------------------------------------------
+# MAKARA ÖMRÜ — Archard aşınma yasası:  dV = k · F_N · dL_kayma / H
+#   F_N = F_r (makara başına radyal kuvvet, Thamasett), dL_kayma = kayma · v_çevre · dt,
+#   v_çevre = 2π·(r_kalıp + s₁)·n  (iş parçası ile makaranın temas noktasındaki çevre hızı),
+#   aşınan hacim makaranın çevresi boyunca dağılır: derinlik(profil noktası) = d · W_j / W_maks,
+#   V = d · π·D · Σ (W_j / W_maks)·Δl_j  →  bir parçadaki en büyük derinlik d = V · W_maks / (π·D·Σ W_j·Δl_j)
+# -------------------------------------------------------------
+HRC_HV = ((20, 238), (30, 302), (40, 392), (45, 446), (50, 513), (55, 595), (58, 653), (60, 697), (62, 746),
+          (64, 800), (66, 865), (68, 940))
+
+
+def hrc_to_mpa(hrc):
+    """Rockwell C sertliğini yaklaşık Vickers'a, oradan MPa'ya (H = HV·9,807) çevirir."""
+    a = np.array(HRC_HV, float)
+    return float(np.interp(float(hrc), a[:, 0], a[:, 1])) * 9.80665
+
+
+def _life_volume(r, rpm_k=1.0, feed_k=1.0, D=None, slip=0.02):
+    """Bir parçada makara başına Σ F_r·L_kayma (N·mm). rpm_k / feed_k: devir ve ilerleme hızı çarpanı,
+    D: yeni makara çapı (None: aynı). F_r ∝ √f (f = F/n), F_r ∝ √r_m,CD; kayma yolu ∝ n · süre, süre ∝ 1/feed_k."""
+    e = r['eng']
+    if not np.any(e):
+        return 0.0
+    dt = np.where(e, r['dsp'] / np.maximum(r['v'], 1e-9) * 60.0, 0.0)            # s (programdaki hızla)
+    rc = r['rM'] + np.nan_to_num(r['s1'])
+    Fr = np.asarray(r['Fr'], float) * np.sqrt(feed_k / rpm_k)
+    if D is not None and D > 0:
+        rT = D / 2.0
+        rm2 = 2.0 * rT * r['rM'] / np.maximum(rT + r['rM'], 1e-9)
+        Fr = Fr * np.sqrt(rm2 / np.maximum(r['rmCD'], 1e-9))
+    vs = 2.0 * np.pi * rc * r['n_rpm'] * rpm_k / 60.0                               # mm/s
+    return float(np.sum(np.where(e, Fr * slip * vs * dt / feed_k, 0.0)))
+
+
+def wear_life(wres, pres, D_roll, depth_mm, kA, H_mpa, slip, known_parts=0.0):
+    """Kanal başına: bir parçadaki en büyük aşınma derinliği (mm) ve hedef derinliğe (depth_mm) kaç parçada ulaşılacağı.
+    known_parts > 0: k bu ömre göre kalibre edilir (en kısa ömürlü kanal bu değeri verecek şekilde)."""
+    rows = []
+    for i, (w, r) in enumerate(zip(wres, pres)):
+        if w is None or r is None or w['W'].max() <= 0 or not np.any(r['eng']):
+            continue
+        dl = float(w['s'][1] - w['s'][0]) if len(w['s']) > 1 else 1.0
+        geo = float(w['W'].max()) / (np.pi * D_roll * float(w['W'].sum()) * dl)      # 1/mm²
+        FL = _life_volume(r, slip=slip)
+        rows.append({'i': i, 'geo': geo, 'FL': FL, 'r': r, 'w': w})
+    if not rows:
+        return [], kA
+    if known_parts and known_parts > 0 and depth_mm > 0:
+        worst = max(q['geo'] * q['FL'] for q in rows)
+        kA = depth_mm / (known_parts * worst / H_mpa) if worst > 0 else kA
+    for q in rows:
+        q['d_part'] = kA * q['FL'] / H_mpa * q['geo']                                 # mm / parça
+        q['N'] = depth_mm / q['d_part'] if q['d_part'] > 0 and depth_mm > 0 else float('inf')
+    return rows, kA
+
+
+def wear_life_sensitivity(rows, D_roll, slip):
+    """Parametre çarpanı (0,5…1,5) → göreli ömür (aynı k ile). Devir, ilerleme hızı (F) ve makara çapı."""
+    ks = np.linspace(0.5, 1.5, 11)
+    out = {}
+    for q in rows:
+        base = q['FL'] * q['geo']
+        cur = {}
+        for name in ('rpm', 'feed', 'D'):
+            vals = []
+            for kk in ks:
+                if name == 'D':
+                    Dn = D_roll * kk
+                    geo = q['geo'] * D_roll / Dn
+                    v = _life_volume(q['r'], D=Dn, slip=slip) * geo
+                else:
+                    v = _life_volume(q['r'], rpm_k=kk if name == 'rpm' else 1.0,
+                                     feed_k=kk if name == 'feed' else 1.0, slip=slip) * q['geo']
+                vals.append(base / v if v > 0 else np.nan)
+            cur[name] = np.array(vals)
+        out[q['i']] = cur
+    return ks, out
+
+
+def wear_life_figure(ks, sens, rows, title_N):
+    """Ömür – parametre çarpanı (en kısa ömürlü kanal için), parça sayısı."""
+    fig = Figure(figsize=(7.4, 3.3), dpi=100); FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    q = min(rows, key=lambda r_: r_['N'])
+    N0 = q['N']
+    cols = {'rpm': '#2a78d6', 'feed': '#eb6834', 'D': '#1baf7a'}
+    labs = {'rpm': 'İş mili devri n', 'feed': 'İlerleme hızı F', 'D': 'Makara çapı D'}
+    for name in ('rpm', 'feed', 'D'):
+        y = sens[q['i']][name] * N0
+        ax.plot(ks * 100, y, color=cols[name], linewidth=2, label=labs[name])
+        ax.annotate(f"{y[-1]:,.0f}".replace(',', '.'), (ks[-1] * 100, y[-1]), xytext=(4, 0), textcoords='offset points',
+                    va='center', fontsize=8, color=INK)
+    ax.axvline(100, color=GRID, linewidth=1.2, zorder=0)
+    ax.scatter([100], [N0], color=INK, s=22, zorder=5)
+    ax.set_title(f"Kanal {q['i'] + 1} — makara ömrü: parametre değişince ({title_N})", fontsize=10, color=INK)
+    ax.set_xlabel('Parametre / mevcut değer (%)', fontsize=9, color=INK)
+    ax.set_ylabel('Ömür (parça)', fontsize=9, color=INK)
+    ax.grid(True, axis='y', color=GRID, linewidth=0.8)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    ax.tick_params(labelsize=8, colors=INK2)
+    ax.set_xlim(48, 162); ax.set_ylim(0, ax.get_ylim()[1] * 1.22)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, p: f"{v:,.0f}".replace(',', '.')))
+    ax.legend(fontsize=8, frameon=False, loc='upper left', ncol=3)
+    fig.tight_layout()
+    return fig_to_svg_card(fig)
+
+
+# -------------------------------------------------------------
 # PROSES HESAPLARI (teori) — IUL "Shear Forming and Flow Forming" ders notundaki bağıntılar
 #  Flow forming, Thamasett (slayt 7.20–7.21):
 #     b = Δs·cot α            temas boyu (ilerleme yönünde)      → burada profil geometrisinden ölçülür
@@ -5281,7 +5394,8 @@ def compute_process(timelines, radii, mold_points, fin, env_limit, ri, n_rpm, kf
              'Fr': _roll_med(Fr), 'Fa': _roll_med(Fa), 'Ft': _roll_med(Ft), 'P': _roll_med(P), 'dlt': _roll_med(dlt),
              'alpha': alpha, 'eps': eps, 'phi': phi, 'flow': rmCD / max(rmLD, 1e-9), 'rM': rM, 'tipray': tipray,
              'Mt': _roll_med(Ft * rc / 1000.0), 'z': max(int(z), 1), 'kfm': kfa, 'phiT': ph1, 'C': smp['C'],
-             'u': smp['u'], 'Mtip': M[tipray]}
+             'u': smp['u'], 'Mtip': M[tipray], 'dsp': smp['ds'], 'v': smp['v'], 'rmCD': rmCD, 'rT': rT,
+             'n_rpm': float(n_rpm), 'eta': float(eta)}
         if shear and fin is not None and len(fin.get('T', [])) == len(M):
             sinA = np.abs(N[tipray, 1 - ri]); cosA = np.abs(N[tipray, ri])
             t0 = np.nan_to_num(np.asarray(fin['T'], float)[tipray])
@@ -5527,7 +5641,8 @@ def config_to_json_dict(cfg, fps, speed, ac_start, ac_end, ac_step, opts, prefor
                                    for k, v in ((preform or {}).get('layers') or {}).items()}}}
     for idx, ch in enumerate(cfg['channels']):
         data['channels'].append({'channel_id': idx + 1, 'x0': ch['x0'], 'y0': ch['y0'], 'tr': ch['tr'],
-                                 'fd': ch['fd'], 'y_offset': ch['y_offset'], 'code': ch['code'],
+                                 'fd': ch['fd'], 'x_offset': ch.get('x_offset', 0.0), 'y_offset': ch['y_offset'],
+                                 'code': ch['code'],
                                  'dia_mode': ch['dia_mode'], 'dia_axis': ch['dia_axis']})
         te = (tools or {}).get(str(idx))
         if te and te.get('shape'):
@@ -5562,6 +5677,8 @@ def json_dict_to_updates(data, gr_update):
     mat = st.get('material') if isinstance(st.get('material'), dict) else {}
     for key in MATERIAL_KEYS:
         ups.append(gr_update(value=mat[key]) if key in mat else gr_update())
+    for k in range(N_CH):                               # kanal X offsetleri
+        ups.append(pick(chans[k] if k < len(chans) else {}, 'x_offset'))
     ups.append(pick(st, 'fps'))
     ups.append(pick(st, 'speed'))
     ac = data.get('autocad', {}) or {}
@@ -6262,7 +6379,7 @@ function updateCNC(){
     for(var q=0;q<6;q++){ var idx=start+q, d=cd.lines[q];
       if(idx<L.length){ if(/^\s*N\d+/i.test(L[idx])) d.textContent=L[idx].trim(); else { var n='N'+(idx+1); while(n.length<5) n+=' '; d.textContent=n+L[idx]; } } else d.textContent='';
       d.className=(idx===cur&&!done)?'ln cur':'ln'; }
-    cd.rx[0].textContent=f3(px*c.fx); cd.ry[0].textContent=f3((py-c.yo)*c.fy);
+    cd.rx[0].textContent=f3((px-(c.xo||0))*c.fx); cd.ry[0].textContent=f3((py-c.yo)*c.fy);
     cd.rx[1].textContent=f3(rx); cd.ry[1].textContent=f3(ry);
     cd.lk.textContent=remLbl; cd.lv.textContent=''; cd.lv2.textContent=remTxt||f3(rem);
     updForce(cd,c);
@@ -6578,7 +6695,7 @@ def player_cnc_data(cfg, channels_segments, timelines, total_time, start_points=
                                            start_points[i] if start_points else (ch['x0'], ch['y0'])),
                     'fx': (2 if (dia and 'X' in ax) else 1) * (-1 if (cfg.get('plane') or {}).get('hneg') else 1),
                     'fy': (2 if (dia and 'Y' in ax) else 1) * (-1 if (cfg.get('plane') or {}).get('vneg') else 1),
-                    'yo': round(float(ch.get('y_offset', 0.0)), 4),
+                    'yo': round(float(ch.get('y_offset', 0.0)), 4), 'xo': round(float(ch.get('x_offset', 0.0)), 4),
                     'hl': (cfg.get('plane') or {}).get('hl', 'X'), 'vl': (cfg.get('plane') or {}).get('vl', 'Y'),
                     'p0': [round(float(v), 4) for v in (start_points[i] if start_points else (ch['x0'], ch['y0']))]})
     return out
@@ -7355,7 +7472,56 @@ def _wear_compute(vals):
     form = _envelopes(timelines, radii, mold_pts, opts, force=True, cfg=cfg) if _preform(opts, cfg) else None
     fin = (form or {}).get('final')
     res, src = compute_wear(timelines, radii, mold_pts, fin, opts['env_limit'], a, b, vref, Kc)
-    return cfg, radii, res, src, note, (a, b, vref, Kc)
+    ctx = {'timelines': timelines, 'mold_pts': mold_pts, 'fin': fin, 'opts': opts}
+    return cfg, radii, res, src, note, (a, b, vref, Kc), ctx
+
+
+def _wear_life_md(cfg, radii, wres, depth, kA, hrc, slip, known, ctx=None):
+    """Makara ömrü (Archard) → (markdown, figür HTML, tablo satırları)"""
+    mat = cfg.get('material') or DEFAULT_MATERIAL
+    if ctx is None:
+        return "", "", []
+    if not depth or depth <= 0:
+        return ("**Makara ömrü:** hedef derinlik için 'En büyük aşınma derinliği (mm)' alanına bir değer gir "
+                "(aşınmış profil DXF'i ile aynı değer)."), "", []
+    if mat['rpm'] <= 0 or mat['kf0'] <= 0 or mat['Dr'] <= 0:
+        return "**Makara ömrü:** Malzeme ayarlarında devir, k_f0 ve makara çapı girilmeli.", "", []
+    fin = ctx['fin']
+    radial = (fin or {}).get('radial') or resolve_radial(ctx['opts'].get('pf_radial', 'auto'), cfg)[0]
+    ri = 0 if radial == 'X' else 1
+    pres, _src, _E = compute_process(ctx['timelines'], radii, ctx['mold_pts'], fin, ctx['opts']['env_limit'], ri,
+                                     mat['rpm'], mat['kf0'], mat['eta'], mat['Dr'], mat['z'], mat['beta'], mat['cst'],
+                                     bool(fin) and fin.get('mode') == 'shear', mat=mat)
+    H = hrc_to_mpa(hrc)
+    rows, k_used = wear_life(wres, pres, mat['Dr'], depth, kA, H, slip, known)
+    if not rows:
+        return "**Makara ömrü:** makaralar malzemeye girmiyor.", "", []
+    fmt = lambda v: (f"{v:,.0f}".replace(',', '.') if np.isfinite(v) else '∞')
+    md = [f"**Makara ömrü (Archard):** dV = k · F_r · L_kayma / H — k = **{k_used:.3g}**"
+          + (f" (bilinen {fmt(known)} parça ömrüne göre kalibre edildi)" if known and known > 0 else " (girilen)")
+          + f", sertlik {hrc:g} HRC ≈ {H / 9.80665:.0f} HV, kayma %{slip * 100:g}, n = {mat['rpm']:g} dev/dk, "
+          f"makara çapı {mat['Dr']:g} mm, hedef en büyük derinlik **{depth:g} mm**."]
+    tab = []
+    for q in rows:
+        i = q['i']
+        md.append(f"**Kanal {i + 1}:** parça başına en büyük aşınma {q['d_part'] * 1000:.3g} µm → "
+                  f"**{depth:g} mm'ye yaklaşık {fmt(q['N'])} parçada** ulaşılır.")
+    ks, sens = wear_life_sensitivity(rows, mat['Dr'], slip)
+    for q in rows:
+        sv = sens[q['i']]
+        j8, j12 = 3, 7                                    # %80 ve %120
+        tab.append({'Kanal': q['i'] + 1, 'Ömür (parça)': fmt(q['N']),
+                    'Devir %80': fmt(q['N'] * sv['rpm'][j8]), 'Devir %120': fmt(q['N'] * sv['rpm'][j12]),
+                    'F %80': fmt(q['N'] * sv['feed'][j8]), 'F %120': fmt(q['N'] * sv['feed'][j12]),
+                    'Makara Ø %80': fmt(q['N'] * sv['D'][j8]), 'Makara Ø %120': fmt(q['N'] * sv['D'][j12])})
+    md.append("Etkiler (aynı program yolu, aynı k): **devir ↑** → çevre hızı ve kayma yolu artar, devir başına ilerleme f "
+              "azaldığından F_r ∝ √f düşer; net ömür ∝ n^(−1/2). **İlerleme hızı F ↑** → işlem süresi kısalır, F_r artar; "
+              "net ömür ∝ F^(1/2) (ama kuvvet, yüzey kalitesi ve çap büyümesi riski artar). **Makara çapı ↑** → aşınma daha "
+              "geniş bir çevreye yayılır ama temas uzadığı için F_r de artar; ömür artar, fakat çapla tam orantılı değil. "
+              "Mutlak parça sayısı k'ya bağlıdır: bir makaranın gerçek ömrünü 'Bilinen ömür' alanına girersen k ondan "
+              "hesaplanır ve diğer ayarların ömrü bu kalibrasyonla tahmin edilir.")
+    fig = wear_life_figure(ks, sens, rows, f"{depth:g} mm aşınmaya kadar")
+    return "\n\n".join(md), fig, tab
 
 
 @_trim
@@ -7363,7 +7529,7 @@ def run_wear_dxf(*vals):
     """vals = all_inputs + [a, b, v_ref, K, en büyük aşınma derinliği (mm)]"""
     try:
         depth = _num(vals[-1], 0.0)
-        cfg, radii, res, src, note, (a, b, vref, Kc) = _wear_compute(vals[:-1])
+        cfg, radii, res, src, note, (a, b, vref, Kc), _ctx = _wear_compute(vals[:-1])
         paths, msg = wear_dxf_files(res, radii, depth, Kc)
         return paths, msg
     except ValueError as e:
@@ -7374,12 +7540,15 @@ def run_wear_dxf(*vals):
 
 @_trim
 def run_wear(*vals):
-    """vals = all_inputs + [a, b, v_ref, K]"""
+    """vals = all_inputs + [a, b, v_ref, K, hedef derinlik, k_Archard, HRC, kayma (%), bilinen ömür]"""
     try:
+        depth, kA, hrc, slip, known = (_num(vals[-5], 0.0), _num(vals[-4], 1e-6), _num(vals[-3], 60.0),
+                                       _num(vals[-2], 2.0) / 100.0, _num(vals[-1], 0.0))
+        vals = vals[:-5]
         try:
-            cfg, radii, res, src, note, (a, b, vref, Kc) = _wear_compute(vals)
+            cfg, radii, res, src, note, (a, b, vref, Kc), ctx = _wear_compute(vals)
         except ValueError as e:
-            return "", str(e), None, f"Aşınma hesaplanamadı: {e}"
+            return "", str(e), None, "", "", None, f"Aşınma hesaplanamadı: {e}"
         html_parts, rows, md = [], [], []
         md.append(f"**Denklem:** her makara profili noktası için her adımda  dW = K · h^{a:g} · (F / {vref:g})^{b:g} · Δs  \n"
                   f"h = noktanın gelen malzeme yüzeyinin altında kaldığı derinlik (süpürdüğü kalınlık, mm), "
@@ -7412,9 +7581,15 @@ def run_wear(*vals):
                   "K girilirse en büyük değer µm olarak tahmin edilir. Gelen yüzey ön formun **ilk** halinden alınır: "
                   "simülasyonda malzemenin akıp gittiği yerlerde makaranın yan yüzlerindeki temas fazla görünebilir.")
         df = pd.DataFrame(rows) if rows else None
-        return "".join(html_parts) or "<p>Aktif kanal yok.</p>", "\n\n".join(md), df, (note + "\n" if note else "") + "Aşınma hesaplandı."
+        try:
+            lmd, lfig, ltab = _wear_life_md(cfg, radii, res, depth, kA, hrc, slip, known, ctx)
+        except Exception:
+            lmd, lfig, ltab = "Makara ömrü hesaplanamadı: " + traceback.format_exc(limit=2).strip().splitlines()[-1], "", []
+        ldf = pd.DataFrame(ltab) if ltab else None
+        return ("".join(html_parts) or "<p>Aktif kanal yok.</p>", "\n\n".join(md), df, lmd, lfig, ldf,
+                (note + "\n" if note else "") + "Aşınma hesaplandı.")
     except Exception:
-        return "", "", None, "Aşınma hesaplanırken hata oluştu:\n" + traceback.format_exc()
+        return "", "", None, "", "", None, "Aşınma hesaplanırken hata oluştu:\n" + traceback.format_exc()
 
 
 @_trim
@@ -7554,6 +7729,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
         # ---------------- SOL: girdiler ----------------
         with gr.Column(scale=4, min_width=380):
             cfg_comps = []
+            xoff_comps = []
             dia_pairs = []
             tool_files, tool_prevs, tool_trs, tool_dels = [], [], [], []
             with gr.Tabs():
@@ -7564,11 +7740,16 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                         y0 = gr.Number(value=d['y0'], label="Başlangıç Y")
                         tr = gr.Number(value=d['tr'], label="Takım Yarıçapı")
                         fd = gr.Number(value=d['fd'], label="Varsayılan F")
-                        yo = gr.Number(value=d['y_offset'], label="Y Offset (mm)")
+                        with gr.Row():
+                            xo = gr.Number(value=d.get('x_offset', 0.0), label="X Offset (mm)",
+                                           info="Programdaki tüm X (yatay eksen) değerlerine eklenir.")
+                            yo = gr.Number(value=d['y_offset'], label="Y Offset (mm)",
+                                           info="Programdaki tüm Y (dikey eksen) değerlerine eklenir.")
+                        xoff_comps.append(xo)
                         code = gr.Textbox(value=d['code'], lines=8, label="G-Kodu")
                         dmode = gr.Radio(DIA_MODE_CHOICES, value=d['dia_mode'], label="Girdiğim değer türü",
                                          info="Çap seçilirse seçilen eksendeki G-kodu koordinatları ve başlangıç değeri 2'ye bölünür "
-                                              "(I/J/R ve Y offset değişmez).")
+                                              "(I/J/R ve X / Y offset değişmez; offsetler gerçek mm kaydırmadır).")
                         daxis = gr.Radio(DIA_AXIS_CHOICES, value=d['dia_axis'], label="Çap hangi eksende?",
                                          visible=(d['dia_mode'] == 'diameter'))
                         dia_pairs.append((dmode, daxis))
@@ -7718,6 +7899,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                     mat_comps = [mat_E, mat_sy, mat_kh, mat_clamp, mat_rpm, mat_kf0, mat_C, mat_nh, mat_eta, mat_Dr,
                                  mat_z, mat_beta, mat_cst]
                     cfg_comps += mat_comps
+                    cfg_comps += xoff_comps                 # kanal X offsetleri (N_CFG sonuna eklendi)
                 with gr.Row():
                     pf_use = gr.Checkbox(value=True, label="Ön formu kullan")
                     pf_dx = gr.Number(value=0.0, label="Ön form kaydırma X (mm)")
@@ -7871,6 +8053,22 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                         wear_depth = gr.Number(value=0.5, label="En büyük aşınma derinliği (mm) — 0: K'ya göre")
                         wear_dxf_btn = gr.Button("📐 Aşınmış profili DXF indir")
                     wear_dxf_out = gr.File(label="Aşınmış makara profili DXF", interactive=False, file_count="multiple")
+                    gr.Markdown("**Makara ömrü — bu aşınmış profile kaç parçada ulaşılır?** Archard yasası: "
+                                "**dV = k · F_r · L_kayma / H**. F_r her an Thamasett ile hesaplanır (Malzeme ayarlarındaki "
+                                "devir, akış eğrisi, η, makara çapı); kayma yolu L = kayma oranı × iş parçası çevre hızı × süre. "
+                                "Aşınan hacim makaranın çevresine, profil boyunca yukarıdaki aşınma dağılımına göre yayılır. "
+                                "Hedef derinlik = yukarıdaki 'En büyük aşınma derinliği'. Sonuç 'Aşınmayı hesapla' ile gelir.")
+                    with gr.Row():
+                        wear_kA = gr.Number(value=1e-6, label="Archard aşınma katsayısı k (boyutsuz)",
+                                            info="Yağlı sertleştirilmiş çelik ≈ 1e-8 … 1e-6. Bilinen ömür girersen hesaplanır.")
+                        wear_hrc = gr.Number(value=60.0, label="Makara sertliği (HRC)")
+                        wear_slip = gr.Number(value=2.0, label="Kayma oranı (%)",
+                                              info="Makara ile parça arasındaki göreli kayma (genelde %1 – 5).")
+                        wear_known = gr.Number(value=0.0, label="Bilinen ömür (parça) — 0: k kullanılır",
+                                               info="Bu ayarlarla bir makara hedef derinliğe kaç parçada ulaştıysa gir; k ondan kalibre edilir.")
+                    wear_life_md = gr.Markdown()
+                    wear_life_html = gr.HTML()
+                    wear_life_df = gr.DataFrame(label="Makara ömrü (parça) — parametre değişince")
 
     # ---------------- OLAYLAR ----------------
     opt_comps = [lbl_font, lbl_shift, x_name, y_name, show_env, env_limit,
@@ -7948,8 +8146,9 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
         _c.change(_plane_md, inputs=plane_comps, outputs=pl_legend)
 
     # takım aşınması
-    wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K],
-                   outputs=[wear_html, wear_md, wear_df, status])
+    wear_btn.click(run_wear, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K, wear_depth, wear_kA, wear_hrc,
+                                                  wear_slip, wear_known],
+                   outputs=[wear_html, wear_md, wear_df, wear_life_md, wear_life_html, wear_life_df, status])
     pr_btn.click(run_process, inputs=all_inputs,
                  outputs=[pr_html, pr_md, pr_df, status])
     wear_dxf_btn.click(run_wear_dxf, inputs=all_inputs + [wear_a, wear_b, wear_vref, wear_K, wear_depth],
