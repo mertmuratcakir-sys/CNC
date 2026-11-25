@@ -7127,8 +7127,13 @@ def _live_forces(cfg, opts, form, timelines, radii, mold_pts, total_time, n):
 # -------------------------------------------------------------
 # 1) Ana çalıştırma: animasyon + analizler + hızlı oynatıcı
 # -------------------------------------------------------------
+def run_all_fast(*vals):
+    """Kuvvet hesabı olmadan (hızlı)."""
+    return run_all(*vals, with_forces=False)
+
+
 @_trim
-def run_all(*vals):
+def run_all(*vals, with_forces=True):
     try:
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
@@ -7163,7 +7168,10 @@ def run_all(*vals):
                                'info': sb_res['info']}
             cnc_d = player_cnc_data(cfg, segs, timelines, total_time, starts)
             n_pl = int(min(max(np.ceil(total_time * 30), 2), 6000))       # build_player_data ile aynı kare sayısı
-            frc_d, frc_note = _live_forces(cfg, opts, form, timelines, radii, mold_pts, total_time, n_pl)
+            if with_forces:
+                frc_d, frc_note = _live_forces(cfg, opts, form, timelines, radii, mold_pts, total_time, n_pl)
+            else:
+                frc_d, frc_note = None, "\nKuvvetler hesaplanmadı (hızlı çalıştırma) — canlı kuvvetler için '⚡ … + Kuvvetler' düğmesini kullan."
             player_html = build_player_html(build_player_data(segs, starts, radii, mold_pts, timelines,
                                                               total_time, speed0=speed,
                                                               xname=opts['xname'], yname=opts['yname'],
@@ -7911,7 +7919,11 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                 fps_sl = gr.Slider(5, 40, value=20, step=1, label="FPS")
                 speed_sl = gr.Slider(0.2, 5.0, value=1.0, step=0.2, label="Hız Çarpanı")
 
-            run_btn = gr.Button("▶ Simülasyonu ve Analizleri Çalıştır", variant="primary")
+            with gr.Row():
+                run_btn = gr.Button("▶ Simülasyonu ve Analizleri Çalıştır — kuvvetsiz (hızlı)", variant="primary")
+                run_frc_btn = gr.Button("⚡ Simülasyonu ve Analizleri Çalıştır + Kuvvetler", variant="secondary")
+            gr.Markdown("Kuvvetli çalıştırma, Hızlı Oynatıcıda canlı eksen kuvvetlerini ve kuvvet oklarını da hesaplar "
+                        "(ön form gerekli; süre yaklaşık iki katına çıkar).")
 
             with gr.Accordion("Konfigürasyon Yönetimi (JSON)", open=True):
                 gr.Markdown("3 kanalın ve kalıbın tüm ayarlarını (başlangıç, yarıçap, F, Y offset, G-kodları, "
@@ -8075,10 +8087,10 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
                  pf_use, pf_dx, pf_dy, pf_layers, pf_model, pf_radial, pf_sim] # sıra: opts_from_values
     all_inputs = cfg_comps + [fps_sl, speed_sl, ac_start, ac_end, ac_step] + opt_comps + [pf_state, tool_state]
 
-    run_btn.click(
-        run_all, inputs=all_inputs,
-        outputs=[anim_img, frame_sl, play_timer, anim_token, comp_html, ind1, ind2, ind3,
-                 table_out, player_out, thick_html, thick_md, thick_df, status])
+    _run_outs = [anim_img, frame_sl, play_timer, anim_token, comp_html, ind1, ind2, ind3,
+                 table_out, player_out, thick_html, thick_md, thick_df, status]
+    run_btn.click(run_all_fast, inputs=all_inputs, outputs=_run_outs)
+    run_frc_btn.click(run_all, inputs=all_inputs, outputs=_run_outs)
 
     # statik grafikleri yeniden çiz (yazı boyutu / kaydırma / eksen adı / radüs izi)
     redraw_outputs = [comp_html, ind1, ind2, ind3, thick_html, thick_md, thick_df, status]
