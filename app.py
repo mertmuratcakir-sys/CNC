@@ -7099,29 +7099,87 @@ def _static_plots(segs, starts, radii, mold_pts, opts, form=None, png_out=None):
 
 def _live_forces(cfg, opts, form, timelines, radii, mold_pts, total_time, n):
     """Hızlı oynatıcı için canlı makara kuvvetleri (malzeme ayarlarındaki Thamasett girdileriyle).
-    Ön form yoksa gelen kalınlık bilinmediği için hesaplanmaz. Döndürür: (veri veya None, durum notu)"""
+    Ön form yoksa gelen kalınlık 'ham malzeme kalınlığı' (yoksa takım yarıçapı) alınır. Döndürür: (veri veya None, durum notu)"""
     try:
         fin = (form or {}).get('final') if form else None
         mat = cfg.get('material') or DEFAULT_MATERIAL
-        if fin is None or len(mold_pts) < 2:
-            return None, ''
+        if len(mold_pts) < 2:
+            return None, "\nKuvvetler hesaplanmadı: kalıp profili (DXF) yüklenmemiş."
         if mat['rpm'] <= 0 or mat['kf0'] <= 0 or mat['Dr'] <= 0:
-            return None, "\nKuvvetler: malzeme ayarlarında devir, k_f0 ve makara çapı girilmeli."
-        radial = fin.get('radial') or resolve_radial(opts.get('pf_radial', 'auto'), cfg)[0]
+            return None, "\nKuvvetler hesaplanmadı: Malzeme ayarlarında devir, k_f0 ve makara çapı sıfırdan büyük olmalı."
+        radial = ((fin or {}).get('radial')) or resolve_radial(opts.get('pf_radial', 'auto'), cfg)[0]
         ri = 0 if radial == 'X' else 1
         res, src, _E = compute_process(timelines, radii, mold_pts, fin, opts['env_limit'], ri, mat['rpm'], mat['kf0'],
                                        mat['eta'], mat['Dr'], mat['z'], mat['beta'], mat['cst'],
-                                       fin.get('mode') == 'shear', mat=mat)
+                                       bool(fin) and fin.get('mode') == 'shear', mat=mat)
         d = player_force_data(res, total_time, n, ri, mat, src)
         if d is None:
-            return None, "\nKuvvetler: makaralar malzemeye girmiyor."
+            return None, f"\nKuvvetler: makaralar malzemeye girmiyor (gelen kalınlık: {src})."
         parts = []
         for i, r in enumerate(res):
             if r is not None and np.any(r['eng']):
                 parts.append(f"K{i + 1} F_r {r['Fr'].max() / 1000:.1f} / F_a {r['Fa'].max() / 1000:.1f} / F_t {r['Ft'].max() / 1000:.2f} kN")
-        return d, "\nKuvvetler (en büyük, makara başına): " + "; ".join(parts) + " — Hızlı Oynatıcıda canlı."
+        return d, ("\nKuvvetler (en büyük, makara başına): " + "; ".join(parts) + f" — gelen kalınlık: {src}. "
+                   "Hızlı Oynatıcıda canlı (CNC ekranları + 'Kuvvet' okları).")
     except Exception:
         return None, "\nKuvvetler hesaplanamadı: " + traceback.format_exc(limit=2).strip().splitlines()[-1]
+
+
+def axial_time_plot(cfg, opts, segs, timelines, total_time):
+    """Her kanaldaki makaranın eksenel (Z) konumu – zaman, tek grafikte; altında ilk aktif kanala göre konum farkı
+    (makara kademelenmesi). Makara merkezi, offset dahil gerçek konum."""
+    try:
+        pl = cfg.get('plane') or {}
+        hl, vl = str(pl.get('hl', 'X')).upper(), str(pl.get('vl', 'Y')).upper()
+        if 'Z' in (hl, vl):
+            ai = 0 if hl == 'Z' else 1
+        else:
+            radial = resolve_radial(opts.get('pf_radial', 'auto'), cfg)[0]
+            ai = 1 if radial == 'X' else 0
+        lab = hl if ai == 0 else vl
+        sg = -1.0 if pl.get('hneg' if ai == 0 else 'vneg') else 1.0
+        T = max(float(total_time), 1e-6)
+        ts = np.linspace(0.0, T, int(min(max(T * 25, 400), 4000)))
+        act = [i for i in range(N_CH) if channel_active(segs[i])]
+        if not act:
+            return ""
+        Z = {i: np.array([get_position(timelines[i], t, 'points')[ai] for t in ts], float) * sg for i in act}
+        two = len(act) > 1
+        fig = Figure(figsize=(10.5, 6.4 if two else 4.2), dpi=100); FigureCanvasAgg(fig)
+        if two:
+            ax, ax2 = fig.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios': [3, 2]})
+        else:
+            ax, ax2 = fig.add_subplot(111), None
+        def style(a_, ylab):
+            a_.set_ylabel(ylab, fontsize=9, color=INK); a_.grid(True, color=GRID, linewidth=0.8)
+            for sp in ('top', 'right'):
+                a_.spines[sp].set_visible(False)
+            a_.tick_params(labelsize=8, colors=INK2)
+        ls = {i: ('--' if CHANNEL_COLORS[i] in [CHANNEL_COLORS[j] for j in act if j < i] else '-') for i in act}
+        for i in act:
+            off = float(cfg['channels'][i].get('x_offset' if ai == 0 else 'y_offset', 0.0) or 0.0)
+            ax.plot(ts, Z[i], color=CHANNEL_COLORS[i], linewidth=2, linestyle=ls[i],
+                    label=f"Kanal {i + 1}" + (f" (offset {off:+g})" if off else ''))
+        ax.set_title(f"Makaraların {lab} ekseni konumu – zaman (makara merkezi, offset dahil)", fontsize=11, color=INK)
+        style(ax, f'{lab} (mm)')
+        ax.legend(fontsize=8, frameon=False, loc='best', ncol=len(act))
+        if two:
+            r0 = act[0]
+            ax2.axhline(0, color=CHANNEL_COLORS[r0], linewidth=1.4, linestyle=ls[r0])
+            for i in act[1:]:
+                d = Z[i] - Z[r0]
+                ax2.plot(ts, d, color=CHANNEL_COLORS[i], linewidth=2, linestyle=ls[i], label=f"Kanal {i + 1} − Kanal {r0 + 1}")
+            ax2.set_title(f"Kademelenme: Kanal {r0 + 1}'e göre {lab} farkı", fontsize=10, color=INK)
+            style(ax2, f'Δ{lab} (mm)')
+            ax2.legend(fontsize=8, frameon=False, loc='best', ncol=len(act) - 1)
+            ax2.set_xlabel('Zaman (s)', fontsize=9, color=INK)
+        else:
+            ax.set_xlabel('Zaman (s)', fontsize=9, color=INK)
+        ax.set_xlim(0, T)
+        fig.tight_layout()
+        return fig_to_svg_card(fig)
+    except Exception:
+        return "<p>Eksen–zaman grafiği çizilemedi: " + html.escape(traceback.format_exc(limit=2).strip().splitlines()[-1]) + "</p>"
 
 
 # -------------------------------------------------------------
@@ -7129,11 +7187,21 @@ def _live_forces(cfg, opts, form, timelines, radii, mold_pts, total_time, n):
 # -------------------------------------------------------------
 def run_all_fast(*vals):
     """Kuvvet hesabı olmadan (hızlı)."""
-    return run_all(*vals, with_forces=False)
+    return _run_all_impl(vals, False)
+
+
+def run_all_forces(*vals):
+    """Kuvvetlerle birlikte (Hızlı Oynatıcıda canlı eksen kuvvetleri)."""
+    return _run_all_impl(vals, True)
+
+
+def run_all(*vals):
+    """Geriye uyum: kuvvetlerle çalıştırır."""
+    return _run_all_impl(vals, True)
 
 
 @_trim
-def run_all(*vals, with_forces=True):
+def _run_all_impl(vals, with_forces=True):
     try:
         cfg, fps, speed, ac_s, ac_e, ac_st, opts = _split_vals(vals)
         segs, starts, radii, mold_pts, note = build_channels_cfg(cfg)
@@ -7155,6 +7223,7 @@ def run_all(*vals, with_forces=True):
             sb_res = None
         ind_png = []
         comp_html, ind_html = _static_plots(segs, starts, radii, mold_pts, opts, form, png_out=ind_png)
+        comp_html += axial_time_plot(cfg, opts, segs, timelines, total_time)
         table = distance_table(segs, mold_pts)
         th_html, th_md, th_df = thickness_profile(form)
         frc_note = ''
@@ -7219,6 +7288,7 @@ def redraw_plots(*vals):
         timelines, total_time = synchronize(segs)
         form = _envelopes(timelines, radii, mold_pts, opts, cfg=cfg)
         comp, ind = _static_plots(segs, starts, radii, mold_pts, opts, form)
+        comp += axial_time_plot(cfg, opts, segs, timelines, total_time)
         th_html, th_md, th_df = thickness_profile(form)
         return comp, ind[0], ind[1], ind[2], th_html, th_md, th_df, "Grafikler güncellendi."
     except Exception:
@@ -8090,7 +8160,7 @@ with gr.Blocks(title="3 Kanallı CNC Simülatörü") as demo:
     _run_outs = [anim_img, frame_sl, play_timer, anim_token, comp_html, ind1, ind2, ind3,
                  table_out, player_out, thick_html, thick_md, thick_df, status]
     run_btn.click(run_all_fast, inputs=all_inputs, outputs=_run_outs)
-    run_frc_btn.click(run_all, inputs=all_inputs, outputs=_run_outs)
+    run_frc_btn.click(run_all_forces, inputs=all_inputs, outputs=_run_outs)
 
     # statik grafikleri yeniden çiz (yazı boyutu / kaydırma / eksen adı / radüs izi)
     redraw_outputs = [comp_html, ind1, ind2, ind3, thick_html, thick_md, thick_df, status]
