@@ -132,7 +132,7 @@ def _tangent_for(seg, ang):
 
 
 def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.0, y_offset=0.0, g0_feed=15000.0,
-                     x_offset=0.0):
+                     x_offset=0.0, spindle_rpm=0.0):
     """
     Bir kanalın G-kodu komutlarını işleyip hareket segmentleri listesi üretir.
     y_offset: G-kodundaki tüm Y değerlerine eklenecek ofset miktarı.
@@ -165,20 +165,26 @@ def simulate_channel(commands, start_x, start_y, tool_radius, default_feed=1000.
             _app({'type': 'wait', **{k_: cmd[k_] for k_ in ('wkind', 'mark', 'chans') if k_ in cmd}})
             continue
 
+        _dwell_blk = False
         for _gv in cmd.get('Gs', [cmd['G']] if 'G' in cmd else []):
             g = int(_gv)
             if g in (0, 1, 2, 3):
                 motion_mode = f'G{g}'
             elif g == 4:
-                motion_mode = 'G4'
+                _dwell_blk = True
             elif g in (40, 41, 42):
                 comp_mode = f'G{g}'
 
-        if 'F' in cmd:
+        if 'F' in cmd and not _dwell_blk:
             feed = cmd['F']
 
-        if motion_mode == 'G4':
-            dwell = cmd.get('P', 0.0)
+        if _dwell_blk:
+            if 'F' in cmd:
+                dwell = float(cmd['F'])                       # Sinumerik: G4 F.. saniye
+            elif 'S' in cmd:
+                dwell = float(cmd['S']) / spindle_rpm * 60.0 if spindle_rpm > 0 else 0.0   # iş mili devri
+            else:
+                dwell = float(cmd.get('P', 0.0))              # Fanuc: G4 P.. saniye
             _app({'type': 'dwell', 'point': (x, y), 'duration': dwell})
             continue
 
@@ -1334,7 +1340,8 @@ def build_channels_cfg(cfg):
             notes.append(n)
         tr = ToolR(ch['tr'], ch.get('shape'))           # yarıçap (kompanzasyon) + varsa DXF makara profili
         segs = simulate_channel(cmds, x0, y0, float(tr), ch['fd'], y_offset=ch['y_offset'], g0_feed=g0_feed,
-                                x_offset=ch.get('x_offset', 0.0))
+                                x_offset=ch.get('x_offset', 0.0),
+                                spindle_rpm=float((cfg.get('material') or {}).get('rpm', 0.0) or 0.0))
         segs = apply_corner_compensation(segs, float(tr))
         segs, cn = apply_sinumerik_corners(segs, float(tr), pc.get('ins_limit', 10.0), pc.get('skip_arcs', True))
         notes.extend(f"Kanal {ci + 1}: {t_}" for t_ in cn)
@@ -6323,8 +6330,8 @@ if(!CN){ cncRow.style.display='none'; } else {
     var st=el('span','st',''); hdr.appendChild(ttl); hdr.appendChild(st);
     var lines=[]; for(var q=0;q<6;q++){var d=el('div','ln',''); prog.appendChild(d); lines.push(d);}
     var tb=el('table'), th=el('tr'); ['', 'Konum', 'Kalan'].forEach(function(h){th.appendChild(el('th','',h));}); tb.appendChild(th);
-    function row(lbl){var r=el('tr'); var k=el('td','k',lbl), a=el('td','big',''), b=el('td','',''); r.appendChild(k); r.appendChild(a); r.appendChild(b); tb.appendChild(r); return [a,b];}
-    var rx=row((c.hl||'X')+(Math.abs(c.fx)===2?' Ø':'')), ry=row((c.vl||'Y')+(Math.abs(c.fy)===2?' Ø':''));
+    function row(lbl){var r=el('tr'); var k=el('td','k',lbl), a=el('td','big',''), b=el('td','',''); r.appendChild(k); r.appendChild(a); r.appendChild(b); tb.appendChild(r); return [a,b,k];}
+    var rx=row(c.hl||'X'), ry=row(c.vl||'Y');
     var rl=el('tr'), lk=el('td','k','Yol'), lv=el('td','',''), lv2=el('td','','');
     rl.appendChild(lk); rl.appendChild(lv); rl.appendChild(lv2); tb.appendChild(rl);
     pos.appendChild(tb); body.appendChild(prog); body.appendChild(pos); card.appendChild(hdr); card.appendChild(body); cncRow.appendChild(card);
@@ -6356,6 +6363,9 @@ function updateCNC(){
     if(D.act && !D.act[i]){ cards[i].st.textContent='BOŞ PROGRAM'; return; }
     var cd=cards[i], B=c.B, k=blockAt(B,t), L=c.L;
     var b=(k>=0)?B[k]:null, done=(!b)||(k===B.length-1&&t>b[1]+1e-6);
+    // MKS: gerçek eksen konumu (çap programında da yarıçap), WKS: programdaki gibi (çap girişinde Ø)
+    var gx=(CSYS==='MKS')?((c.fx<0)?-1:1):c.fx, gy=(CSYS==='MKS')?((c.fy<0)?-1:1):c.fy;
+    cd.rx[2].textContent=(c.hl||'X')+(Math.abs(gx)===2?' Ø':''); cd.ry[2].textContent=(c.vl||'Y')+(Math.abs(gy)===2?' Ø':'');
     var cur=-1, px=0, py=0, rx=0, ry=0, rem=0, status='', remLbl='Yol', remTxt='';
     if(!b){ status='—'; if(c.p0){ px=c.p0[0]; py=c.p0[1]; } }
     else {
@@ -6363,11 +6373,11 @@ function updateCNC(){
       var code=b[3], f=(b[1]>b[0])?Math.min(Math.max((t-b[0])/(b[1]-b[0]),0),1):1; if(done) f=1;
       if(code===2||code===3){ var a=b[11]+(b[12]-b[11])*f; px=b[8]+b[10]*Math.cos(a); py=b[9]+b[10]*Math.sin(a); rem=Math.abs(b[12]-b[11])*b[10]*(1-f); }
       else { px=b[4]+(b[6]-b[4])*f; py=b[5]+(b[7]-b[5])*f; rem=Math.hypot(b[6]-px,b[7]-py); }
-      rx=(b[6]-px)*c.fx; ry=(b[7]-py)*c.fy;
+      rx=(b[6]-px)*gx; ry=(b[7]-py)*gy;
       if(CSYS==='MKS' && b.length>16){
         var dc=D.ch[i], qq=kf(), mx=lerp(dc.cx,qq[0],qq[1]), my=lerp(dc.cy,qq[0],qq[1]);
         if(mx===null||mx===undefined||!isFinite(mx)){ mx=b[14]; my=b[15]; }
-        px=mx; py=my; rx=(b[14]-mx)*c.fx; ry=(b[15]-my)*c.fy; rem=b[16]*(1-f);
+        px=mx; py=my; rx=(b[14]-mx)*gx; ry=(b[15]-my)*gy; rem=b[16]*(1-f);
       }
       if(done){ status='PROGRAM SONU'; rem=0; rx=0; ry=0; }
       else if(code===5){ status='WAIT – diğer kanallar bekleniyor'; remLbl='Bekleme'; remTxt=(b[1]-t).toFixed(2)+' s'; }
@@ -6379,7 +6389,7 @@ function updateCNC(){
     for(var q=0;q<6;q++){ var idx=start+q, d=cd.lines[q];
       if(idx<L.length){ if(/^\s*N\d+/i.test(L[idx])) d.textContent=L[idx].trim(); else { var n='N'+(idx+1); while(n.length<5) n+=' '; d.textContent=n+L[idx]; } } else d.textContent='';
       d.className=(idx===cur&&!done)?'ln cur':'ln'; }
-    cd.rx[0].textContent=f3((px-(c.xo||0))*c.fx); cd.ry[0].textContent=f3((py-c.yo)*c.fy);
+    cd.rx[0].textContent=f3((px-(c.xo||0))*gx); cd.ry[0].textContent=f3((py-c.yo)*gy);
     cd.rx[1].textContent=f3(rx); cd.ry[1].textContent=f3(ry);
     cd.lk.textContent=remLbl; cd.lv.textContent=''; cd.lv2.textContent=remTxt||f3(rem);
     updForce(cd,c);
